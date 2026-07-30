@@ -330,11 +330,22 @@
 
       <article class="card" data-p="anthropic">
         <span class="who">Anthropic · input_schema</span>
-        <div class="errline">tools.0.input_schema: Input should be a valid dictionary / not an object schema.</div>
-        <h3>input_schema is standard JSON Schema</h3>
-        <p>Anthropic tool <code>input_schema</code> is ordinary JSON Schema with an object root — no forced-required, no <code>additionalProperties</code> rule. For guaranteed conformance, add <code>strict: true</code> to the <em>tool</em> definition, not the schema.</p>
-        <p class="fix">Fix → Convert to Anthropic keeps your schema and notes the strict option.</p>
-        <a class="doc" href="https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview" rel="noopener">anthropic tool use docs ↗</a>
+        <div class="errline">tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level.</div>
+        <h3>No union at the root of a tool schema</h3>
+        <p>A tool <code>input_schema</code> must have an object root with <code>properties</code>. A top-level <code>oneOf</code>/<code>allOf</code>/<code>anyOf</code> is rejected — move the union down into a property, where it's allowed.</p>
+        <p class="fix">Fix → Convert to Anthropic wraps a root union under a property.</p>
+        <a class="fixlink" href="fixes/anthropic-input-schema-oneof-allof-anyof-top-level.html">Full fix + examples →</a>
+        <a class="doc" href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">anthropic tool use docs ↗</a>
+      </article>
+
+      <article class="card" data-p="anthropic">
+        <span class="who">Anthropic · input_schema</span>
+        <div class="errline">tools.0.custom.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12.</div>
+        <h3>Properties present but <code>required</code> missing</h3>
+        <p>Claude requires a <code>required</code> array whenever an object has <code>properties</code> — even an empty one. Zod-style generators often omit it for all-optional objects; thinking models reject it hardest.</p>
+        <p class="fix">Fix → Convert to Anthropic adds required (empty array is valid).</p>
+        <a class="fixlink" href="fixes/anthropic-input-schema-json-schema-invalid-required-missing.html">Full fix + examples →</a>
+        <a class="doc" href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">anthropic tool use docs ↗</a>
       </article>
 
     </div>

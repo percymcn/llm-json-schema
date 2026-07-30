@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fix: "input_schema does not support oneOf, allOf, or anyOf at the top level" (Anthropic Claude)</title>
+<meta name="description" content="Claude's tool input_schema rejects a union at the root. oneOf / allOf / anyOf aren't allowed at the top level — the root must be a plain object. Here's why, and how to move the union into a property." />
+<meta name="keywords" content="input_schema does not support oneOf allOf or anyOf at the top level, claude tool input_schema anyof, anthropic tool schema oneof error, claude api 400 input_schema union root, anthropic function calling schema" />
+<link rel="canonical" href="https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-oneof-allof-anyof-top-level.html" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Fix: 'input_schema does not support oneOf, allOf, or anyOf at the top level' — Anthropic Claude" />
+<meta property="og:description" content="Claude tool schemas can't union at the root. Move the oneOf/anyOf into a property and keep an object root. Here's the exact fix." />
+<meta property="og:url" content="https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-oneof-allof-anyof-top-level.html" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C1017'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' text-anchor='middle' fill='%237C6BFF'%3E%7B%7D%3C/text%3E%3C/svg%3E" />
+<script type="application/ld+json">
+{
+  "@context":"https://schema.org",
+  "@graph":[
+    {
+      "@type":"TechArticle",
+      "headline":"Fix: input_schema does not support oneOf, allOf, or anyOf at the top level (Anthropic Claude)",
+      "description":"Why Claude's tool input_schema rejects a union at the root, and how to move it into a property while keeping an object root.",
+      "about":"Anthropic Claude tool input_schema validation",
+      "url":"https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-oneof-allof-anyof-top-level.html",
+      "author":{"@type":"Organization","name":"LLM JSON Schema"},
+      "isPartOf":{"@type":"WebApplication","name":"LLM JSON Schema","url":"https://percymcn.github.io/llm-json-schema/"}
+    },
+    {
+      "@type":"BreadcrumbList",
+      "itemListElement":[
+        {"@type":"ListItem","position":1,"name":"LLM JSON Schema","item":"https://percymcn.github.io/llm-json-schema/"},
+        {"@type":"ListItem","position":2,"name":"Fixes","item":"https://percymcn.github.io/llm-json-schema/#rejections"},
+        {"@type":"ListItem","position":3,"name":"input_schema oneOf/allOf/anyOf at the top level"}
+      ]
+    }
+  ]
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="fix.css" />
+<style>:root{--pc:var(--anthropic)}</style>
+</head>
+<body>
+<div class="bar"><div class="bar-in">
+  <a class="mark" href="../"><span class="glyph">{}</span> LLM JSON Schema</a>
+  <span class="spacer"></span>
+  <a class="ghlink" href="https://github.com/percymcn/llm-json-schema" rel="noopener">View source ↗</a>
+</div></div>
+
+<div class="wrap">
+  <nav class="crumb"><a href="../">Home</a><span class="sep">/</span><a href="../#rejections">Fixes</a><span class="sep">/</span>Anthropic · input_schema union</nav>
+</div>
+
+<main class="wrap">
+  <p class="eyebrow">Anthropic · tool input_schema</p>
+  <div class="errbanner">tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level</div>
+
+  <h1>A Claude tool schema <span class="u">can't union at the root</span> — move it into a property</h1>
+  <p class="lede">When a tool's <code>input_schema</code> puts <code>oneOf</code>, <code>allOf</code>, or <code>anyOf</code> at the top level, the Claude API returns a 400. The root of an <code>input_schema</code> must be a plain object with <code>properties</code>. Here's the fix, and where a union <em>is</em> allowed.</p>
+
+  <h2>What the error means</h2>
+  <p>Claude's tool-use validator requires each tool's <code>input_schema</code> to describe an <b>object</b> of named arguments — a root with <code>"type": "object"</code> and a <code>properties</code> map. A composition keyword (<code>oneOf</code>/<code>allOf</code>/<code>anyOf</code>) at the <em>top level</em> describes "one of several shapes," which the tool interface has no way to fill, so it's rejected outright. The restriction is specifically the <b>top level</b>: a union nested inside a property is fine.</p>
+
+  <h2>The fix</h2>
+  <p>Keep an object at the root and push the union down into a property:</p>
+  <div class="codeblock"><span class="cm"># before — union at the root → 400 rejected</span>
+<span class="rm">{
+  "oneOf": [
+    { "type": "object", "properties": { "email": { "type": "string" } } },
+    { "type": "object", "properties": { "phone": { "type": "string" } } }
+  ]
+}</span>
+
+<span class="cm"># after — object root; the union lives inside a property</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+<span class="add">    "contact": {
+      "anyOf": [
+        { "type": "object", "properties": { "email": { "type": "string" } }, "required": ["email"] },
+        { "type": "object", "properties": { "phone": { "type": "string" } }, "required": ["phone"] }
+      ]
+    }</span>
+  },
+<span class="add">  "required": ["contact"]</span>
+}</div>
+
+  <div class="callout">
+    <p class="lbl">The mental model</p>
+    <p>An <code>input_schema</code> answers "what arguments does this tool take?" — that's always an object. "Which of these shapes?" is a decision <em>about one argument</em>, so the union belongs on that property, not at the root. Also note: <code>allOf</code> combined with <code>$ref</code>, and external <code>$ref</code>, aren't supported even when nested — inline those.</p>
+  </div>
+
+  <h2>Fix it automatically</h2>
+  <p>Paste your schema, pick <b>Anthropic</b>, and the converter flags a top-level <code>oneOf</code>/<code>allOf</code>/<code>anyOf</code> and wraps it under a property with an object root — each change annotated with the rule. Everything runs in your browser; nothing is uploaded.</p>
+  <a class="cta" href="../#run">Open the converter →</a><br />
+  <a class="doc" href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">Anthropic tool-use docs ↗</a>
+
+  <section class="related">
+    <h2>Related rejections</h2>
+    <ul>
+      <li><a href="anthropic-input-schema-json-schema-invalid-required-missing.html"><b>input_schema: JSON schema is invalid</b> — properties present but <code>required</code> missing</a></li>
+      <li><a href="openai-required-array-every-key-in-properties.html"><b>required must include every key in properties</b> — OpenAI strict is stricter still</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer><div class="fin">
+  <span class="mono">{} LLM JSON Schema</span>
+  <span class="spacer"></span>
+  <a href="../">Converter</a>
+  <a href="https://github.com/percymcn/llm-json-schema" rel="noopener">GitHub</a>
+  <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">Anthropic docs</a>
+</div></footer>
+</body>
+</html>

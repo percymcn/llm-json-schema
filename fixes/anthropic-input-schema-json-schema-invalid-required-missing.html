@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fix: "input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12" (Anthropic Claude)</title>
+<meta name="description" content="Claude rejects a tool input_schema that has properties but no 'required' field with 'JSON schema is invalid. It must match JSON Schema draft 2020-12' — especially on thinking models. The fix is one line: add required, even an empty array." />
+<meta name="keywords" content="input_schema JSON schema is invalid it must match JSON Schema draft 2020-12, claude tool schema required missing, anthropic input_schema required empty array, claude api 400 invalid json schema tool, claude thinking model tool schema error" />
+<link rel="canonical" href="https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-json-schema-invalid-required-missing.html" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Fix: 'input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12' — Anthropic Claude" />
+<meta property="og:description" content="Claude rejects a tool schema with properties but no 'required'. Add required (an empty array is valid). Here's the one-line fix." />
+<meta property="og:url" content="https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-json-schema-invalid-required-missing.html" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C1017'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' text-anchor='middle' fill='%237C6BFF'%3E%7B%7D%3C/text%3E%3C/svg%3E" />
+<script type="application/ld+json">
+{
+  "@context":"https://schema.org",
+  "@graph":[
+    {
+      "@type":"TechArticle",
+      "headline":"Fix: input_schema JSON schema is invalid, must match JSON Schema draft 2020-12 (Anthropic Claude)",
+      "description":"Why Claude rejects a tool input_schema that has properties but no required field, and the one-line fix.",
+      "about":"Anthropic Claude tool input_schema required-field validation",
+      "url":"https://percymcn.github.io/llm-json-schema/fixes/anthropic-input-schema-json-schema-invalid-required-missing.html",
+      "author":{"@type":"Organization","name":"LLM JSON Schema"},
+      "isPartOf":{"@type":"WebApplication","name":"LLM JSON Schema","url":"https://percymcn.github.io/llm-json-schema/"}
+    },
+    {
+      "@type":"BreadcrumbList",
+      "itemListElement":[
+        {"@type":"ListItem","position":1,"name":"LLM JSON Schema","item":"https://percymcn.github.io/llm-json-schema/"},
+        {"@type":"ListItem","position":2,"name":"Fixes","item":"https://percymcn.github.io/llm-json-schema/#rejections"},
+        {"@type":"ListItem","position":3,"name":"input_schema JSON schema is invalid (required missing)"}
+      ]
+    }
+  ]
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="fix.css" />
+<style>:root{--pc:var(--anthropic)}</style>
+</head>
+<body>
+<div class="bar"><div class="bar-in">
+  <a class="mark" href="../"><span class="glyph">{}</span> LLM JSON Schema</a>
+  <span class="spacer"></span>
+  <a class="ghlink" href="https://github.com/percymcn/llm-json-schema" rel="noopener">View source ↗</a>
+</div></div>
+
+<div class="wrap">
+  <nav class="crumb"><a href="../">Home</a><span class="sep">/</span><a href="../#rejections">Fixes</a><span class="sep">/</span>Anthropic · required missing</nav>
+</div>
+
+<main class="wrap">
+  <p class="eyebrow">Anthropic · tool input_schema</p>
+  <div class="errbanner">tools.0.custom.input_schema: JSON schema is invalid. It must match JSON Schema draft 2020-12</div>
+
+  <h1>Claude rejects a tool schema with <span class="u">properties but no <code>required</code></span></h1>
+  <p class="lede">This generic-looking error almost always has one specific cause: your tool's <code>input_schema</code> declares <code>properties</code> but omits the <code>required</code> array. Claude's validator (strictest on thinking models) treats that as invalid. The fix is one line.</p>
+
+  <h2>What the error means</h2>
+  <p>Claude validates each tool <code>input_schema</code> against JSON Schema draft 2020-12, and requires <code>required</code> to be <b>present</b> whenever an object has <code>properties</code> — even if nothing is actually mandatory. Schema generators (e.g. Zod-to-JSON-Schema) frequently emit <code>properties</code> with no <code>required</code> key for all-optional objects, which trips this. Thinking models enforce it most aggressively.</p>
+
+  <h2>The fix</h2>
+  <p>Add a <code>required</code> array. If no field is mandatory, an empty array is valid:</p>
+  <div class="codeblock"><span class="cm"># before — properties present, no "required" → "JSON schema is invalid"</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"limit"</span>: { <span class="key">"type"</span>: "number" }
+  }
+<span class="rm">}</span>
+
+<span class="cm"># after — add required (empty array is fine when nothing is mandatory)</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"limit"</span>: { <span class="key">"type"</span>: "number" }
+  },
+<span class="add">  "required": []</span>
+}</div>
+
+  <div class="callout">
+    <p class="lbl">Don't confuse this with OpenAI</p>
+    <p>Anthropic only requires <code>required</code> to <em>exist</em> — an empty array passes. OpenAI's strict Structured Outputs is stricter: <code>required</code> must list <em>every</em> key in <code>properties</code>. Same field, two different rules — a converter that targets the wrong one produces a schema the other provider rejects.</p>
+  </div>
+
+  <h2>Fix it automatically</h2>
+  <p>Paste your schema, pick <b>Anthropic</b>, and the converter adds a <code>required</code> array wherever an object has <code>properties</code> without one — annotated with the rule. Switch the target to OpenAI and it upgrades the same field to list every key. All in-browser; nothing uploaded.</p>
+  <a class="cta" href="../#run">Open the converter →</a><br />
+  <a class="doc" href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">Anthropic tool-use docs ↗</a>
+
+  <section class="related">
+    <h2>Related rejections</h2>
+    <ul>
+      <li><a href="anthropic-input-schema-oneof-allof-anyof-top-level.html"><b>input_schema does not support oneOf, allOf, or anyOf at the top level</b> — keep an object root</a></li>
+      <li><a href="openai-required-array-every-key-in-properties.html"><b>required must include every key in properties</b> — the stricter OpenAI version of this rule</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer><div class="fin">
+  <span class="mono">{} LLM JSON Schema</span>
+  <span class="spacer"></span>
+  <a href="../">Converter</a>
+  <a href="https://github.com/percymcn/llm-json-schema" rel="noopener">GitHub</a>
+  <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" rel="noopener">Anthropic docs</a>
+</div></footer>
+</body>
+</html>
