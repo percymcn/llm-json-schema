@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fix: "Unknown name '$ref' / 'pattern' in responseSchema" — Gemini structured output</title>
+<meta name="description" content="Gemini's responseSchema returns 400 INVALID_ARGUMENT: Unknown name because it supports only a subset of JSON Schema. Here's what it drops ($ref, pattern, minLength...) and how to make your schema Gemini-safe." />
+<meta name="keywords" content="gemini responseSchema unknown name, gemini 400 INVALID_ARGUMENT responseSchema, gemini structured output $ref not supported, gemini responseSchema pattern unsupported, gemini json schema subset" />
+<link rel="canonical" href="https://percymcn.github.io/llm-json-schema/fixes/gemini-responseschema-unknown-field.html" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Fix: 'Unknown name in responseSchema' — Gemini structured output" />
+<meta property="og:description" content="Gemini supports only a subset of JSON Schema. Here's what it drops and how to make your schema Gemini-safe." />
+<meta property="og:url" content="https://percymcn.github.io/llm-json-schema/fixes/gemini-responseschema-unknown-field.html" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C1017'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' text-anchor='middle' fill='%237C6BFF'%3E%7B%7D%3C/text%3E%3C/svg%3E" />
+<script type="application/ld+json">
+{
+  "@context":"https://schema.org",
+  "@graph":[
+    {
+      "@type":"TechArticle",
+      "headline":"Fix: Unknown name in responseSchema (Gemini structured output)",
+      "description":"Gemini's responseSchema supports only a subset of JSON Schema. What it drops and how to make a schema Gemini-safe.",
+      "about":"Gemini responseSchema JSON Schema subset",
+      "url":"https://percymcn.github.io/llm-json-schema/fixes/gemini-responseschema-unknown-field.html",
+      "author":{"@type":"Organization","name":"LLM JSON Schema"},
+      "isPartOf":{"@type":"WebApplication","name":"LLM JSON Schema","url":"https://percymcn.github.io/llm-json-schema/"}
+    },
+    {
+      "@type":"BreadcrumbList",
+      "itemListElement":[
+        {"@type":"ListItem","position":1,"name":"LLM JSON Schema","item":"https://percymcn.github.io/llm-json-schema/"},
+        {"@type":"ListItem","position":2,"name":"Fixes","item":"https://percymcn.github.io/llm-json-schema/#rejections"},
+        {"@type":"ListItem","position":3,"name":"Unknown name in responseSchema"}
+      ]
+    }
+  ]
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="fix.css" />
+<style>:root{--pc:var(--gemini)}</style>
+</head>
+<body>
+<div class="bar"><div class="bar-in">
+  <a class="mark" href="../"><span class="glyph">{}</span> LLM JSON Schema</a>
+  <span class="spacer"></span>
+  <a class="ghlink" href="https://github.com/percymcn/llm-json-schema" rel="noopener">View source ↗</a>
+</div></div>
+
+<div class="wrap">
+  <nav class="crumb"><a href="../">Home</a><span class="sep">/</span><a href="../#rejections">Fixes</a><span class="sep">/</span>Gemini · responseSchema</nav>
+</div>
+
+<main class="wrap">
+  <p class="eyebrow">Gemini · responseSchema</p>
+  <div class="errbanner">400 INVALID_ARGUMENT: Unknown name "$ref" at 'generation_config.response_schema': Cannot find field.</div>
+
+  <h1>Gemini's responseSchema is a <span class="u">subset</span> of JSON Schema</h1>
+  <p class="lede">Gemini rejects a schema with <code>Unknown name</code> when it contains a keyword outside its supported subset — most often <code>$ref</code>, but also <code>pattern</code>, <code>minLength</code>, and others. The fix is to inline and strip what Gemini doesn't understand.</p>
+
+  <h2>What the error means</h2>
+  <p>Unlike OpenAI (which validates a strict superset) or Anthropic (which takes ordinary JSON Schema), Gemini's <code>responseSchema</code> accepts only a defined subset of fields. Any keyword outside that subset isn't ignored — it's a hard <code>400 INVALID_ARGUMENT</code>. The usual culprits:</p>
+  <div class="codeblock"><span class="cm"># commonly unsupported in responseSchema</span>
+$ref, $defs        <span class="cm">→ definitions/references must be inlined</span>
+pattern            <span class="cm">→ regex constraints are dropped</span>
+minLength, maxLength
+format (except date-time, date, time, and enum/duration variants)
+additionalProperties on the object</div>
+
+  <h2>The fix</h2>
+  <p>Inline any <code>$ref</code> so the referenced definition is written out in place, and remove the keywords Gemini can't parse. Keep the structural fields it <em>does</em> support — <code>type</code>, <code>properties</code>, <code>items</code>, <code>required</code>, <code>enum</code>, <code>nullable</code>, and <code>propertyOrdering</code>.</p>
+  <div class="codeblock"><span class="cm"># before — rejected</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"id"</span>: <span class="rm">{ "$ref": "#/$defs/Id" }</span>,
+    <span class="key">"code"</span>: { <span class="key">"type"</span>: "string", <span class="rm">"pattern": "^[A-Z]{3}$"</span> }
+  }
+}
+
+<span class="cm"># after — $ref inlined, pattern stripped, ordering added</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"id"</span>: <span class="add">{ "type": "string" }</span>,
+    <span class="key">"code"</span>: { <span class="key">"type"</span>: "string" }
+  }<span class="add">,
+  "propertyOrdering": ["id", "code"]</span>
+}</div>
+
+  <div class="callout">
+    <p class="lbl">Bonus: stable field order</p>
+    <p>Gemini decides output field order from <code>propertyOrdering</code>. Without it, order is unpredictable and can hurt output quality — so the converter adds it to every object automatically.</p>
+  </div>
+
+  <h2>Fix it automatically</h2>
+  <p>Paste your schema, pick <b>Gemini</b>, and the converter inlines <code>$ref</code>, drops unsupported keywords, and adds <code>propertyOrdering</code> — listing each change with the doc rule behind it. Runs entirely in your browser.</p>
+  <a class="cta" href="../#run">Open the converter →</a><br />
+  <a class="doc" href="https://ai.google.dev/gemini-api/docs/structured-output" rel="noopener">Gemini structured output docs ↗</a>
+
+  <section class="related">
+    <h2>Related rejections</h2>
+    <ul>
+      <li><a href="openai-additionalproperties-required-to-be-false.html"><b>'additionalProperties' is required to be supplied and to be false</b> — OpenAI strict</a></li>
+      <li><a href="openai-required-array-every-key-in-properties.html"><b>required must include every key in properties</b> — OpenAI strict has no optional fields</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer><div class="fin">
+  <span class="mono">{} LLM JSON Schema</span>
+  <span class="spacer"></span>
+  <a href="../">Converter</a>
+  <a href="https://github.com/percymcn/llm-json-schema" rel="noopener">GitHub</a>
+  <a href="https://ai.google.dev/gemini-api/docs/structured-output" rel="noopener">Gemini docs</a>
+</div></footer>
+</body>
+</html>

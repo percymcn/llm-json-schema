@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Fix: "required is required to be supplied and to be an array including every key in properties" (OpenAI)</title>
+<meta name="description" content="OpenAI strict Structured Outputs rejects your schema because a property isn't in required. Strict mode has no optional fields — here's why, and how to keep a field optional with a nullable type." />
+<meta name="keywords" content="required is required to be supplied and to be an array including every key in properties, openai strict required all properties, openai structured outputs optional field, openai nullable field schema" />
+<link rel="canonical" href="https://percymcn.github.io/llm-json-schema/fixes/openai-required-array-every-key-in-properties.html" />
+<meta name="robots" content="index, follow" />
+<meta property="og:type" content="article" />
+<meta property="og:title" content="Fix: 'required ... an array including every key in properties' — OpenAI" />
+<meta property="og:description" content="Strict mode has no optional fields. Here's the fix, and how to keep a field effectively optional." />
+<meta property="og:url" content="https://percymcn.github.io/llm-json-schema/fixes/openai-required-array-every-key-in-properties.html" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230C1017'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='20' font-weight='700' text-anchor='middle' fill='%237C6BFF'%3E%7B%7D%3C/text%3E%3C/svg%3E" />
+<script type="application/ld+json">
+{
+  "@context":"https://schema.org",
+  "@graph":[
+    {
+      "@type":"TechArticle",
+      "headline":"Fix: required is required to be supplied and to be an array including every key in properties (OpenAI)",
+      "description":"Why OpenAI strict mode requires every property in required, and how to keep a field optional.",
+      "about":"OpenAI Structured Outputs strict required-fields validation",
+      "url":"https://percymcn.github.io/llm-json-schema/fixes/openai-required-array-every-key-in-properties.html",
+      "author":{"@type":"Organization","name":"LLM JSON Schema"},
+      "isPartOf":{"@type":"WebApplication","name":"LLM JSON Schema","url":"https://percymcn.github.io/llm-json-schema/"}
+    },
+    {
+      "@type":"BreadcrumbList",
+      "itemListElement":[
+        {"@type":"ListItem","position":1,"name":"LLM JSON Schema","item":"https://percymcn.github.io/llm-json-schema/"},
+        {"@type":"ListItem","position":2,"name":"Fixes","item":"https://percymcn.github.io/llm-json-schema/#rejections"},
+        {"@type":"ListItem","position":3,"name":"required must include every key in properties"}
+      ]
+    }
+  ]
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="fix.css" />
+<style>:root{--pc:var(--openai)}</style>
+</head>
+<body>
+<div class="bar"><div class="bar-in">
+  <a class="mark" href="../"><span class="glyph">{}</span> LLM JSON Schema</a>
+  <span class="spacer"></span>
+  <a class="ghlink" href="https://github.com/percymcn/llm-json-schema" rel="noopener">View source ↗</a>
+</div></div>
+
+<div class="wrap">
+  <nav class="crumb"><a href="../">Home</a><span class="sep">/</span><a href="../#rejections">Fixes</a><span class="sep">/</span>OpenAI · required</nav>
+</div>
+
+<main class="wrap">
+  <p class="eyebrow">OpenAI · Structured Outputs (strict)</p>
+  <div class="errbanner">Invalid schema for response_format: 'required' is required to be supplied and to be an array including every key in properties.</div>
+
+  <h1>Strict mode has <span class="u">no optional fields</span> — every property must be required</h1>
+  <p class="lede">OpenAI Structured Outputs rejects a schema when any object leaves a property out of its <code>required</code> array. In strict mode, "optional" doesn't exist. Here's the fix, plus the correct way to keep a field effectively optional.</p>
+
+  <h2>What the error means</h2>
+  <p>With <code>strict: true</code>, OpenAI guarantees the model returns a value for every property you declare. To make that guarantee, it requires that <code>required</code> lists <em>every</em> key in <code>properties</code>, on every object in the schema. Leaving even one key out — the normal JSON-Schema way to mark it optional — triggers this error.</p>
+
+  <h2>The fix</h2>
+  <p>List every property in <code>required</code>. For a field that genuinely may be absent, don't drop it from <code>required</code> — instead make it <b>nullable</b> so the model can return <code>null</code>:</p>
+  <div class="codeblock"><span class="cm"># before — "nickname" left out of required → rejected</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"name"</span>:     { <span class="key">"type"</span>: "string" },
+    <span class="key">"nickname"</span>: { <span class="key">"type"</span>: "string" }
+  },
+  <span class="rm">  "required": ["name"]</span>
+}
+
+<span class="cm"># after — nickname stays required, but is nullable</span>
+{
+  <span class="key">"type"</span>: "object",
+  <span class="key">"properties"</span>: {
+    <span class="key">"name"</span>:     { <span class="key">"type"</span>: "string" },
+    <span class="key">"nickname"</span>: { <span class="key">"type"</span>: <span class="add">["string", "null"]</span> }
+  },
+<span class="add">  "required": ["name", "nickname"],</span>
+<span class="add">  "additionalProperties": false</span>
+}</div>
+
+  <div class="callout">
+    <p class="lbl">The mental model</p>
+    <p>In strict mode you don't make a field optional by omission — you make it optional by allowing <code>null</code>. The key stays in <code>required</code>; the <em>type</em> is what carries the optionality.</p>
+  </div>
+
+  <h2>Fix it automatically</h2>
+  <p>Paste your schema, pick <b>OpenAI</b>, and the converter forces every property into <code>required</code> and makes the ones you'd left out nullable — each change annotated with the doc rule. All in-browser; nothing uploaded.</p>
+  <a class="cta" href="../#run">Open the converter →</a><br />
+  <a class="doc" href="https://developers.openai.com/api/docs/guides/structured-outputs" rel="noopener">OpenAI Structured Outputs docs ↗</a>
+
+  <section class="related">
+    <h2>Related rejections</h2>
+    <ul>
+      <li><a href="openai-additionalproperties-required-to-be-false.html"><b>'additionalProperties' is required to be supplied and to be false</b> — every object needs it</a></li>
+      <li><a href="gemini-responseschema-unknown-field.html"><b>Unknown name "$ref" in responseSchema</b> — Gemini supports only a schema subset</a></li>
+    </ul>
+  </section>
+</main>
+
+<footer><div class="fin">
+  <span class="mono">{} LLM JSON Schema</span>
+  <span class="spacer"></span>
+  <a href="../">Converter</a>
+  <a href="https://github.com/percymcn/llm-json-schema" rel="noopener">GitHub</a>
+  <a href="https://developers.openai.com/api/docs/guides/structured-outputs" rel="noopener">OpenAI docs</a>
+</div></footer>
+</body>
+</html>

@@ -191,6 +191,9 @@
   .card a.doc{font-family:var(--mono);font-size:11.5px;color:var(--faint);
     text-decoration:none;border-bottom:1px dotted var(--faint);align-self:flex-start;margin-top:2px}
   .card a.doc:hover{color:var(--tool);border-color:var(--tool)}
+  .card a.fixlink{font-family:var(--mono);font-size:12px;font-weight:500;color:var(--tool);
+    text-decoration:none;align-self:flex-start;margin-top:2px}
+  .card a.fixlink:hover{text-decoration:underline}
 
   footer{border-top:1px solid var(--line);margin-top:50px;padding:30px 0 60px;color:var(--dim)}
   footer .fin{display:flex;flex-wrap:wrap;gap:16px;align-items:center;font-size:13.5px}
@@ -272,7 +275,7 @@
 
   <p class="privacy">↳ <b>Nothing leaves your browser.</b> The schema is parsed, transformed, and linted entirely in client-side JavaScript. No server, no logging, no account.</p>
 
-  <section class="rejections">
+  <section class="rejections" id="rejections">
     <h2>Common rejections, and the rule behind each</h2>
     <p class="sub">The errors developers actually hit when sending a JSON Schema to an LLM API — what they mean, and the one change that fixes them. Every fix links the provider's own doc.</p>
     <div class="cards">
@@ -283,6 +286,7 @@
         <h3>Every object needs <code>additionalProperties: false</code></h3>
         <p>In strict mode OpenAI requires <code>additionalProperties: false</code> on <em>every</em> object in the schema — including nested ones. Missing it on any level fails the whole request.</p>
         <p class="fix">Fix → Convert to OpenAI adds it everywhere.</p>
+        <a class="fixlink" href="fixes/openai-additionalproperties-required-to-be-false.html">Full fix + examples →</a>
         <a class="doc" href="https://developers.openai.com/api/docs/guides/structured-outputs" rel="noopener">openai structured outputs docs ↗</a>
       </article>
 
@@ -292,6 +296,7 @@
         <h3>All fields must be in <code>required</code></h3>
         <p>Strict mode has no concept of optional fields — every property must appear in <code>required</code>. To keep a field effectively optional, make it nullable with <code>"type": ["string", "null"]</code>.</p>
         <p class="fix">Fix → Convert forces required and nullables the ones you left out.</p>
+        <a class="fixlink" href="fixes/openai-required-array-every-key-in-properties.html">Full fix + examples →</a>
         <a class="doc" href="https://developers.openai.com/api/docs/guides/structured-outputs" rel="noopener">openai structured outputs docs ↗</a>
       </article>
 
@@ -319,6 +324,7 @@
         <h3>Gemini supports only a schema subset</h3>
         <p>No <code>$ref</code>/<code>$defs</code>, no <code>pattern</code>, no <code>minLength</code>/<code>maxLength</code>. String <code>format</code> is limited to <code>date-time</code>, <code>date</code>, and <code>time</code>. Anything else must be removed or inlined.</p>
         <p class="fix">Fix → Convert to Gemini drops unsupported keywords and flags $ref.</p>
+        <a class="fixlink" href="fixes/gemini-responseschema-unknown-field.html">Full fix + examples →</a>
         <a class="doc" href="https://ai.google.dev/gemini-api/docs/structured-output" rel="noopener">gemini structured output docs ↗</a>
       </article>
 
