@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://percymcn.github.io/llm-json-schema/sitemap.xml
