@@ -8,7 +8,9 @@ KEY="535e5d6d6e2d4d248b8140e435491f8f"
 KEY_LOCATION="https://${HOST}/llm-json-schema/${KEY}.txt"
 SITEMAP="$(cd "$(dirname "$0")" && pwd)/sitemap.xml"
 
-mapfile -t URLS < <(grep -oE '<loc>[^<]+</loc>' "$SITEMAP" | sed -E 's#</?loc>##g')
+# Portable URL extraction (macOS bash 3.2 has no mapfile).
+URLS=()
+while IFS= read -r u; do URLS+=("$u"); done < <(grep -oE '<loc>[^<]+</loc>' "$SITEMAP" | sed -E 's#</?loc>##g')
 
 URLLIST=$(printf '"%s",' "${URLS[@]}"); URLLIST="[${URLLIST%,}]"
 
