@@ -445,6 +445,68 @@ function blockers(r) {
   ok("openai accepts an array that declares items", blockers(withItems).length === 0);
 })();
 
+// --- allOf is not flatly unsupported; the blanket strip deleted subschemas --
+// `{allOf:[<object>], description:"..."}` is what Pydantic emits for a $ref'd
+// model carrying a field description. Stripping `allOf` reduced it to
+// `{"description":"..."}` — the whole shape gone, reported as a fix.
+(function () {
+  var singleton = E.toOpenAI({
+    type: "object",
+    properties: {
+      f: { allOf: [{ type: "object", properties: { a: { type: "string" } }, required: ["a"] }], description: "d" }
+    },
+    required: ["f"]
+  });
+  var f = singleton.schema.properties.f;
+  ok("openai flattens a single-member allOf", f.type === "object" && !!f.properties &&
+    f.properties.a !== undefined && f.allOf === undefined);
+  ok("openai keeps the wrapper annotation when flattening", f.description === "d");
+  ok("openai does not blow away a single-member allOf", blockers(singleton).length === 0);
+
+  var open = E.toOpenAI({
+    type: "object",
+    properties: {
+      f: {
+        allOf: [
+          { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+          { type: "object", properties: { b: { type: "string" } }, required: ["b"] }
+        ]
+      }
+    },
+    required: ["f"]
+  });
+  var of = open.schema.properties.f;
+  ok("openai merges an allOf of open objects", of.properties.a !== undefined && of.properties.b !== undefined);
+  ok("openai unions required across merged allOf members",
+    of.required.indexOf("a") !== -1 && of.required.indexOf("b") !== -1);
+
+  // Closed members cannot be merged without changing Draft 7 validation, and
+  // non-object members are unsupported outright — both are blockers, never a
+  // silent strip.
+  var closed = E.toOpenAI({
+    type: "object",
+    properties: {
+      f: {
+        allOf: [
+          { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false },
+          { type: "object", properties: { b: { type: "string" } }, required: ["b"], additionalProperties: false }
+        ]
+      }
+    },
+    required: ["f"]
+  });
+  ok("openai blocks an unmergeable allOf of closed objects", blockers(closed).length > 0);
+  ok("openai leaves the unmergeable allOf visible",
+    Array.isArray(closed.schema.properties.f.allOf));
+
+  var scalars = E.toOpenAI({
+    type: "object",
+    properties: { f: { allOf: [{ type: "string", minLength: 1 }, { type: "string", maxLength: 5 }] } },
+    required: ["f"]
+  });
+  ok("openai blocks a multi-member allOf of non-objects", blockers(scalars).length > 0);
+})();
+
 // --- Anthropic diverges here, and the rule must NOT be ported ---------------
 // `transformJSONSchema` rewrites oneOf -> anyOf with no exclusivity proof, so
 // the same input that is a hard blocker for OpenAI is only a warning here.

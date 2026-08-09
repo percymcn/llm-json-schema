@@ -304,8 +304,8 @@
         <span class="who">OpenAI · strict</span>
         <div class="errline">Invalid schema: 'anyOf' is not permitted at the root level.</div>
         <h3>Root can't be <code>anyOf</code> (or a non-object)</h3>
-        <p>The root of a strict schema must be an object and must not use <code>anyOf</code>. Move the union down into a property. <code>allOf</code>, <code>not</code>, and <code>if/then/else</code> aren't supported at all.</p>
-        <p class="fix">Fix → Convert flags a root anyOf and strips unsupported composition keywords.</p>
+        <p>The root of a strict schema must be an object and must not use <code>anyOf</code>. Move the union down into a property. <code>not</code> and <code>if/then/else</code> aren't supported at all. <code>allOf</code> and <code>oneOf</code> are <em>conditional</em>: a single-member <code>allOf</code> is flattened and an <code>allOf</code> of open objects is merged, while <code>oneOf</code> becomes <code>anyOf</code> only when its branches are provably mutually exclusive.</p>
+        <p class="fix">Fix → Convert flags a root anyOf, flattens or merges <code>allOf</code> where that's lossless, and tells you when a <code>oneOf</code> can't be rewritten without widening it.</p>
         <a class="doc" href="https://developers.openai.com/api/docs/guides/structured-outputs" rel="noopener">openai structured outputs docs ↗</a>
       </article>
 

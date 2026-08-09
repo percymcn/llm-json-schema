@@ -574,6 +574,78 @@
     }
 
     walk(s, "root", function (node, path) {
+      // `allOf` is NOT flatly unsupported, and treating it that way deleted
+      // whole subschemas. Measured against openai@7.4.0's toStrictJsonSchema:
+      //   allOf with ONE member                  -> flattened, annotations kept
+      //   allOf of OPEN objects (no additionalProperties:false)
+      //                                          -> merged (properties+required)
+      //   allOf of CLOSED objects                -> throws, "cannot be merged
+      //                                             without changing Draft 7 validation"
+      //   allOf of non-objects, 2+ members       -> throws, unsupported keyword
+      // We had a blanket strip, so `{allOf:[<object>], description:"..."}` —
+      // exactly what Pydantic emits for a $ref'd model with a field
+      // description — came out as `{"description":"..."}`: the entire shape
+      // gone, reported as a successful fix. Silent widening, again.
+      var allOfBlocked = false;
+      if (Array.isArray(node.allOf) && node.allOf.length) {
+        var members = node.allOf;
+        var mergeable =
+          members.length === 1 ||
+          members.every(function (m) {
+            return isPlainObject(m) && m.type === "object" &&
+              isPlainObject(m.properties) && m.additionalProperties !== false;
+          });
+        if (!mergeable) {
+          allOfBlocked = true;
+          ledger.push(entry("!", path,
+            "`allOf` with " + members.length + " members that OpenAI cannot merge. Its transformer " +
+            "merges an `allOf` of OPEN object schemas and flattens a single-member one, but throws on " +
+            "anything else — closed objects (`additionalProperties: false`) \"cannot be merged without " +
+            "changing Draft 7 validation\", and non-object members are simply unsupported. Express the " +
+            "combined shape as one object schema. We will not drop the `allOf` for you: that would " +
+            "silently remove every constraint inside it.",
+            DOCS.openai));
+        } else if (members.length === 1) {
+          var only = members[0];
+          if (isPlainObject(only)) {
+            Object.keys(only).forEach(function (k) {
+              if (!(k in node)) node[k] = clone(only[k]);
+            });
+          }
+          delete node.allOf;
+          ledger.push(entry("~", path,
+            "Flattened a single-member `allOf` into this node — OpenAI's own transformer does exactly " +
+            "this, keeping the wrapper's annotations. Nothing is lost. (A `$ref` wrapped in `allOf` " +
+            "beside a `description` is the standard Pydantic output for a referenced model with a " +
+            "field description.)",
+            DOCS.openai));
+        } else {
+          var mergedProps = {}, mergedReq = [];
+          members.forEach(function (m) {
+            Object.keys(m.properties).forEach(function (k) {
+              if (!(k in mergedProps)) mergedProps[k] = clone(m.properties[k]);
+            });
+            (Array.isArray(m.required) ? m.required : []).forEach(function (k) {
+              if (mergedReq.indexOf(k) === -1) mergedReq.push(k);
+            });
+          });
+          Object.keys(mergedProps).forEach(function (k) {
+            if (!node.properties) node.properties = {};
+            if (!(k in node.properties)) node.properties[k] = mergedProps[k];
+          });
+          var nodeReq = Array.isArray(node.required) ? node.required : [];
+          mergedReq.forEach(function (k) { if (nodeReq.indexOf(k) === -1) nodeReq.push(k); });
+          node.required = nodeReq;
+          if (node.type === undefined) node.type = "object";
+          delete node.allOf;
+          ledger.push(entry("~", path,
+            "Merged an `allOf` of " + members.length + " open object schemas into one object — the " +
+            "union of their properties and of their `required` lists. This is what OpenAI's " +
+            "transformer does with the same input.",
+            DOCS.openai));
+        }
+      }
+
       // `anyOf` is the union OpenAI supports; `oneOf` is not representable.
       // Rewriting is only lossless when the branches are provably disjoint —
       // see oneOfProvablyExclusive above for why, and whose rule this is.
@@ -652,6 +724,7 @@
         // "exactly one" constraint entirely — a silent widening on top of an
         // unreported one — and hide the keyword the reader has to remodel.
         if (k === "oneOf" && oneOfBlocked) return;
+        if (k === "allOf" && allOfBlocked) return;
         var why = OPENAI_STRIP_REASON[k] ||
           "not in OpenAI's supported keyword set, and strict mode errors on unsupported keywords.";
         delete node[k];
