@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 687 engine + 197 CLI + 34 ESM/library assertions = **918** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 701 engine + 197 CLI + 34 ESM/library assertions = **932** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -485,7 +485,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 918 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 932 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -619,6 +619,41 @@ holds numbers where subschemas belong — and leaves the two genuinely ambiguous
 cases (`{"title": ..., "description": ...}` alone, and `{}`) classified as data,
 unchanged. The CLI still prints `note: input looked like an example object` when
 it infers, and `--mode schema` still forces the other reading.
+
+### …and inference itself only read element 0
+
+Once the classifier was right, the inference it hands off to was still reading
+`value[0]` and stopping. That reads like a shortcut and is a **narrowing**: the
+other elements of the example are, by construction, examples of legal data, so
+the inferred schema forbade the very document it was inferred from.
+
+Measured against `ajv` 2020 — the invariant is simply *an inferred schema must
+validate the example it was inferred from*:
+
+| example | old `items` | verdict on its own input |
+|---|---|---|
+| `[1, "a"]` | `{"type":"integer"}` | ❌ `data/vals/1 must be integer` |
+| `[1, 2.5]` | `{"type":"integer"}` | ❌ the float is illegal |
+| `[null, "x"]` | `{"type":"null"}` | ❌ — and the array can now hold *only* nulls |
+| `[{"a":1}, {"a":1,"b":2}]` | first object | ✅ inferred… ❌ after `additionalProperties: false` |
+
+Every one of these was silent: exit 0, no ledger line, and **`toStrictJsonSchema()`
+accepts all of them** — a schema that rejects your data is still a valid schema.
+
+Inference now joins across every element: sibling types union (`["integer","string"]`),
+`integer` beside a float widens to `number` (`integer` ⊂ `number`), sibling objects
+union their `properties` and **intersect** their `required` (a key missing from one
+element is demonstrably optional), and a structured element beside a scalar becomes
+`anyOf` so neither shape is lost. All six joined forms are `ACCEPT-verbatim` at
+`toStrictJsonSchema()` (openai@7.4.0).
+
+Two deliberate non-changes. An **empty** array still gets no `items` and stays a
+blocker: no element was seen, so there is no element type, and inventing one is
+the failure mode this project has documented elsewhere — a wrong `items` is
+accepted everywhere and silently redescribes the data, which is worse than the
+error. And the last row above stays ❌ after `--to openai` on purpose: strict mode
+has no optional fields, so `b` is forced required-and-nullable, which the ledger
+says in as many words.
 
 
 ## An empty collection usually means the opposite, not "less"

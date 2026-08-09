@@ -4259,5 +4259,82 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     m(conv("openai", noParentProps)).properties.a !== undefined);
 })();
 
+// --- #350: inference reads EVERY element, not just element 0 ----------------
+// Reading `value[0]` alone is not a shortcut, it is a narrowing: the remaining
+// elements are examples of legal data, so the inferred schema rejected the very
+// document it was inferred from. Verified against ajv 2020 in the cycle record;
+// these assertions pin the resulting shapes.
+(function () {
+  function inf(example) {
+    var r = E.convert(example, "openai-nonstrict");
+    return r && r.schema ? r.schema : {};
+  }
+  function items(example, key) {
+    var p = at(inf(example), "properties." + key);
+    return p && p.items;
+  }
+  function typeList(s) {
+    if (!s || s.type === undefined) return [];
+    return Array.isArray(s.type) ? s.type.slice().sort() : [s.type];
+  }
+
+  var mixed = typeList(items({ vals: [1, "a"] }, "vals"));
+  ok("#350 a heterogeneous array keeps every element type",
+    mixed.length === 2 && mixed[0] === "integer" && mixed[1] === "string");
+
+  ok("#350 an int beside a float widens to `number`, not `integer`",
+    typeList(items({ vals: [1, 2.5] }, "vals")).join(",") === "number");
+
+  var withNull = typeList(items({ vals: [null, "x"] }, "vals"));
+  ok("#350 a leading null does not make the array null-only",
+    withNull.length === 2 && withNull.indexOf("null") !== -1 && withNull.indexOf("string") !== -1);
+
+  var rows = items({ rows: [{ a: 1 }, { a: 1, b: 2 } ] }, "rows");
+  ok("#350 sibling objects union their properties",
+    rows && rows.properties && rows.properties.a !== undefined && rows.properties.b !== undefined);
+  ok("#350 a key missing from one sibling is not required",
+    rows && rows.required.length === 1 && rows.required[0] === "a");
+
+  var mix = items({ things: [{ a: 1 }, "x"] }, "things");
+  ok("#350 a structured element beside a scalar becomes anyOf, losing neither",
+    mix && Array.isArray(mix.anyOf) && mix.anyOf.length === 2 &&
+    mix.anyOf.some(function (m) { return m.type === "object"; }) &&
+    mix.anyOf.some(function (m) { return m.type === "string"; }));
+
+  var nullObj = items({ things: [null, { a: 1 }] }, "things");
+  ok("#350 null beside an object keeps the object shape",
+    nullObj && Array.isArray(nullObj.anyOf) &&
+    nullObj.anyOf.some(function (m) { return m.type === "object" && m.properties.a; }));
+
+  // A missing `items` means "that element was an empty array", i.e. no
+  // information — not "any element is allowed" — so the informative side wins.
+  var nested = items({ outer: [[], [1]] }, "outer");
+  ok("#350 an empty sibling array does not erase the known element type",
+    nested && nested.type === "array" && nested.items && nested.items.type === "integer");
+
+  ok("#350 repeated element types are not duplicated in the union",
+    typeList(items({ vals: [1, "a", 1, "a"] }, "vals")).join(",") === "integer,string");
+
+  // --- guards: the join must not fire where there was nothing to join --------
+  ok("#350 GUARD a homogeneous array is unchanged",
+    typeList(items({ vals: [1, 2, 3] }, "vals")).join(",") === "integer");
+
+  ok("#350 GUARD identical sibling objects stay one object with required intact",
+    (function () {
+      var s = items({ rows: [{ a: 1 }, { a: 2 }] }, "rows");
+      return s && s.type === "object" && s.required.length === 1 && s.required[0] === "a";
+    })());
+
+  // Nothing is invented for an empty array (#336): no element was seen, so no
+  // element type is guessed. It stays a blocker the human resolves.
+  var emptyR = E.convert({ tags: [] }, "openai");
+  ok("#350 GUARD an empty array still gets no invented `items`",
+    at(emptyR.schema, "properties.tags.items") === undefined);
+  ok("#350 GUARD an empty array is still a blocker",
+    (emptyR.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; }).length === 1);
+  ok("#350 the array-without-items blocker names the empty-example cause",
+    has(emptyR.ledger, "array in that example was empty"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

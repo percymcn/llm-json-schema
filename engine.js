@@ -378,11 +378,89 @@
 
   // ---- schema inference from a JSON example --------------------------------
 
+  // Join the schemas inferred from two sibling array elements. Reading only
+  // element 0 (what this used to do) is not a shortcut, it is a NARROWING: the
+  // remaining elements are examples of legal data, and a schema that forbids
+  // them rejects the very document it was inferred from. Measured on ajv
+  // 2020: `[1,"a"]` -> `items:{type:"integer"}` (element 1 illegal),
+  // `[1,2.5]` -> integer (2.5 illegal), `[null,"x"]` -> `items:{type:"null"}`
+  // (the array can only ever hold nulls), and `[{a:1},{a:1,b:2}]` inferred
+  // clean and then INVERTED once `additionalProperties:false` was added — two
+  // individually-correct edits composing into a rejection, #348's shape.
+  //
+  // Nothing here invents a type it did not see (#336): every branch is a
+  // union of things actually present in the example.
+  function typeOnlyList(s) {
+    if (!isPlainObject(s)) return null;
+    var k = Object.keys(s);
+    if (k.length !== 1 || k[0] !== "type") return null;
+    return Array.isArray(s.type) ? s.type.slice() : [s.type];
+  }
+
+  function anyOfMembers(s) {
+    return isPlainObject(s) && Array.isArray(s.anyOf) ? s.anyOf : [s];
+  }
+
+  function joinInferred(a, b) {
+    if (canonical(a) === canonical(b)) return a;
+
+    if (isPlainObject(a) && isPlainObject(b) &&
+        a.type === "object" && b.type === "object" &&
+        isPlainObject(a.properties) && isPlainObject(b.properties)) {
+      // Union the keys, intersect `required`: a key absent from one element is
+      // demonstrably optional. (Strict mode has no optional fields, so the
+      // openai converter will later force it required-and-nullable and say so.)
+      var props = {};
+      Object.keys(a.properties).forEach(function (k) { props[k] = a.properties[k]; });
+      Object.keys(b.properties).forEach(function (k) {
+        props[k] = props[k] === undefined
+          ? b.properties[k]
+          : joinInferred(props[k], b.properties[k]);
+      });
+      var bReq = b.required || [];
+      var req = (a.required || []).filter(function (k) { return bReq.indexOf(k) !== -1; });
+      return { type: "object", properties: props, required: req };
+    }
+
+    if (isPlainObject(a) && isPlainObject(b) && a.type === "array" && b.type === "array") {
+      // A missing `items` here means "this element was an empty array", i.e. no
+      // information — not "any element is allowed" — so the known side wins.
+      var arr = { type: "array" };
+      if (a.items !== undefined && b.items !== undefined) arr.items = joinInferred(a.items, b.items);
+      else if (a.items !== undefined) arr.items = a.items;
+      else if (b.items !== undefined) arr.items = b.items;
+      return arr;
+    }
+
+    var at = typeOnlyList(a), bt = typeOnlyList(b);
+    if (at && bt) {
+      var all = at.slice();
+      bt.forEach(function (t) { if (all.indexOf(t) === -1) all.push(t); });
+      // `integer` is a subset of `number`, so a list holding both is a list of
+      // numbers. Keeping `integer` would forbid the float that was right there.
+      if (all.indexOf("number") !== -1) all = all.filter(function (t) { return t !== "integer"; });
+      return all.length === 1 ? { type: all[0] } : { type: all };
+    }
+
+    // Mixed structured/scalar (`[{"a":1}, "x"]`, `[null, {"a":1}]`): `anyOf` is
+    // the only form that keeps BOTH shapes, and every target carries it.
+    var members = [];
+    anyOfMembers(a).concat(anyOfMembers(b)).forEach(function (m) {
+      for (var i = 0; i < members.length; i++) if (canonical(members[i]) === canonical(m)) return;
+      members.push(m);
+    });
+    return members.length === 1 ? members[0] : { anyOf: members };
+  }
+
   function inferSchema(value) {
     if (value === null) return { type: "null" };
     if (Array.isArray(value)) {
       var out = { type: "array" };
-      if (value.length) out.items = inferSchema(value[0]);
+      if (value.length) {
+        var joined = inferSchema(value[0]);
+        for (var i = 1; i < value.length; i++) joined = joinInferred(joined, inferSchema(value[i]));
+        out.items = joined;
+      }
       return out;
     }
     if (typeof value === "object") {
@@ -1420,7 +1498,11 @@
           ledger.push(entry("!", path,
             "This is an array with no `items`. OpenAI strict mode throws on it (\"declares an array " +
             "without `items`\") because a constrained decoder has no element type to emit. Give it an " +
-            "`items` schema — even `{\"type\": \"string\"}` — or drop the field.",
+            "`items` schema, or drop the field. If this schema was inferred from an example, the " +
+            "array in that example was empty, so there was no element to read a type from — put one " +
+            "sample element in it. Supply the type the field REALLY holds rather than a placeholder: " +
+            "a wrong `items` is accepted everywhere and silently redescribes the data, which is " +
+            "worse than this error.",
             DOCS.openai));
         }
       }
