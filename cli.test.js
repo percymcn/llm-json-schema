@@ -546,5 +546,56 @@ var INSTRUCTOR_OPENAI = JSON.stringify({
     rt.status === 0, "status=" + rt.status);
 })();
 
+/* --- pydantic-ai 2.27.0, verbatim captured wire payloads ---------------------
+ * Captured by monkeypatching httpx.Client.send/AsyncClient.send with dummy keys
+ * (no egress) from ONE ordinary Pydantic model. The point of pinning all three:
+ * the same model yields three different schemas and needs three DIFFERENT
+ * targets, none of them the one whose name matches the vendor.
+ */
+var PA_OPENAI = "{\"properties\": {\"title\": {\"description\": \"Short title\", \"maxLength\": 120, \"type\": \"string\"}, \"priority\": {\"$ref\": \"#/$defs/Priority\"}, \"bbox\": {\"description\": \"x1,y1,x2,y2\", \"maxItems\": 4, \"minItems\": 4, \"prefixItems\": [{\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}], \"type\": \"array\"}, \"assignee\": {\"default\": null, \"anyOf\": [{\"type\": \"string\"}, {\"type\": \"null\"}]}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}, \"meta\": {\"$ref\": \"#/$defs/Meta\"}}, \"required\": [\"title\", \"priority\", \"bbox\", \"meta\"], \"type\": \"object\", \"additionalProperties\": false, \"$defs\": {\"Meta\": {\"description\": \"Nested metadata.\", \"properties\": {\"level\": {\"maxLength\": 8, \"minLength\": 2, \"pattern\": \"^[a-z]+$\", \"type\": \"string\"}, \"score\": {\"maximum\": 100, \"minimum\": 0, \"type\": \"integer\"}}, \"required\": [\"level\", \"score\"], \"type\": \"object\", \"additionalProperties\": false}, \"Priority\": {\"enum\": [\"low\", \"high\"], \"type\": \"string\"}}}";
+var PA_ANTHROPIC = "{\"properties\": {\"title\": {\"description\": \"Short title\", \"maxLength\": 120, \"type\": \"string\"}, \"priority\": {\"$ref\": \"#/$defs/Priority\"}, \"bbox\": {\"description\": \"x1,y1,x2,y2\", \"maxItems\": 4, \"minItems\": 4, \"prefixItems\": [{\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}], \"type\": \"array\"}, \"assignee\": {\"default\": null, \"anyOf\": [{\"type\": \"string\"}, {\"type\": \"null\"}]}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}, \"meta\": {\"$ref\": \"#/$defs/Meta\"}}, \"required\": [\"title\", \"priority\", \"bbox\", \"meta\"], \"type\": \"object\", \"$defs\": {\"Meta\": {\"description\": \"Nested metadata.\", \"properties\": {\"level\": {\"maxLength\": 8, \"minLength\": 2, \"pattern\": \"^[a-z]+$\", \"type\": \"string\"}, \"score\": {\"maximum\": 100, \"minimum\": 0, \"type\": \"integer\"}}, \"required\": [\"level\", \"score\"], \"type\": \"object\"}, \"Priority\": {\"enum\": [\"low\", \"high\"], \"type\": \"string\"}}}";
+var PA_GEMINI = "{\"properties\": {\"title\": {\"description\": \"Short title\", \"maxLength\": 120, \"type\": \"string\"}, \"priority\": {\"$ref\": \"#/$defs/Priority\"}, \"bbox\": {\"description\": \"x1,y1,x2,y2\", \"maxItems\": 4, \"minItems\": 4, \"prefixItems\": [{\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}], \"type\": \"array\"}, \"assignee\": {\"default\": null, \"anyOf\": [{\"type\": \"string\"}, {\"type\": \"null\"}]}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}, \"meta\": {\"$ref\": \"#/$defs/Meta\"}}, \"required\": [\"title\", \"priority\", \"bbox\", \"meta\"], \"type\": \"object\", \"$defs\": {\"Meta\": {\"description\": \"Nested metadata.\", \"properties\": {\"level\": {\"maxLength\": 8, \"minLength\": 2, \"pattern\": \"^[a-z]+$\", \"type\": \"string\"}, \"score\": {\"maximum\": 100, \"minimum\": 0, \"type\": \"integer\"}}, \"required\": [\"level\", \"score\"], \"type\": \"object\"}, \"Priority\": {\"enum\": [\"low\", \"high\"], \"type\": \"string\"}}}";
+// pydantic-ai sets strict:true on this one; openai's own toStrictJsonSchema()
+// throws on it ("unsupported keyword `prefixItems`"), so it is a guaranteed 400.
+var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"}, \"bbox\": {\"maxItems\": 4, \"minItems\": 4, \"prefixItems\": [{\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}, {\"type\": \"integer\"}], \"type\": \"array\"}}, \"required\": [\"title\", \"bbox\"], \"type\": \"object\", \"additionalProperties\": false}";
+
+(function () {
+  var o = run(["--to", "openai", "--check"], PA_OPENAI);
+  ok("pydantic-ai openai payload is not strict-compliant", o.status === 1, "status=" + o.status);
+  ok("...and the failure names the target that DOES accept it",
+    /already valid as-is for:.*openai-nonstrict/.test(o.stderr), o.stderr);
+
+  var on = run(["--to", "openai-nonstrict", "--check"], PA_OPENAI);
+  ok("pydantic-ai openai payload is valid non-strict (it sends strict:false)", on.status === 0, "status=" + on.status);
+
+  var an = run(["--to", "anthropic", "--check"], PA_ANTHROPIC);
+  ok("pydantic-ai anthropic payload is valid for the tools path", an.status === 0, "status=" + an.status);
+  var aj = run(["--to", "anthropic-json", "--check"], PA_ANTHROPIC);
+  ok("...and the same bytes are NOT valid for output_format", aj.status === 1, "status=" + aj.status);
+
+  var gj = run(["--to", "gemini-json", "--check"], PA_GEMINI);
+  ok("pydantic-ai gemini payload is valid for parametersJsonSchema", gj.status === 0, "status=" + gj.status);
+  var gn = run(["--to", "gemini", "--check"], PA_GEMINI);
+  ok("...and NOT for the narrow Schema proto", gn.status === 1, "status=" + gn.status);
+  ok("the narrow-path failure points at gemini-json",
+    /already valid as-is for:.*gemini-json/.test(gn.stderr), gn.stderr);
+
+  var tu = run(["--to", "openai", "--check"], PA_TUPLE_STRICT_TRUE);
+  ok("we reject the tuple schema pydantic-ai marks strict:true (a real 400)",
+    tu.status === 1, "status=" + tu.status);
+
+  var quiet = run(["--to", "openai", "--check"], JSON.stringify({
+    type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false
+  }));
+  ok("a passing gate prints no wrong-target diagnosis",
+    quiet.status === 0 && !/already valid as-is for/.test(quiet.stderr), quiet.stderr);
+
+  var j = run(["--to", "openai", "--json"], PA_OPENAI);
+  var parsed = null; try { parsed = JSON.parse(j.stdout); } catch (e) {}
+  ok("--json exposes alsoValidFor for CI consumers",
+    parsed && parsed.alsoValidFor && parsed.alsoValidFor.indexOf("openai-nonstrict") !== -1,
+    j.stdout.slice(0, 120));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

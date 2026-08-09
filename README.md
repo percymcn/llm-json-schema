@@ -143,6 +143,38 @@ types. This tool inlines those refs and keeps the sibling.
 
 This tool applies each provider's rules for you and shows a **change ledger** — every transform, with the exact official-doc rule it enforces cited inline.
 
+### Picking the right target
+Every vendor here accepts more than one dialect, and which one you are on is
+decided by the request your *client* builds — not by anything visible in your
+schema. So the commonest way to get a wrong answer from this tool is to run it
+against the wrong target.
+
+Measured example (pydantic-ai 2.27.0, captured off the wire): one ordinary
+Pydantic model produces three different schemas and needs three targets, and not
+one of them is the one whose name matches the vendor.
+
+| Provider | Request field pydantic-ai uses | Target |
+|---|---|---|
+| OpenAI | Responses API, `strict: false` | `openai-nonstrict` |
+| Anthropic | `tools[].input_schema` | `anthropic` |
+| Gemini | `parametersJsonSchema` | `gemini-json` |
+
+You don't have to know this up front. When `--check` fails, the tool tells you
+which targets *do* accept the schema unchanged:
+
+```
+Not compliant with openai (3 changes):
+  ~ root.assignee — `assignee` added to required …
+
+This schema is already valid as-is for: openai-nonstrict, anthropic, gemini-json
+If that is the dialect your client actually sends, you are on the wrong
+target and no edit is needed — run --help to see what selects each one.
+```
+
+`--json` exposes the same list as `alsoValidFor`. It is computed from your schema
+on every run rather than read from a table, so it cannot go stale when a
+framework changes which field it posts to.
+
 ## Features
 - Accepts a **JSON Schema** or a **JSON example** (auto-detected → schema inferred).
 - Pick a target provider → get the corrected schema.

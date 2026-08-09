@@ -107,6 +107,33 @@ function renderLedger(ledger) {
   }).join("\n");
 }
 
+// Which OTHER targets already accept this schema unchanged?
+//
+// Picking the wrong target is the entire failure mode of a multi-dialect tool:
+// every vendor here has two or more dialects, and which one you are on is decided
+// by the request your CLIENT builds, not by anything visible in the schema. A
+// pydantic-ai user, measured, lands on `openai-nonstrict` + `anthropic` +
+// `gemini-json` — three non-default targets — and never sees the request fields
+// those names refer to. Without this, `--check --to openai` answers such a user
+// with a red build and four edits for a schema their stack sends untouched.
+//
+// This is computed from the schema on every run rather than documented, because a
+// table of "framework X -> target Y" is a claim that rots with each release, and
+// stale doc claims have shipped as bugs in this repo twice (#312, #318).
+function alsoValidFor(raw, provider, mode) {
+  var ok = [];
+  for (var i = 0; i < PROVIDERS.length; i++) {
+    var p = PROVIDERS[i];
+    if (p === provider) continue;
+    var r;
+    try { r = E.convert(raw, p, { mode: mode }); } catch (e) { continue; }
+    if (!r || !r.ok) continue;
+    var needed = r.ledger.filter(function (l) { return l.op !== "=" && !l.advisory; });
+    if (needed.length === 0) ok.push(p);
+  }
+  return ok;
+}
+
 function main(argv) {
   var opts = parseArgs(argv);
   if (opts.error) return fail(opts.error);
@@ -134,11 +161,18 @@ function main(argv) {
     // accepted without them, so they must never turn a CI gate red.
     var required = changes.filter(function (l) { return !l.advisory; });
 
+    // Only worth computing when the answer is "no" — a passing gate has no
+    // wrong-target problem to diagnose.
+    var alsoOk = required.length
+      ? alsoValidFor(raw, opts.provider, opts.mode === "auto" ? undefined : opts.mode)
+      : [];
+
     if (opts.json) {
       process.stdout.write(JSON.stringify({
         ok: blockers.length === 0,
         provider: opts.provider,
         compliant: required.length === 0,
+        alsoValidFor: alsoOk,
         inferred: res.inferred,
         schema: res.schema,
         ledger: res.ledger,
@@ -172,6 +206,11 @@ function main(argv) {
       if (blockers.length) {
         process.stderr.write("\n" + blockers.length + " item" + (blockers.length === 1 ? "" : "s") +
           " above cannot be fixed automatically — see " + res.docUrl + "\n");
+      }
+      if (alsoOk.length) {
+        process.stderr.write("\nThis schema is already valid as-is for: " + alsoOk.join(", ") +
+          "\nIf that is the dialect your client actually sends, you are on the wrong" +
+          "\ntarget and no edit is needed — run --help to see what selects each one.\n");
       }
     }
 
