@@ -123,6 +123,15 @@ export const DOCS: Record<Provider, string>;
  */
 export const GEMINI_ALLOWED_KEYS: string[];
 
+/**
+ * The `format` VALUES Anthropic's transformer keeps on a string node.
+ * Confirmed against three independent vendor artifacts, each a literal in
+ * code: the JS `SUPPORTED_STRING_FORMATS`, the Python `SupportedStringFormats`
+ * and the Go `supportedStringFormats` — all 10, identical. Unlike Gemini's
+ * `format` list, which the vendor documents as open, this one is closed.
+ */
+export const ANTHROPIC_STRING_FORMATS_KEPT: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -132,6 +141,7 @@ declare const api: {
   toGemini: typeof toGemini;
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
+  ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
 };
 
 export default api;

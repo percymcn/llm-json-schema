@@ -3696,5 +3696,127 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 })();
 
+// --- Anthropic `format` VALUES: the closed-vs-open question, per vendor -------
+// #344 established that a vendor list must be checked for CLOSURE before it is
+// implemented as an allowlist, and that Gemini's `format` list is OPEN. This
+// block pins the opposite answer for Anthropic, measured 2026-08-09 against all
+// three SDKs, plus the divergences between them.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function str(fmt, extra) {
+    var x = { type: "string" };
+    if (fmt !== undefined) x.format = fmt;
+    if (extra) for (var k in extra) x[k] = extra[k];
+    return { type: "object", properties: { x: x }, required: ["x"] };
+  }
+  // Does the ledger say this node's `format` stops being enforced?
+  function demoted(r) { return has(r.ledger, "`format` is NOT enforced"); }
+  function silentDrop(r) { return has(r.ledger, "`format` is DELETED without a trace here"); }
+
+  var TARGETS = ["anthropic-json", "anthropic-json-python", "anthropic-go"];
+  // The vendor literals, restated locally. Iterating E.ANTHROPIC_STRING_FORMATS_KEPT
+  // directly aborts the whole file against an engine that does not export it yet
+  // (#322's trap), which hides every assertion below and makes the revert check
+  // unreadable. The export is compared against this list in (1) instead.
+  var VENDOR_10 = ["date-time", "time", "date", "duration", "email",
+                   "hostname", "uri", "ipv4", "ipv6", "uuid"];
+
+  // (1) The exported list IS the three vendor literals, in vendor order.
+  ok("anthropic format list is exported for diffing",
+    Array.isArray(E.ANTHROPIC_STRING_FORMATS_KEPT) &&
+    E.ANTHROPIC_STRING_FORMATS_KEPT.join(",") === VENDOR_10.join(","));
+
+  // (2) Every one of the 10 survives on ALL THREE transform paths. This is the
+  //     over-block guard: being stricter than the vendor is this project's most
+  //     repeated bug, and a `format` we wrongly flag is a false alarm on an
+  //     ordinary pydantic model.
+  var allKept = true;
+  VENDOR_10.forEach(function (f) {
+    TARGETS.forEach(function (t) { if (demoted(conv(str(f), t))) allKept = false; });
+  });
+  ok("all 10 kept `format` values draw no demotion on any anthropic path", allKept);
+
+  // (3) Real pydantic output (2.13.4) emits exactly two values OUTSIDE that list.
+  //     Verbatim generator input per #311 — `Path` -> "path", `Base64Bytes` ->
+  //     "base64" — and both are demoted to prose on all three paths. Measured
+  //     against the SDKs directly: JS/Python write {format: "path"} into
+  //     `description`, Go writes {format: path}.
+  var realOutside = true;
+  ["path", "base64"].forEach(function (f) {
+    TARGETS.forEach(function (t) { if (!demoted(conv(str(f), t))) realOutside = false; });
+  });
+  ok("pydantic's `path` and `base64` are demoted on all three anthropic paths", realOutside);
+
+  // (4) THE GO/JS DIVERGENCE, measured not ported. JS keys `format` on
+  //     `node.type === "string"`, so a format on a NON-string node is demoted.
+  //     Go consults `supportedSchemaKeys` first and only its `case "string"`
+  //     branch demotes, so the same node keeps its format. Verified against
+  //     both SDKs on v1.62.0 / 0.116.0.
+  var intFmt = { type: "object", properties: { x: { type: "integer", format: "int64" } }, required: ["x"] };
+  var arrFmt = { type: "object", properties: { x: { type: "array", items: { type: "string" }, format: "email" } }, required: ["x"] };
+  var typeless = { type: "object", properties: { x: { anyOf: [{ type: "string" }], format: "email" } }, required: ["x"] };
+  ok("JS demotes `format` on a non-string node (integer)", demoted(conv(intFmt, "anthropic-json")));
+  ok("Go KEEPS `format` on a non-string node (integer)", !demoted(conv(intFmt, "anthropic-go")));
+  ok("JS demotes `format` on an array node", demoted(conv(arrFmt, "anthropic-json")));
+  ok("Go KEEPS `format` on an array node", !demoted(conv(arrFmt, "anthropic-go")));
+  ok("JS demotes `format` on a typeless anyOf node", demoted(conv(typeless, "anthropic-json")));
+  ok("Go KEEPS `format` on a typeless anyOf node", !demoted(conv(typeless, "anthropic-go")));
+
+  // (5) An unrecognised value on a STRING node is demoted by all three — this is
+  //     the control that keeps (4) about the node's TYPE and not about the value.
+  ok("all three demote an unlisted value on a string node ('Email')",
+    demoted(conv(str("Email"), "anthropic-json")) &&
+    demoted(conv(str("Email"), "anthropic-json-python")) &&
+    demoted(conv(str("Email"), "anthropic-go")));
+
+  // (6) THE FIX. Go guards on `s.Format != ""` (the VALUE) where JS/Python guard
+  //     on the key being present, and `invopop` declares Format as a bare string
+  //     with omitempty — so an empty/null format is serialised away with NOTHING
+  //     written to `description`. Measured: JS/Python emit {format: ""} /
+  //     {format: null} as prose, Go emits no entry at all. Reporting that as a
+  //     demotion would be #334's error (a silent drop sold as a visible one).
+  [["", "empty"], [null, "null"]].forEach(function (pair) {
+    var f = pair[0], label = pair[1];
+    var go = conv(str(f), "anthropic-go");
+    ok("Go reports a " + label + " `format` as a silent DELETION", silentDrop(go));
+    ok("Go does not claim a " + label + " `format` reaches `description`", !demoted(go));
+    ok("JS still reports a " + label + " `format` as demoted-to-prose",
+      demoted(conv(str(f), "anthropic-json")) && !silentDrop(conv(str(f), "anthropic-json")));
+  });
+
+  // (7) Over-block guard for (6): a NON-empty unlisted format on Go must still be
+  //     the ordinary demotion, not the new deletion message.
+  var goPath = conv(str("path"), "anthropic-go");
+  ok("Go keeps the ordinary demotion wording for a non-empty unlisted format",
+    demoted(goPath) && !silentDrop(goPath));
+
+  // (8) `pattern` is the key-level divergence (#332) and must stay put: Go keeps
+  //     it, the other two demote it. Pins that (4)-(7) did not disturb it.
+  var pat = { type: "object", properties: { x: { type: "string", pattern: "^a$" } }, required: ["x"] };
+  ok("Go keeps `pattern` while JS/Python demote it",
+    !has(conv(pat, "anthropic-go").ledger, "`pattern` is NOT enforced") &&
+    has(conv(pat, "anthropic-json").ledger, "`pattern` is NOT enforced"));
+
+  // (9) The tools path applies no transform at all, so nothing above is a
+  //     finding there — no `format` advisory on `--to anthropic` for any value.
+  var toolsClean = true;
+  ["email", "path", "base64", ""].forEach(function (f) {
+    if (demoted(conv(str(f), "anthropic"))) toolsClean = false;
+  });
+  ok("`--to anthropic` (tools, verbatim) reports no `format` demotion at all", toolsClean);
+
+  // (10) None of this may fail a gate: Anthropic accepts the document either way,
+  //      so every entry is advisory (#317).
+  var advisoryOnly = TARGETS.every(function (t) {
+    return conv(str("path"), t).ledger.every(function (l) { return l.advisory === true || l.op === "="; });
+  });
+  ok("every anthropic `format` finding is advisory, never a gate failure", advisoryOnly);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

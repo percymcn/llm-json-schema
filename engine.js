@@ -2140,6 +2140,31 @@
           url, true));
         return;
       }
+      // `format` is the one demoted key whose Go guard tests the VALUE, not the
+      // key: `if s.Format != "" && !slices.Contains(supportedStringFormats, ...)`
+      // (schemautil.go). An empty or null `format` therefore skips the demotion
+      // branch entirely, and `invopop` declares `Format` as a bare `string` with
+      // `omitempty`, so it is then serialised away. Measured on v1.62.0: the key
+      // vanishes with NO `description` entry, where JS/Python both write
+      // `{format: ""}` / `{format: null}` into prose. Saying "appended to the
+      // description" here would be the #334 error — reporting a silent drop as a
+      // visible demotion.
+      if (goSdk && d.key === "format" &&
+          (d.node.format === "" || d.node.format === null)) {
+        ledger.push(entry("=", d.path,
+          "`format` is DELETED without a trace here, not demoted to prose. The Go SDK guards its " +
+          "format check on `s.Format != \"\"` (schemautil.go), so an empty or null value skips the " +
+          "demotion branch, and `invopop` declares the field as a bare `string` with `omitempty` — so " +
+          "it is serialised away with nothing written to this node's `description`. " +
+          "`@anthropic-ai/sdk` and `anthropic` (Python) both guard on the key being PRESENT rather " +
+          "than non-empty, so they record `{format: " +
+          (d.node.format === null ? "null" : "\"\"") + "}` as text. Measured on " +
+          "anthropic-sdk-go@v1.62.0. An empty `format` constrains nothing either way, so this costs " +
+          "you no enforcement — it is flagged so the three SDKs' outputs are not assumed identical." +
+          VERBATIM_ESCAPE,
+          url, true));
+        return;
+      }
       if (goSdk && GO_POINTER_FORMATTED[d.key]) {
         ledger.push(entry("=", d.path,
           "`" + d.key + "` is not enforced by the Go SDK — and it does not even arrive as readable " +
@@ -3427,7 +3452,30 @@
     // independent ones: the JS `Schema` interface (dist/genai.d.ts), the Python
     // `types.Schema` model (`extra="forbid"`), and the Go `Schema` struct's
     // json tags (google.golang.org/genai v1.67.0) — all 22, identical.
-    GEMINI_ALLOWED_KEYS: Object.keys(GEMINI_ALLOWED)
+    GEMINI_ALLOWED_KEYS: Object.keys(GEMINI_ALLOWED),
+
+    // The `format` VALUES Anthropic's transformer keeps on a string. Exported
+    // for the same reason as GEMINI_ALLOWED_KEYS: so "all three SDKs agree" is a
+    // test rather than a sentence. Confirmed 2026-08-09 against three
+    // independent vendor artifacts, each a LITERAL in code — the JS
+    // `SUPPORTED_STRING_FORMATS` (`new Set([...])`, lib/transform-json-schema.js),
+    // the Python `SupportedStringFormats` (a `set` literal, lib/_parse/_transform.py)
+    // and the Go `supportedStringFormats` (`[]string{...}`, schemautil.go) —
+    // all 10, identical.
+    //
+    // #344 asked whether a vendor list is CLOSED or OPEN before implementing it
+    // as an allowlist. These three are CLOSED: each enumerates its members in
+    // code with no "and others" escape, which is the opposite of Gemini's
+    // `Schema.format`, whose own field description ends "and other formats to
+    // further refine the data type". Same keyword, opposite answers, so the
+    // question has to be asked per vendor rather than once per keyword.
+    //
+    // Honest boundary (#343): these are three CLIENTS agreeing, which is exactly
+    // the shape that was wrong for Gemini. Unlike Gemini there is no free
+    // pre-auth oracle here — Anthropic authenticates before validating — so the
+    // service itself has NOT been asked, and this list is only a claim about
+    // what the clients forward.
+    ANTHROPIC_STRING_FORMATS_KEPT: Object.keys(ANTHROPIC_STRING_FORMATS)
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;
