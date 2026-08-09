@@ -1995,5 +1995,103 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 })();
 
+// ---------------------------------------------------------------------------
+// #331: real payloads from a Go framework -- microsoft/agent-framework-go.
+//
+// Every fixture below is the VERBATIM output of `jsonschema.For[T]` from
+// google/jsonschema-go v0.4.3 (the version that repo pins) run through the
+// `makeStrict` rewrite proposed in agent-framework-go PR #689 -- i.e. what that
+// framework would put on the wire, not a schema we wrote. First Go-language
+// framework in the fixture set; the previous six probes were JS/Python.
+//
+// Vendor verdicts measured 2026-08-09 against openai@7.4.0 toStrictJsonSchema:
+//   Plain    -> ACCEPTED   (repaired only by reordering `required`)
+//   map[string]string -> THROWS  (`properties/tags` must set additionalProperties:false)
+//   map[string]any    -> THROWS  (same, from additionalProperties:true)
+//   required naming an undeclared key -> THROWS
+//   required with no `properties`     -> THROWS
+// Our gate agreed on all five. These pin that agreement: they are the shapes
+// #329 (open map) and #330 (required mismatch) were built for, arriving from a
+// third party rather than from a fixture of our own.
+(function () {
+  var clone = function (x) { return JSON.parse(JSON.stringify(x)); };
+
+  var GO_PLAIN = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      age: { type: "integer" },
+      email: { type: ["string", "null"] }
+    },
+    required: ["age", "email", "name"],
+    additionalProperties: false
+  };
+  var GO_MAP_STRING = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      tags: { type: "object", additionalProperties: { type: "string" } }
+    },
+    required: ["name", "tags"],
+    additionalProperties: false
+  };
+  var GO_MAP_ANY = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      meta: { type: "object", additionalProperties: true }
+    },
+    required: ["meta", "name"],
+    additionalProperties: false
+  };
+  var GO_GHOST = {
+    type: "object",
+    properties: { a: { type: "string" } },
+    required: ["a", "ghost"],
+    additionalProperties: false
+  };
+  var GO_NO_PROPS = {
+    type: "object",
+    required: ["a"],
+    additionalProperties: false
+  };
+
+  // The vendor accepts this one, so blocking it would be a false CI failure --
+  // being merely stricter than the vendor is this project's most repeated bug.
+  ok("agent-framework-go: an ordinary struct is not blocked (vendor ACCEPTS)",
+    blockers(E.convert(clone(GO_PLAIN), "openai")).length === 0);
+
+  // `makeStrict` early-returns on a node with no `properties`, so a Go map
+  // field keeps its open `additionalProperties` and the vendor throws.
+  ok("agent-framework-go: a map[string]string field is blocked as an open map",
+    blockers(E.convert(clone(GO_MAP_STRING), "openai")).length === 1);
+  ok("agent-framework-go: a map[string]any field is blocked as an open map",
+    blockers(E.convert(clone(GO_MAP_ANY), "openai")).length === 1);
+
+  // The element type must survive into the output so the reader can see what
+  // needs remodelling (#318) -- a blocker that hides the shape is not a fix.
+  var mapOut = E.convert(clone(GO_MAP_STRING), "openai");
+  ok("agent-framework-go: the map's element type is carried through, not dropped",
+    mapOut.schema.properties.tags.additionalProperties.type === "string");
+
+  // Both directions of the required/properties correspondence.
+  ok("agent-framework-go: `required` naming an undeclared key is blocked",
+    blockers(E.convert(clone(GO_GHOST), "openai")).length === 1);
+  ok("agent-framework-go: `required` with no `properties` at all is blocked",
+    blockers(E.convert(clone(GO_NO_PROPS), "openai")).length === 1);
+
+  // The undeclared name must stay visible rather than being silently deleted --
+  // that deletion IS the defect #330 found in our own engine and in this PR.
+  var ghostOut = E.convert(clone(GO_GHOST), "openai");
+  ok("agent-framework-go: the undeclared name is not silently dropped",
+    ghostOut.schema.required.indexOf("ghost") !== -1);
+
+  // Non-strict OpenAI accepts every one of these, so none may be blocked there.
+  [GO_PLAIN, GO_MAP_STRING, GO_MAP_ANY, GO_GHOST, GO_NO_PROPS].forEach(function (s, i) {
+    ok("agent-framework-go: payload " + i + " is not blocked on openai-nonstrict",
+      blockers(E.convert(clone(s), "openai-nonstrict")).length === 0);
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
