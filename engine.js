@@ -523,6 +523,67 @@
     return s;
   }
 
+  // A `$ref` that STARTS with `#` is a pointer into this same document, so
+  // `normalizeRefSpelling` above skips it — it only ever inspected the refs that
+  // do not. That left the other half unchecked: a local pointer whose TARGET is
+  // absent. Nothing in the pipeline notices, because every rule that reads a
+  // ref asks "where does this point?" and then quietly does nothing when the
+  // answer is nowhere. `--check --to openai` exited 0 on it while
+  // `toStrictJsonSchema()` throws `Local $ref ... does not resolve`.
+  //
+  // It is not exotic. It is what a document looks like after something MOVED or
+  // DROPPED the definition bag but left the pointers: measured on
+  // strands-agents 1.51.0, whose `_flatten_schema`
+  // (`strands/tools/structured_output/structured_output_utils.py`) rebuilds the
+  // schema from a five-key keep-list — `type`, `properties`, `title`,
+  // `description`, `required` — so a `Field(discriminator=...)` union keeps its
+  // `oneOf: [{$ref: "#/$defs/Cat"}, ...]` while `$defs` itself, not being on the
+  // list, is dropped.
+  //
+  // Resolution is a real JSON pointer walk, not a string match: `#` alone is the
+  // root, `~1` is `/` and `~0` is `~` (RFC 6901), and a numeric token indexes an
+  // array. Anything we cannot resolve is REPORTED — the rule fails closed,
+  // because "I could not find the target" must never be read as "it is fine"
+  // (the inversion that deleted definitions in #320).
+  function resolvesLocally(root, ref) {
+    if (ref === "#" || ref === "") return true;
+    if (ref.charAt(0) !== "#") return false;
+    var frag = ref.slice(1);
+    if (frag.charAt(0) !== "/") return false; // `#name` — a `$anchor`, not a pointer
+    var toks = frag.split("/").slice(1);
+    var cur = root;
+    for (var i = 0; i < toks.length; i++) {
+      var t = decodeURIComponent(toks[i]).replace(/~1/g, "/").replace(/~0/g, "~");
+      if (Array.isArray(cur)) {
+        if (!/^\d+$/.test(t) || Number(t) >= cur.length) return false;
+        cur = cur[Number(t)];
+      } else if (isPlainObject(cur)) {
+        if (!Object.prototype.hasOwnProperty.call(cur, t)) return false;
+        cur = cur[t];
+      } else {
+        return false;
+      }
+    }
+    // A pointer that lands on a non-schema (a string, a number) is dangling in
+    // every sense that matters — the vendor's message says exactly this.
+    return isPlainObject(cur) || typeof cur === "boolean";
+  }
+
+  function findDanglingLocalRefs(root) {
+    var out = [];
+    (function visit(v, path) {
+      if (Array.isArray(v)) { v.forEach(function (x, i) { visit(x, path + "[" + i + "]"); }); return; }
+      if (!isPlainObject(v)) return;
+      if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#" && !resolvesLocally(root, v.$ref)) {
+        out.push({ ref: v.$ref, path: path });
+      }
+      Object.keys(v).forEach(function (k) {
+        visit(v[k], k === "properties" || k === "$defs" || k === "definitions" ? path : path + "." + k);
+      });
+    })(root, "root");
+    return out;
+  }
+
   // `definitions` is draft-07 (what zod-to-json-schema emits); OpenAI's doc and
   // examples use `$defs`. Rename it and repoint every `$ref` that used it.
   function normalizeDefs(s, ledger, docUrl, why) {
@@ -645,13 +706,46 @@
     var result = visit(s, []);
     // once refs are inlined the definitions they pointed at may be orphaned;
     // dead `$defs` still count against OpenAI's 5000-property budget.
+    // This decides what to KEEP by looking for references, so per #320 it must
+    // fail CLOSED: "I could not find a reference to this" is not "nothing
+    // references this." It used to be a raw string match for `"#/$defs/<name>"`,
+    // which missed two ordinary spellings of the SAME pointer and deleted a
+    // live definition:
+    //   * RFC 6901 escapes — a definition named `a/b` is referenced as
+    //     `#/$defs/a~1b`, so the literal search never matched it;
+    //   * a pointer INTO a definition — `#/$defs/T/properties/x` does not
+    //     contain `"#/$defs/T"` (the closing quote is not there).
+    // Both left a dangling `$ref` in output that was intact on input. Collect
+    // the referenced names STRUCTURALLY instead, and if anything is unparseable,
+    // prune nothing — the pruner is only a size optimisation (dead `$defs`
+    // count against OpenAI's 5000-property budget), so skipping it is free
+    // while a wrong deletion is not.
     if (isPlainObject(result.$defs)) {
-      var kept = {};
-      Object.keys(result.$defs).forEach(function (k) {
-        var probe = clone(result); delete probe.$defs;
-        if (JSON.stringify([probe, result.$defs]).indexOf('"#/$defs/' + k + '"') !== -1) kept[k] = result.$defs[k];
-      });
-      if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
+      var referenced = {}, bailOut = false;
+      (function scan(v) {
+        if (bailOut) return;
+        if (Array.isArray(v)) { v.forEach(scan); return; }
+        if (!isPlainObject(v)) return;
+        if (typeof v.$ref === "string") {
+          var m = /^#\/\$defs\/([^/]+)/.exec(v.$ref);
+          if (m) {
+            referenced[decodeURIComponent(m[1]).replace(/~1/g, "/").replace(/~0/g, "~")] = true;
+          } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
+            // A local pointer we cannot attribute to a `$defs` entry. Rather
+            // than guess it is unrelated, stop pruning altogether.
+            bailOut = true;
+          }
+        }
+        Object.keys(v).forEach(function (k) { scan(v[k]); });
+      })(result);
+
+      if (!bailOut) {
+        var kept = {};
+        Object.keys(result.$defs).forEach(function (k) {
+          if (referenced[k]) kept[k] = result.$defs[k];
+        });
+        if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
+      }
     }
     if (fixed) {
       ledger.push(entry("~", "root",
@@ -3126,6 +3220,63 @@
         causeNote +
         " If you really did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
         DOCS[provider], true));
+    });
+
+    // Dangling local `$ref`s are checked on the OUTPUT, not the input, and
+    // deliberately: it is the document the caller is about to send, and running
+    // it last means it also audits our own edits — the ref-spelling rewrite, the
+    // `definitions`->`$defs` rename and the orphan-`$defs` pruner all move
+    // pointers or bags around, and a keep-rule that gets that wrong deletes a
+    // definition something still points at (#320). This is the check that would
+    // have caught it.
+    //
+    // Severity is per provider and MEASURED, not ported (rule 0-bis) — being
+    // merely stricter than the vendor is a false CI failure, which this project
+    // has shipped five times:
+    //   openai  BLOCKER  -- `toStrictJsonSchema()` (openai@7.4.0) throws
+    //                       "Local $ref ... does not resolve to an object or
+    //                       boolean schema".
+    //   gemini  BLOCKER  -- the narrow `responseSchema` proto has no `$ref`
+    //                       field at all, so we inline refs; an absent target
+    //                       cannot be inlined and `types.Schema`
+    //                       (google-genai 2.17.0, extra="forbid") REJECTS what
+    //                       is left.
+    //   others  ADVISORY -- measured on @anthropic-ai/sdk 0.116.0: BOTH
+    //                       `betaTool()` and `betaJSONSchemaOutputFormat()`
+    //                       accept a dangling ref and pass it through verbatim.
+    //                       The remaining targets were not probed for this shape
+    //                       this cycle, so they get the advisory too rather than
+    //                       a blocker we cannot justify.
+    // No repair is offered on purpose: the definition is gone from this file and
+    // inventing one would silently narrow the schema to a guess (#329's rule --
+    // when a repair is impossible, name the remodelling instead).
+    var danglingBlocks = provider === "openai" || provider === "gemini";
+    findDanglingLocalRefs(result.schema).forEach(function (d) {
+      result.ledger.push(entry(danglingBlocks ? "!" : "=", d.path,
+        "`$ref: \"" + d.ref + "\"` points into this document but there is nothing at that " +
+        "location — the reference is dangling, so whatever that subschema constrained is " +
+        "simply absent. " +
+        (danglingBlocks
+          ? (provider === "openai"
+              ? "OpenAI strict mode rejects it: `toStrictJsonSchema()` throws \"Local $ref ... " +
+                "does not resolve to an object or boolean schema\"."
+              : "Gemini's narrow `responseSchema` proto has no `$ref` field, so a ref has to be " +
+                "inlined — and this one has no target to inline, so `types.Schema` rejects what " +
+                "is left. `--to gemini-json` accepts `$ref`, but a dangling one still points at " +
+                "nothing.")
+          : "Measured on `@anthropic-ai/sdk` 0.116.0, both `betaTool()` and " +
+            "`betaJSONSchemaOutputFormat()` ACCEPT this and forward the pointer unresolved, so " +
+            "nothing will error — the model is simply handed a field with no schema behind it.") +
+        " The usual cause is that something moved or dropped the definition bag and left the " +
+        "pointers: measured on strands-agents 1.51.0, `_flatten_schema` " +
+        "(`strands/tools/structured_output/structured_output_utils.py`) rebuilds the schema from " +
+        "a five-key keep-list (`type`, `properties`, `title`, `description`, `required`), so a " +
+        "`Field(discriminator=...)` union keeps its `oneOf: [{\"$ref\": \"#/$defs/...\"}]` and " +
+        "loses the `$defs` bag those refs point at. Restore the definition under `$defs`, or " +
+        "inline the subschema at this location. It cannot be repaired automatically — the " +
+        "content is not in this file, and guessing it would narrow your schema to whatever we " +
+        "invented.",
+        DOCS[provider], !danglingBlocks));
     });
 
     return {

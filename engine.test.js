@@ -3365,5 +3365,137 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- DANGLING LOCAL `$ref` (strands-agents 1.51.0) --------------------------
+//
+// `normalizeRefSpelling` only ever inspected refs that do NOT start with `#`,
+// so a local pointer with an absent target was never checked: `--check --to
+// openai` exited 0 while `toStrictJsonSchema()` (openai@7.4.0) throws
+// "Local $ref at `properties/a` does not resolve to an object or boolean
+// schema". Fixtures are the VERBATIM output of strands-agents 1.51.0's
+// `convert_pydantic_to_tool_spec` (#311: test against real generator input).
+//
+// These go through convert(), not the raw converters: the check is a
+// convert()-level post-pass that runs on the OUTPUT, so it also audits our own
+// ref rewrites and the orphan-`$defs` pruner.
+(function () {
+  function blockers(l) {
+    return (l || []).filter(function (e) { return e.op === "!" && !e.advisory; });
+  }
+  function dangling(l) {
+    return (l || []).filter(function (e) { return e.msg.indexOf("the reference is dangling") !== -1; });
+  }
+
+  var DANGLING = { type: "object", title: "T", additionalProperties: false,
+                   required: ["a"], properties: { a: { $ref: "#/$defs/Missing" } } };
+  var NESTED = { type: "object", title: "T2", additionalProperties: false, required: ["a"],
+                 properties: { a: { type: "array", items: { $ref: "#/$defs/Gone" } } } };
+
+  // Measured: the vendor THROWS on both, so both are blockers.
+  ["openai", "gemini"].forEach(function (tgt) {
+    ok(tgt + ": a dangling local $ref is a blocker",
+      blockers(E.convert(DANGLING, tgt).ledger).length >= 1);
+    ok(tgt + ": a dangling $ref inside `items` is a blocker",
+      blockers(E.convert(NESTED, tgt).ledger).length >= 1);
+  });
+
+  // OVER-BLOCK GUARD, and it is the whole reason this is conditional: measured
+  // on @anthropic-ai/sdk 0.116.0, BOTH `betaTool()` and
+  // `betaJSONSchemaOutputFormat()` ACCEPT a dangling ref and forward it
+  // verbatim. Flagging it as a gate failure there would be the false-CI class
+  // this project has shipped five times.
+  ["anthropic", "anthropic-json"].forEach(function (tgt) {
+    var r = E.convert(DANGLING, tgt);
+    ok(tgt + ": a dangling $ref is reported but never fails the gate",
+      dangling(r.ledger).length >= 1 && blockers(r.ledger).length === 0);
+    // Requires a HIT first: `.every()` on an empty array is vacuously true, so
+    // without this the assertion passes against an engine that reports nothing.
+    ok(tgt + ": and it is marked advisory",
+      dangling(r.ledger).length >= 1 &&
+      dangling(r.ledger).every(function (e) { return e.advisory === true; }));
+  });
+
+  // The verbatim strands payload: `_flatten_schema` keeps `oneOf` + its `$ref`s
+  // and drops the `$defs` bag those refs point at.
+  var STRANDS_DISC = { type: "object", title: "Disc", additionalProperties: false, required: ["pet"],
+    properties: { pet: { title: "Pet",
+      discriminator: { propertyName: "kind", mapping: { cat: "#/$defs/Cat", dog: "#/$defs/Dog" } },
+      oneOf: [{ $ref: "#/$defs/Cat" }, { $ref: "#/$defs/Dog" }] } } };
+  ok("openai: strands' discriminator payload is caught as dangling",
+    dangling(E.convert(STRANDS_DISC, "openai").ledger).length >= 1);
+  ok("openai: the dangling blocker names the measured producer",
+    has(E.convert(STRANDS_DISC, "openai").ledger, "strands-agents 1.51.0"));
+
+  // --- OVER-BLOCK GUARDS: everything below MUST NOT be reported ------------
+  var RESOLVES = { type: "object", additionalProperties: false, required: ["a"],
+    $defs: { T: { type: "object", properties: { x: { type: "integer" } } } },
+    properties: { a: { $ref: "#/$defs/T" } } };
+  ok("a $ref whose target exists is not reported",
+    dangling(E.convert(RESOLVES, "openai").ledger).length === 0);
+
+  // draft-07 `definitions` is renamed to `$defs` and every ref repointed. The
+  // check runs AFTER that, so it must see the renamed bag, not report the
+  // pre-rename spelling as dangling.
+  var DRAFT07 = { type: "object", additionalProperties: false, required: ["a"],
+    definitions: { T: { type: "object", properties: { x: { type: "integer" } } } },
+    properties: { a: { $ref: "#/definitions/T" } } };
+  ok("a `#/definitions/...` ref that survives the $defs rename is not reported",
+    dangling(E.convert(DRAFT07, "openai").ledger).length === 0);
+
+  // A property literally NAMED `$ref` is data, not a reference (#334's control
+  // pair): its value is a schema object, not a string, so it must not match.
+  var PROP_NAMED_REF = { type: "object", additionalProperties: false, required: ["$ref"],
+    properties: { $ref: { type: "string" } } };
+  ok("a property NAMED `$ref` is not a false positive",
+    dangling(E.convert(PROP_NAMED_REF, "openai").ledger).length === 0);
+
+  // RFC 6901 escapes: `~1` is `/`, `~0` is `~`. A definition whose NAME contains
+  // a slash resolves only if the pointer is unescaped properly.
+  var ESCAPED = { type: "object", additionalProperties: false, required: ["a"],
+    $defs: { "a/b": { type: "object", properties: { x: { type: "integer" } } } },
+    properties: { a: { $ref: "#/$defs/a~1b" } } };
+  ok("an escaped JSON pointer (`~1`) resolves and is not reported",
+    dangling(E.convert(ESCAPED, "openai").ledger).length === 0);
+
+  // `#` alone is the root document — a legal self-reference, not a dangling one.
+  ok("a bare `#` self-reference is not reported",
+    dangling(E.convert({ type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { $ref: "#" } } }, "openai").ledger).length === 0);
+
+  // --- The orphan-`$defs` pruner, which the check above caught deleting -----
+  //
+  // The pruner decided what to KEEP by string-matching `"#/$defs/<name>"`, so
+  // two ordinary spellings of the same pointer looked like no reference at all
+  // and the definition was deleted — turning an intact input into an output
+  // with a dangling ref. Ninth instance of the alternate-spelling class, and
+  // #320's fail-closed rule applied to the escape form.
+  var ESCAPED_KEPT = E.convert(ESCAPED, "openai").schema;
+  ok("pruner: a def referenced by an escaped pointer survives",
+    !!(ESCAPED_KEPT.$defs && ESCAPED_KEPT.$defs["a/b"]));
+
+  var DEEP = { type: "object", additionalProperties: false, required: ["a"],
+    $defs: { T: { type: "object", properties: { x: { type: "integer" } } } },
+    properties: { a: { $ref: "#/$defs/T/properties/x" } } };
+  var DEEP_OUT = E.convert(DEEP, "openai");
+  ok("pruner: a def referenced by a pointer INTO it survives",
+    !!(DEEP_OUT.schema.$defs && DEEP_OUT.schema.$defs.T));
+  ok("pruner: and that ref is therefore not reported as dangling",
+    dangling(DEEP_OUT.ledger).length === 0);
+
+  // GUARD: the fix must not simply stop pruning. A genuinely unreferenced
+  // definition is still removed — dead `$defs` count against OpenAI's
+  // 5000-property budget, which is why the pruner exists.
+  ok("pruner: a genuinely orphaned def is still removed",
+    !E.convert({ type: "object", additionalProperties: false, required: ["a"],
+      $defs: { Unused: { type: "object", properties: { z: { type: "integer" } } } },
+      properties: { a: { type: "string" } } }, "openai").schema.$defs);
+
+  // A pointer that lands on a STRING rather than a schema is dangling in the
+  // sense the vendor means ("does not resolve to an object or boolean schema").
+  ok("a pointer landing on a non-schema value is reported",
+    dangling(E.convert({ type: "object", additionalProperties: false, required: ["a"],
+      $defs: { T: { type: "object", properties: { x: { type: "integer" } } } },
+      properties: { a: { $ref: "#/$defs/T/type" } } }, "openai").ledger).length >= 1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
