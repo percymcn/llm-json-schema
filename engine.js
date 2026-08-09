@@ -75,6 +75,32 @@
     return false;
   }
 
+  // An EMPTIED map is the fossil an open map leaves behind after something has
+  // already "repaired" it: `additionalProperties: false` and NO `properties` key
+  // at all. Its only legal instance is `{}`, so the field can never be
+  // populated — but it is perfectly valid, every provider accepts it, and by the
+  // time you are looking at it the value type is GONE. Nothing downstream can
+  // recover what it used to be, which is why this is worth saying out loud.
+  //
+  // Measured against @mastra/schema-compat@1.3.5, whose
+  // `prepareJsonSchemaForOpenAIStrictMode` produces exactly this from an
+  // ordinary `z.record(z.string())`: the vendor then ACCEPTS the result.
+  //
+  // The discriminator is the ABSENCE of the `properties` key, not an empty one.
+  // Measured: a deliberate `z.object({})` emits `properties: {}`, so requiring
+  // the key to be missing separates a real empty object from an emptied map.
+  // Being merely noisier than the vendor is this project's most repeated bug,
+  // so this is advisory-only and never fails a gate.
+  function isEmptiedMap(node) {
+    if (!isPlainObject(node)) return false;
+    if (node.additionalProperties !== false) return false;
+    if ("properties" in node) return false;
+    var t = node.type;
+    if (t === "object") return true;
+    if (Array.isArray(t) && t.indexOf("object") !== -1) return true;
+    return false;
+  }
+
   // ---- boolean subschemas ---------------------------------------------------
   //
   // JSON Schema defines a schema as "an object OR a boolean": `true` matches any
@@ -2676,6 +2702,31 @@
     }
 
     var result = conv(schema);
+
+    // An emptied map is provider-independent: it is a fact about the document
+    // the caller is holding, not about who accepts it, and EVERY provider
+    // accepts it. So it is reported once, here, for every target — and only as
+    // an advisory, because there is genuinely nothing to fix in this file. The
+    // value type is already gone; the fix belongs upstream, in whatever
+    // compatibility layer ran before us.
+    //
+    // Reported on the INPUT, because a converter that legitimately closes an
+    // object would otherwise make us report our own edit back to the caller.
+    walk(schema, "root", function (node, path) {
+      if (!isEmptiedMap(node)) return;
+      result.ledger.push(entry("=", path,
+        "This object is closed (`additionalProperties: false`) and declares no `properties`, " +
+        "so its only legal value is `{}` — the model can never put anything in it. Every " +
+        "provider accepts this, so nothing will warn you. Most often it is not what anyone " +
+        "wrote: it is what is left after a compatibility layer \"fixed\" a map/dictionary by " +
+        "setting `additionalProperties: false`, which does not close an open map, it empties " +
+        "it (measured: `@mastra/schema-compat`'s `prepareJsonSchemaForOpenAIStrictMode` does " +
+        "exactly this to an ordinary `z.record(z.string())`). The value type is already gone " +
+        "here and cannot be recovered — check the schema BEFORE that layer runs. If you really " +
+        "did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
+        DOCS[provider], true));
+    });
+
     return {
       ok: true,
       schema: result.schema,

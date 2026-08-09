@@ -2554,5 +2554,76 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 })();
 
+// ---------------------------------------------------------------------------
+// Cycle #335 — the emptied-map fossil, and the Mastra battery it came from.
+//
+// Fixtures are the VERBATIM output of @mastra/schema-compat@1.3.5's
+// `prepareJsonSchemaForOpenAIStrictMode` (#311: pin to real generator output,
+// not something we wrote). The point of the whole block is that our verdict
+// agrees with the vendor's on both the raw input and Mastra's wire payload.
+(function () {
+  // Verbatim: zod@3.25.76 + zod-to-json-schema, `z.record(z.string())`, run
+  // through Mastra's strict-mode prep. Measured: the vendor ACCEPTS this and
+  // the `tags` field can then only ever be `{}`.
+  var MASTRA_WIRE = {
+    type: "object",
+    properties: { title: { type: "string" }, tags: { type: "object", additionalProperties: false } },
+    required: ["title", "tags"],
+    additionalProperties: false
+  };
+  var MASTRA_RAW = {
+    type: "object",
+    properties: { title: { type: "string" }, tags: { type: "object", additionalProperties: { type: "string" } } },
+    required: ["title", "tags"],
+    additionalProperties: false
+  };
+
+  var wire = E.convert(JSON.parse(JSON.stringify(MASTRA_WIRE)), "openai");
+  ok("mastra: the emptied map left behind is reported",
+    has(wire.ledger, "compatibility layer"));
+  ok("mastra: it is ADVISORY — there is nothing to fix in this file",
+    wire.ledger.filter(function (l) { return /compatibility layer/.test(l.msg); })
+      .every(function (l) { return l.advisory === true; }));
+  ok("mastra: it names the upstream cause rather than blaming the schema",
+    has(wire.ledger, "z.record"));
+
+  // The discriminator, and it is the whole reason this is safe to ship:
+  // measured, a deliberate `z.object({})` emits `properties: {}`, while an
+  // emptied map has NO `properties` key. Empty-but-present must not fire.
+  var legit = E.convert({
+    type: "object",
+    properties: { e: { type: "object", properties: {}, additionalProperties: false } },
+    required: ["e"], additionalProperties: false
+  }, "openai");
+  ok("mastra: a deliberate empty object (`properties: {}`) is NOT flagged",
+    !has(legit.ledger, "compatibility layer"));
+
+  // No double-report: a live open map is a blocker, not a fossil.
+  var live = E.convert(JSON.parse(JSON.stringify(MASTRA_RAW)), "openai");
+  ok("mastra: a LIVE open map gets the blocker, not the fossil advisory",
+    has(live.ledger, "This is an open map") && !has(live.ledger, "compatibility layer"));
+
+  // Provider-independent: every target accepts an emptied map, so every target
+  // says so, and none of them turns it into a gate failure.
+  ["openai", "openai-nonstrict", "anthropic", "anthropic-json", "gemini", "gemini-json", "anthropic-go"].forEach(function (p) {
+    var x = E.convert(JSON.parse(JSON.stringify(MASTRA_WIRE)), p);
+    ok(p + ": reports the emptied map",     has(x.ledger, "compatibility layer"));
+    ok(p + ": and only as an advisory",
+      x.ledger.filter(function (l) { return /compatibility layer/.test(l.msg); })
+        .every(function (l) { return l.advisory === true; }));
+  });
+
+  // Regression pins on the Mastra battery itself (#331: a differential test
+  // against a live third party beats another fixture we wrote ourselves).
+  // Each of these is a shape Mastra's strict prep FAILS to fix or silently
+  // damages, with our verdict measured against `toStrictJsonSchema`.
+  var ghost = E.convert({ type: "object", properties: { a: { type: "string" } }, required: ["a", "ghost"] }, "openai");
+  ok("mastra: `required` naming an undeclared key is still a blocker (#330)",
+    ghost.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+  var noProps = E.convert({ type: "object", required: ["a"] }, "openai");
+  ok("mastra: `required` with no `properties` — the shape Mastra's prep skips",
+    noProps.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
