@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 243 engine + 97 CLI + 31 ESM/library assertions = **371** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 262 engine + 102 CLI + 31 ESM/library assertions = **395** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -158,6 +158,23 @@ Each provider accepts a different schema dialect, so a schema that works with on
   The two paths also differ in how they treat an unsupported keyword, which is why the tool treats them differently. OpenAI's doc says outright that an unsupported schema means "you will receive an error", so unsupported keywords are **removed**. Gemini's `response_json_schema` says the full JSON Schema **may be sent** and merely that not all features are supported — so on that path unsupported keywords are **kept and flagged as unenforced**, because deleting a constraint the request tolerates costs you something and buys nothing. On the narrow proto path they are removed, and that one is machine-checkable rather than a judgement call: the Python SDK's `types.Schema` is declared `extra="forbid"`, so `Schema.model_validate()` raises on any keyword outside the proto. That makes it a vendor-owned oracle you can run with no API key — the same role `toStrictJsonSchema()` plays for OpenAI — and this tool's narrow-path output is round-tripped through it.
 
   On the JSON-Schema path the tool also enforces two rules stated only on that SDK field: a `$ref` sub-schema may carry no non-`$` siblings, and cyclic references are only allowed inside **non-required** properties.
+
+  **Google's two SDKs also disagree — and here it is Python that validates and JavaScript that does not.** That is the opposite of the OpenAI split above, so you cannot predict which side is strict from the language. Measured 2026-08-09 over a 40-shape battery run through both clients (`@google/genai@2.16.0`, `google-genai@2.17.0`), capturing the request body each one actually builds:
+
+  | | `@google/genai` (JS) | `google-genai` (Python) |
+  |---|---|---|
+  | shapes it refuses to build | **0 of 40** | **18 of 40** |
+  | `prefixItems`, `uniqueItems`, `exclusiveMinimum`, `oneOf`, `allOf`, `not`, `patternProperties`, `propertyNames`, nested `$id`, `examples`, `$comment`, integer `enum`, `const` | forwarded **verbatim** into the proto | raises `extra_forbidden` |
+  | `type: ["string","null"]` | rewritten to `{type:"STRING", nullable:true}` | raises — `Schema.type` is a single-valued enum |
+  | `items: [A, B]` (draft-07 tuple) | silently becomes `items: {"0":A, "1":B}` | raises |
+  | `additionalProperties: false` | silently dropped | preserved |
+  | `$ref` / `$defs` | left in place, unresolved | inlined |
+  | `type: "null"` alone | **throws** | accepted, becomes `{nullable:true}` |
+  | wire casing | `minLength`, `anyOf`, `propertyOrdering` | `min_length`, `any_of`, `property_ordering` |
+
+  `processJsonSchema()` in the JS client is a type-caser, not a validator: it upper-cases `type` and forwards everything else. So the JS client hands you a **runtime 400** where the Python client raises **before the request exists** — and the schema that a Python user cannot even build is one a JS user ships to production.
+
+  This is why `--to gemini` rewrites a union `type`. `zod-to-json-schema` emits `type: ["string","null"]` for `.nullable()`, and this tool's own `--to openai` output creates it. Every one of the 12 union shapes tested fails in **one** of the two SDKs — in both directions, since bare `type:"null"` fails in the opposite one — and the converted output was verified to build in **both**. The rewrite is the one the JS SDK itself performs, with two deliberate departures where that SDK is wrong: a null-only type becomes `{nullable:true}` rather than an empty `anyOf`, and repeated members are collapsed. On `--to gemini-json` a union `type` is left alone, because it is ordinary JSON Schema there.
 
 ### What generators actually emit
 `zod-to-json-schema` wraps your schema as `{ "$ref": "#/definitions/X", "definitions": { … } }`.

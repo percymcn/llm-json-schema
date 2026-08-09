@@ -1463,6 +1463,93 @@
   // it as "permissive path" green-lit a payload the live API rejects with
   // `Unknown name "prefixItems" ... Cannot find field`. Only the caller knows
   // which client they hold, so the caller picks the target.
+  // Union `type` for the narrow `responseSchema` proto.
+  //
+  // `type` is in GEMINI_ALLOWED, so an ARRAY sitting in `type` sailed straight
+  // through the allowlist and `--check --to gemini` exited 0 — the same
+  // alternate-spelling false pass as array-form `items`, one field over
+  // (`definitions` vs `$defs` #311, array-`items` #313/#316, `/$defs/` #320).
+  //
+  // `types.Schema.type` is a SINGLE-valued enum, so `google-genai` (Python)
+  // 2.17.0 refuses to build the request at all:
+  //   properties.a.type: Input should be 'TYPE_UNSPECIFIED', 'STRING', 'NUMBER',
+  //   'INTEGER', 'BOOLEAN', 'ARRAY' or 'NULL'
+  // — even for a single-element list like ["string"]. `@google/genai` (JS)
+  // 2.16.0 does NOT throw; it rewrites. The rewrite below is copied from what
+  // that SDK actually emits, measured shape by shape rather than guessed:
+  //   ["string","null"]           -> {type:"STRING", nullable:true}
+  //   ["string","integer"]        -> {anyOf:[{STRING},{INTEGER}]}   (no `type`)
+  //   ["string","integer","null"] -> {anyOf:[...], nullable:true}
+  //   ["string"]                  -> {type:"STRING"}
+  // Constraining siblings (`items`, `minLength`, …) stay OUTSIDE the generated
+  // `anyOf`, which is also what the JS SDK does.
+  //
+  // Two deliberate divergences from that SDK, both because it is wrong there:
+  //   * a null-only type. JS emits `{nullable:true, anyOf:[]}` for ["null"] but
+  //     THROWS on the equivalent bare `"null"` ("type: null can not be the only
+  //     possible type for the field."). Python is inconsistent in the mirror
+  //     direction: it ACCEPTS bare `"null"` and rewrites it to `{nullable:true}`
+  //     with no `type`, and throws on ["null"]. We emit `{nullable:true}` for
+  //     both, the one form neither SDK rejects.
+  //   * duplicates are collapsed. JS emits `anyOf:[{STRING},{STRING}]` for
+  //     ["string","string","null"]; deduping makes that a plain nullable string.
+  //
+  // Not exotic: `zod-to-json-schema` emits `type:["string","null"]` for
+  // `.nullable()`, and our own `--to openai` output CREATES it (the forced-
+  // required rewrite shipped in #311).
+  function normalizeUnionType(node, path, ledger) {
+    var raw = node.type;
+    var isList = Array.isArray(raw);
+    if (!isList && raw !== "null") return;
+
+    var list = isList ? raw : ["null"];
+    var hasNull = false;
+    var rest = [];
+    list.forEach(function (t) {
+      if (t === "null") { hasNull = true; return; }
+      if (rest.indexOf(t) === -1) rest.push(t);
+    });
+
+    // `type` + `anyOf` together is already reported as a blocker upstream, and
+    // this rewrite would have to invent a merge. Leave it visible instead.
+    if (rest.length > 1 && node.anyOf !== undefined) return;
+
+    var before = JSON.stringify(raw);
+    var why;
+
+    if (rest.length === 0) {
+      delete node.type;
+      node.nullable = true;
+      why = "a null-only type has no proto spelling both SDKs accept; `{nullable: true}` " +
+        "with no `type` is the form `google-genai` itself produces";
+    } else if (rest.length === 1) {
+      node.type = rest[0];
+      if (hasNull) node.nullable = true;
+      why = "`Schema.type` holds one value, and `nullable` is the proto's way to say " +
+        "\"or null\"";
+    } else {
+      delete node.type;
+      node.anyOf = rest.map(function (t) { return { type: t }; });
+      if (hasNull) node.nullable = true;
+      why = "a multi-type union has no single `Schema.type`, so it becomes `anyOf` — " +
+        "which is what `@google/genai` emits for this input";
+    }
+
+    ledger.push(entry("~", path,
+      "Rewrote `type: " + before + "` to " +
+      JSON.stringify(node.anyOf !== undefined && rest.length > 1
+        ? { anyOf: node.anyOf, nullable: node.nullable }
+        : { type: node.type, nullable: node.nullable }, function (k, v) {
+          return v === undefined ? undefined : v;
+        }) + ". " +
+      "`types.Schema.type` is a single-valued enum, so `google-genai` (Python) REFUSES TO " +
+      "BUILD the request — `Input should be 'TYPE_UNSPECIFIED', 'STRING', … or 'NULL'` — " +
+      "even for a one-element list. `@google/genai` (JS) does not throw; it performs this " +
+      "same rewrite silently, so the two clients disagree about whether your schema is " +
+      "sendable at all. Lossless: " + why + ".",
+      DOCS.gemini));
+  }
+
   function toGemini(schema, jsonPath) {
     var s = clone(schema);
     var ledger = [];
@@ -1616,6 +1703,11 @@
     });
 
     walk(s, "root", function (node, path) {
+      // Union `type`. Runs before the allowlist strip below so the `nullable` /
+      // `anyOf` it produces are already in place when the allowlist sees them
+      // (both are fields of `Schema`).
+      normalizeUnionType(node, path, ledger);
+
       // Tuples. `items` is in GEMINI_ALLOWED, so an ARRAY sitting in `items`
       // used to sail straight through the allowlist untouched — the third time
       // an alternate spelling of a container has hidden from a keyword check

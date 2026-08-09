@@ -1592,5 +1592,99 @@ var PY_SDK_OK = {"properties":{"title":{"maxLength":80,"minLength":2,"pattern":"
     blockers(control).length === 0);
 })();
 
+// --- Gemini union `type` -----------------------------------------------------
+// Cycle #326. `type` is on the Gemini allowlist, so an ARRAY in `type` used to
+// pass straight through and `--check --to gemini` exited 0 — a false pass on a
+// schema `google-genai` (Python) 2.17.0 REFUSES TO BUILD, because
+// `types.Schema.type` is a single-valued enum. `@google/genai` (JS) 2.16.0 does
+// not throw on any of these; it silently performs the rewrite below.
+//
+// Every expectation here was measured against both SDKs. Each raw shape fails
+// in ONE language and builds in the other -- in BOTH directions, `bare-null`
+// going the opposite way from the rest -- and every converted output was
+// verified to build in BOTH.
+(function () {
+  function gem(schema) { return E.convert(JSON.parse(JSON.stringify(schema)), "gemini"); }
+  function propA(r) { return r.schema.properties.a; }
+
+  // The plain nullable field. `zod-to-json-schema` emits exactly this for
+  // `.nullable()`, and our own `--to openai` output creates it.
+  var r = gem({ type: "object", properties: { a: { type: ["string", "null"] } } });
+  ok("gemini union type is not a silent pass",
+    JSON.stringify(r.schema) !== JSON.stringify({ type: "object", properties: { a: { type: ["string", "null"] } } }));
+  ok("gemini ['string','null'] becomes type:string", propA(r).type === "string");
+  ok("gemini ['string','null'] sets nullable", propA(r).nullable === true);
+  ok("gemini nullable rewrite leaves no array type", !Array.isArray(propA(r).type));
+
+  // Multi-type union -> anyOf, which is what the JS SDK emits.
+  var m = gem({ type: "object", properties: { a: { type: ["string", "integer"] } } });
+  ok("gemini multi-type union becomes anyOf",
+    Array.isArray(propA(m).anyOf) && propA(m).anyOf.length === 2);
+  ok("gemini multi-type union drops `type` (proto forbids type+anyOf)",
+    propA(m).type === undefined);
+  // Guarded: with the rewrite absent these are `undefined`, and a suite that
+  // crashes instead of reporting cannot tell you what depends on the fix (#322).
+  ok("gemini multi-type union preserves both branches",
+    (propA(m).anyOf || []).length === 2 &&
+    propA(m).anyOf[0].type === "string" && propA(m).anyOf[1].type === "integer");
+
+  var t = gem({ type: "object", properties: { a: { type: ["string", "integer", "null"] } } });
+  ok("gemini union with null keeps anyOf AND nullable",
+    (propA(t).anyOf || []).length === 2 && propA(t).nullable === true);
+
+  // Divergences from the JS SDK, both deliberate: it emits an empty `anyOf`
+  // here, and does not dedupe.
+  var n0 = gem({ type: "object", properties: { a: { type: ["null"] } } });
+  ok("gemini null-only type becomes bare nullable, not an empty anyOf",
+    propA(n0).nullable === true && propA(n0).type === undefined && propA(n0).anyOf === undefined);
+  var d = gem({ type: "object", properties: { a: { type: ["string", "string", "null"] } } });
+  ok("gemini dedupes a repeated member instead of emitting anyOf",
+    propA(d).type === "string" && propA(d).anyOf === undefined && propA(d).nullable === true);
+
+  // Bare `type: "null"` is the one shape going the OTHER way: Python accepts it,
+  // JS throws ("type: null can not be the only possible type for the field.").
+  var b = gem({ type: "object", properties: { a: { type: "null" } } });
+  ok("gemini bare null type is normalised for the JS client that throws on it",
+    propA(b).nullable === true && propA(b).type === undefined);
+
+  // A one-element list is semantically identical to the bare string, and Python
+  // rejects it anyway.
+  var one = gem({ type: "object", properties: { a: { type: ["string"] } } });
+  ok("gemini single-element type list is unwrapped",
+    propA(one).type === "string" && one.ledger.length > 0);
+
+  // Depth: the walk must reach nested objects and item schemas.
+  var deep = gem({ type: "object", properties: { o: { type: "object", properties: { a: { type: ["string", "null"] } } } } });
+  ok("gemini union rewrite reaches a nested object",
+    deep.schema.properties.o.properties.a.nullable === true &&
+    deep.schema.properties.o.properties.a.type === "string");
+  var inItems = gem({ type: "object", properties: { a: { type: "array", items: { type: ["string", "null"] } } } });
+  ok("gemini union rewrite reaches an items schema",
+    propA(inItems).items.nullable === true && propA(inItems).items.type === "string");
+
+  // Root position.
+  var root = gem({ type: ["object", "null"], properties: { a: { type: "string" } } });
+  ok("gemini union rewrite applies at the root", root.schema.type === "object" && root.schema.nullable === true);
+
+  // Constraining siblings stay outside the generated anyOf (JS does the same).
+  var sib = gem({ type: "object", properties: { a: { type: ["string", "array"], items: { type: "integer" }, minLength: 2 } } });
+  ok("gemini keeps constraining siblings beside the generated anyOf",
+    propA(sib).items !== undefined && propA(sib).minLength === 2);
+
+  // A pre-existing `anyOf` beside a union `type` is already a blocker; do not
+  // invent a merge on top of it.
+  var conflict = gem({ type: "object", properties: { a: { type: ["string", "integer"], anyOf: [{ type: "boolean" }] } } });
+  ok("gemini leaves a type+anyOf conflict visible instead of merging",
+    blockers(conflict).length > 0);
+
+  // Idempotence, and the permissive path must NOT be touched: a union `type` is
+  // ordinary JSON Schema and `responseJsonSchema` takes it verbatim.
+  var again = E.convert(JSON.parse(JSON.stringify(r.schema)), "gemini");
+  ok("gemini union rewrite is idempotent", JSON.stringify(again.schema) === JSON.stringify(r.schema));
+  var js = E.convert({ type: "object", properties: { a: { type: ["string", "null"] } } }, "gemini-json");
+  ok("gemini-json leaves a union type alone (legal JSON Schema there)",
+    Array.isArray(js.schema.properties.a.type) && js.schema.properties.a.type.length === 2);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

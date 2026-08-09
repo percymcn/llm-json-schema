@@ -641,5 +641,35 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   ok("a typo'd provider is still rejected", bad.status === 2, "status=" + bad.status);
 })();
 
+// Cycle #326. The defect was an EXIT CODE: `--check --to gemini` returned 0 for
+// a schema `google-genai` (Python) refuses to build, so a CI gate went green on
+// a request that cannot be sent. Pinned here as well as in the engine, because
+// the exit code is what CI actually reads.
+(function () {
+  var NULLABLE = JSON.stringify({
+    type: "object",
+    properties: { note: { type: ["string", "null"] } },
+    required: ["note"]
+  });
+
+  var narrow = run(["--to", "gemini", "--check"], NULLABLE);
+  ok("a union `type` fails --check on the narrow gemini path",
+    narrow.status === 1, "status=" + narrow.status);
+  ok("...and the diagnosis names the single-valued proto enum",
+    /single-valued enum|REFUSES TO BUILD/.test(narrow.stderr), narrow.stderr.slice(0, 300));
+
+  var permissive = run(["--to", "gemini-json", "--check"], NULLABLE);
+  ok("the same schema passes on gemini-json (a union type is legal there)",
+    permissive.status === 0, "status=" + permissive.status);
+
+  var converted = run(["--to", "gemini"], NULLABLE);
+  var out = JSON.parse(converted.stdout);
+  ok("the converted narrow-path output carries nullable, not an array type",
+    out.properties.note.type === "string" && out.properties.note.nullable === true,
+    converted.stdout);
+  var twice = run(["--to", "gemini", "--check"], converted.stdout);
+  ok("the converted output then passes its own gate", twice.status === 0, "status=" + twice.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
