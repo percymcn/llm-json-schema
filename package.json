@@ -1,0 +1,44 @@
+{
+  "name": "llm-json-schema",
+  "version": "0.1.0",
+  "description": "Make a JSON Schema valid for OpenAI strict structured outputs, Anthropic tool use, or Gemini responseSchema. Dependency-free, works as a library, a CLI, and a CI gate.",
+  "keywords": [
+    "json-schema",
+    "openai",
+    "structured-outputs",
+    "strict",
+    "anthropic",
+    "tool-use",
+    "gemini",
+    "responseSchema",
+    "additionalProperties",
+    "zod",
+    "llm"
+  ],
+  "homepage": "https://percymcn.github.io/llm-json-schema/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/percymcn/llm-json-schema.git"
+  },
+  "bugs": {
+    "url": "https://github.com/percymcn/llm-json-schema/issues"
+  },
+  "license": "MIT",
+  "main": "engine.js",
+  "bin": {
+    "llm-schema": "cli.js"
+  },
+  "files": [
+    "engine.js",
+    "cli.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node engine.test.js && node cli.test.js"
+  },
+  "engines": {
+    "node": ">=14"
+  },
+  "dependencies": {}
+}
