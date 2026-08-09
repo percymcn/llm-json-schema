@@ -597,5 +597,49 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     j.stdout.slice(0, 120));
 })();
 
+// --- LangChain Python (#324): the anthropic-json split, end to end -------------
+(function () {
+  // Verbatim: pydantic 2.13.4 RootModel-shaped root, the shape LangChain Python
+  // hands to anthropic's transformer unchanged.
+  var LC_ROOT_REF = JSON.stringify({
+    "$ref": "#/$defs/Ticket",
+    "$defs": {
+      "Ticket": {
+        "type": "object", "title": "Ticket",
+        "properties": { "kind": { "type": "string", "enum": ["bug", "feature"] } },
+        "required": ["kind"]
+      }
+    }
+  });
+
+  var js = run(["--to", "anthropic-json", "--check"], LC_ROOT_REF);
+  var py = run(["--to", "anthropic-json-python", "--check"], LC_ROOT_REF);
+  ok("anthropic-json fails on a root $ref (TypeScript SDK drops $defs)",
+    js.status === 1, "status=" + js.status);
+  ok("anthropic-json-python passes the same bytes",
+    py.status === 0, "status=" + py.status);
+
+  var jsOut = run(["--to", "anthropic-json"], LC_ROOT_REF);
+  var pyOut = run(["--to", "anthropic-json-python"], LC_ROOT_REF);
+  ok("the two targets emit different schemas for one file",
+    jsOut.stdout !== pyOut.stdout);
+  // Parse defensively: an unknown provider writes nothing to stdout, and a
+  // throwing test aborts the file instead of reporting (#322).
+  function parseOr(s, fallback) { try { return JSON.parse(s); } catch (e) { return fallback; } }
+  ok("the Python target's output is byte-identical to its input",
+    JSON.stringify(parseOr(pyOut.stdout, null)) === JSON.stringify(JSON.parse(LC_ROOT_REF)));
+
+  ok("the failing TypeScript target names the Python one",
+    /anthropic-json-python/.test(js.stderr), js.stderr.slice(0, 200));
+
+  var help = run(["--help"], "");
+  ok("--help lists anthropic-json-python", /anthropic-json-python/.test(help.stdout));
+  ok("--help says what selects it (SDK language, not version)",
+    /same version string/.test(help.stdout) || /SDK LANGUAGE/.test(help.stdout), help.stdout.slice(0, 400));
+
+  var bad = run(["--to", "anthropic-json-pythonn", "--check"], LC_ROOT_REF);
+  ok("a typo'd provider is still rejected", bad.status === 2, "status=" + bad.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

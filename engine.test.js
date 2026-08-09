@@ -1302,5 +1302,235 @@ function at(obj, path) {
   });
 })();
 
+// --- LangChain Python (#324): the vendor's TWO SDKs disagree about one schema ---
+// Fixtures are verbatim generator output (#311): `Ticket.model_json_schema()` from
+// pydantic 2.13.4, the exact object langchain-openai 1.4.2 / langchain-anthropic
+// 1.5.4 / langchain-google-genai 4.3.2 put on the wire.
+var LC_PY_PYDANTIC = {
+  "$defs": {
+    "Priority": {
+      "description": "How urgent this is.",
+      "properties": {
+        "level": {
+          "description": "one of low/med/high",
+          "title": "Level",
+          "type": "string"
+        },
+        "score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Score",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "level",
+        "score"
+      ],
+      "title": "Priority",
+      "type": "object"
+    }
+  },
+  "description": "A support ticket.",
+  "properties": {
+    "title": {
+      "description": "Short summary",
+      "maxLength": 120,
+      "minLength": 2,
+      "title": "Title",
+      "type": "string"
+    },
+    "count": {
+      "title": "Count",
+      "type": "integer"
+    },
+    "kind": {
+      "enum": [
+        "bug",
+        "feature"
+      ],
+      "title": "Kind",
+      "type": "string"
+    },
+    "tags": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Tags",
+      "type": "array"
+    },
+    "bbox": {
+      "description": "x1,y1,x2,y2",
+      "maxItems": 4,
+      "minItems": 4,
+      "prefixItems": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        }
+      ],
+      "title": "Bbox",
+      "type": "array"
+    },
+    "priority": {
+      "$ref": "#/$defs/Priority"
+    },
+    "assignee": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Assignee"
+    }
+  },
+  "required": [
+    "title",
+    "count",
+    "kind",
+    "tags",
+    "bbox",
+    "priority"
+  ],
+  "title": "Ticket",
+  "type": "object"
+};
+
+// A Pydantic RootModel/discriminated-union root, the shape where the two Anthropic
+// SDKs produce different SCHEMAS rather than different warnings.
+var LC_PY_ROOT_REF = {
+  "$ref": "#/$defs/Ticket",
+  "$defs": {
+    "Ticket": {
+      "type": "object", "title": "Ticket",
+      "properties": { "kind": { "type": "string", "enum": ["bug", "feature"] } },
+      "required": ["kind"]
+    }
+  }
+};
+
+(function () {
+  ok("anthropic-json-python is a registered target",
+    E.PROVIDERS ? E.PROVIDERS.indexOf("anthropic-json-python") !== -1
+                : !!E.convert(JSON.parse(JSON.stringify(LC_PY_PYDANTIC)), "anthropic-json-python").ok);
+  ok("anthropic-json-python has a doc URL", !!E.DOCS["anthropic-json-python"]);
+})();
+
+(function () {
+  // `enum`: Python keeps it, JS stringifies it into `description`. Measured on
+  // anthropic 0.110.0/0.116.0/0.121.0 vs @anthropic-ai/sdk@0.116.0 -- the same
+  // version string, opposite behaviour, so this is not a skew that self-heals.
+  var js = E.convert(JSON.parse(JSON.stringify(LC_PY_PYDANTIC)), "anthropic-json");
+  var py = E.convert(JSON.parse(JSON.stringify(LC_PY_PYDANTIC)), "anthropic-json-python");
+
+  ok("anthropic-json reports enum as unenforced",
+    has(js.ledger, "`enum` is NOT enforced"));
+  ok("anthropic-json points a Python caller at the other target",
+    has(js.ledger, "--to anthropic-json-python"));
+  ok("anthropic-json-python does NOT report enum as unenforced",
+    !has(py.ledger, "`enum` is NOT enforced"));
+  ok("anthropic-json-python says enum IS enforced",
+    has(py.ledger, "`enum` IS enforced"));
+  ok("anthropic-json-python warns that TypeScript callers lose the enum",
+    has(py.ledger, "--to anthropic-json"));
+
+  // Neither may fail a gate: `enum` is kept on both, so this is information,
+  // not a defect (#317 -- an advisory that fails CI is the bug we keep shipping).
+  // `ledgerOf` for the same reason `has()` is defensive: a converter that does
+  // not exist returns {ok:false} with no ledger, and dereferencing it aborts the
+  // file, hiding every assertion after it (#322).
+  function ledgerOf(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  var enumRefs = ledgerOf(js).concat(ledgerOf(py)).filter(function (l) {
+    return l.msg.indexOf("enum") !== -1 && l.msg.indexOf("anthropic-json") !== -1;
+  });
+  ok("every enum cross-reference is advisory on both targets",
+    enumRefs.length > 0 && enumRefs.every(function (l) { return l.advisory === true; }));
+})();
+
+(function () {
+  // The root `$ref`: the one case where the split changes the OUTPUT.
+  var js = E.convert(JSON.parse(JSON.stringify(LC_PY_ROOT_REF)), "anthropic-json");
+  var py = E.convert(JSON.parse(JSON.stringify(LC_PY_ROOT_REF)), "anthropic-json-python");
+
+  // Defensive reads for the same reason as `has()`: a missing converter must
+  // report a failure, not abort the file and hide every later assertion (#322).
+  var jsS = (js && js.schema) || {}, pyS = (py && py.schema) || {};
+  var pyL = (py && Array.isArray(py.ledger)) ? py.ledger : null;
+
+  ok("anthropic-json inlines a root $ref (JS SDK drops $defs and loses everything)",
+    jsS.$ref === undefined && jsS.type === "object");
+  ok("anthropic-json-python leaves the root $ref alone",
+    pyS.$ref === "#/$defs/Ticket" && !!(pyS.$defs && pyS.$defs.Ticket));
+  ok("the two anthropic-json targets disagree on the same root-ref file",
+    !!js && !!py && JSON.stringify(jsS) !== JSON.stringify(pyS));
+  ok("anthropic-json-python needs no edit for a root $ref",
+    !!pyL && pyL.every(function (l) { return l.advisory === true || l.op === "="; }));
+  ok("anthropic-json-python still explains what a TypeScript caller must do",
+    has(py.ledger, "run `--to anthropic-json`"));
+})();
+
+(function () {
+  // draft-07 spelling is destroyed by BOTH SDKs (the Python early-return only
+  // rescues `$defs`), so the fix there stays unconditional.
+  var d7 = {
+    "$ref": "#/definitions/T",
+    "definitions": { "T": { "type": "object", "properties": { "a": { "type": "string" } } } }
+  };
+  var py = E.convert(JSON.parse(JSON.stringify(d7)), "anthropic-json-python");
+  var pyS = (py && py.schema) || null;
+  ok("anthropic-json-python still repairs a draft-07 root $ref",
+    !!pyS && (pyS.$ref === undefined || !!pyS.$defs));
+  ok("draft-07 root $ref is a real change, not an advisory, on the Python target",
+    !!py && Array.isArray(py.ledger) &&
+    py.ledger.some(function (l) { return l.advisory !== true; }));
+})();
+
+(function () {
+  // The `$defs`-is-not-a-sibling fix must not stop any other target inlining.
+  ["openai", "anthropic-json"].forEach(function (p) {
+    var r = E.convert(JSON.parse(JSON.stringify(LC_PY_ROOT_REF)), p);
+    ok(p + " still inlines a root $ref", r.schema && r.schema.$ref === undefined);
+  });
+  // gemini-json deliberately does NOT: `$ref`/`$defs` are on the accepted list
+  // for `responseJsonSchema` (#314), so inlining there would be a pointless
+  // rewrite. Pinned so the fix above cannot silently turn it into one.
+  var g = E.convert(JSON.parse(JSON.stringify(LC_PY_ROOT_REF)), "gemini-json");
+  ok("gemini-json still preserves a root $ref rather than inlining it",
+    g.schema && g.schema.$ref === "#/$defs/Ticket" && !!g.schema.$defs);
+  // A $ref with a REAL constraining sibling is still resolved on both.
+  var sib = {
+    type: "object",
+    properties: { p: { "$ref": "#/$defs/X", description: "d" } },
+    "$defs": { X: { type: "object", properties: { a: { type: "string" } } } }
+  };
+  var sibRes = E.convert(JSON.parse(JSON.stringify(sib)), "anthropic-json-python");
+  var sp = sibRes && sibRes.schema && sibRes.schema.properties && sibRes.schema.properties.p;
+  ok("anthropic-json-python still inlines a $ref carrying a description",
+    !!sp && sp.$ref === undefined && sp.description === "d");
+})();
+
+(function () {
+  ["anthropic-json", "anthropic-json-python"].forEach(function (p) {
+    [["pydantic", LC_PY_PYDANTIC], ["root-ref", LC_PY_ROOT_REF]].forEach(function (pair) {
+      var once = E.convert(JSON.parse(JSON.stringify(pair[1])), p);
+      var twice = once.schema ? E.convert(JSON.parse(JSON.stringify(once.schema)), p) : {};
+      ok(p + " is idempotent on the LangChain Python " + pair[0] + " schema",
+        !!once.schema && JSON.stringify(once.schema) === JSON.stringify(twice.schema));
+    });
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

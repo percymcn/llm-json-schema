@@ -5,7 +5,15 @@
  * tool use, or Gemini responseSchema.
  */
 
-export type Provider = "openai" | "openai-nonstrict" | "anthropic" | "anthropic-json" | "gemini" | "gemini-json" | "openai-realtime";
+export type Provider =
+  | "openai"
+  | "openai-nonstrict"
+  | "anthropic"
+  | "anthropic-json"
+  | "anthropic-json-python"
+  | "gemini"
+  | "gemini-json"
+  | "openai-realtime";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */
 export type JSONSchema = Record<string, any>;

@@ -56,7 +56,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 | Flag | Meaning |
 |---|---|
-| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `gemini` \| `gemini-json` (required) |
+| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `anthropic-json-python` \| `gemini` \| `gemini-json` (required) |
 | `--check` | Emit no schema; exit `1` if it isn't already compliant |
 | `--json` | Emit `{ok, compliant, schema, ledger, docUrl}` for scripting |
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
@@ -80,21 +80,31 @@ Each provider accepts a different schema dialect, so a schema that works with on
   **Some clients decide this for you.** [Instructor](https://github.com/567-labs/instructor) omits `strict` on *every* OpenAI path — `Mode.TOOLS` (the default), `Mode.JSON_SCHEMA`, and `Mode.TOOLS_STRICT`, which is deprecated and collapses to `Mode.TOOLS`, so asking for strict silently gets you non-strict. Measured on `instructor==1.15.4`: no `strict` key in any of the three payloads. Gating those against the strict rules fails CI on a schema the API accepts as written.
 - **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`). Because nothing in the schema tells you which one you are on, each is its own target:
   - **`--to anthropic` → `tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. Tuples, `maxLength`, `format`, a draft-07 `definitions` bag and a non-exclusive `oneOf` all survive untouched, so this target reports them as fine rather than "fixing" them. `strict: true` goes on the **tool**, not the schema — the SDK documents it as *"guarantees schema validation on tool names and inputs"*; without it the schema is guidance the model can violate.
-  - **`--to anthropic-json` → `output_format: { type: "json_schema" }`** — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+  - **`--to anthropic-json` → the structured-output path** (`output_format` / `output_config`: `{ type: "json_schema" }`) — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+  - **`--to anthropic-json-python`** — the same path, as implemented by the **Python** `anthropic` SDK, which is not the same program. This split is by **SDK language, not version**: `anthropic==0.116.0` and `@anthropic-ai/sdk@0.116.0` carry the same version string and disagree, so it is not a skew you can upgrade past. Across 43 schema shapes run through both transformers they agree on 41; the two exceptions are below.
+
+  **The two Anthropic SDKs disagree about exactly two things** (measured on `anthropic` 0.110.0 / 0.116.0 / 0.121.0 against `@anthropic-ai/sdk@0.116.0`):
+
+  | | Python `anthropic` | `@anthropic-ai/sdk` |
+  |---|---|---|
+  | `enum` | **preserved** — actually enforced | demoted into `description` prose |
+  | root `{$ref, $defs}` | **`$defs` kept**, pointer resolves | `$defs` dropped → dangling `$ref`, whole schema gone |
+
+  The Python transformer pops `$defs` *before* its `$ref` early-return, with a source comment naming that exact case. Note the draft-07 spelling `{$ref, definitions}` is destroyed by **both**, so the `definitions` → `$defs` rename this tool performs is unconditional.
 
   Picking the wrong one is not cosmetic. `instructor`'s default Anthropic mode is `ANTHROPIC_TOOLS`, so an ordinary Pydantic model with a `tuple[int, int, int, int]` field goes on the wire **byte-identical** — gating it against the `output_format` rules is a CI failure on a payload Anthropic accepts exactly as written.
 
   That third policy is the one to internalise. OpenAI **errors** on an unsupported keyword; Gemini's `responseJsonSchema` **ignores** it; Anthropic **demotes it to prose**:
 
   ```js
-  {type: "string", enum: ["low","high"]}
-  // -> {"type":"string","description":"{enum: [\"low\",\"high\"]}"}
+  {type: "integer", minimum: 0, maximum: 100}
+  // -> {"type":"integer","description":"{minimum: 0, maximum: 100}"}
   ```
 
-  The enum still reaches the model — as a sentence. It is no longer enforced, and nothing errors or warns. Same for `minLength`, `maxLength`, `pattern`, `maxItems`, `minItems` (unless it is exactly 0 or 1), and any `format` outside `date-time, time, date, duration, email, hostname, uri, ipv4, ipv6, uuid`.
+  The bounds still reach the model — as a sentence. They are no longer enforced, and nothing errors or warns. Same for `minLength`, `maxLength`, `pattern`, `maxItems`, `minItems` (unless it is exactly 0 or 1), `const`, `default` and any `format` outside `date-time, time, date, duration, email, hostname, uri, ipv4, ipv6, uuid`. (`enum` is demoted **only by the TypeScript SDK** — see the table above.)
 
   Two more that bite real generator output:
-  - A **root `$ref`** is fatal: the transformer returns early on `$ref`, so `zod-to-json-schema`'s `{$ref, definitions}` becomes literally `{"$ref":"#/definitions/X"}` — dangling pointer, whole schema gone, no error. `$ref` siblings are dropped outright too (not even demoted).
+  - A **root `$ref`** is fatal on the TypeScript SDK: the transformer returns early on `$ref`, so `zod-to-json-schema`'s `{$ref, definitions}` becomes literally `{"$ref":"#/definitions/X"}` — dangling pointer, whole schema gone, no error. `$ref` siblings are dropped outright too (not even demoted) — **that part is true of both SDKs**.
   - **Tuples** fail two different ways: array-form `items` (and `prefixItems` beside `items: false`) **throws** `JSON schema must have a type defined if anyOf/oneOf/allOf are not used` — a message that never mentions tuples — while a bare `prefixItems`, which is exactly what zod v4's `z.toJSONSchema(z.tuple([...]))` emits, is quietly demoted, leaving an array with **no item schema and no length at all**.
 
   Unlike OpenAI, Anthropic does **not** require every key in `required` — the transformer passes your list through as given, so this tool does not force it.

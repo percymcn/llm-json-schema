@@ -18,7 +18,8 @@
 var fs = require("fs");
 var E = require("./engine.js");
 
-var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json", "gemini", "gemini-json", "openai-realtime"];
+var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json",
+  "anthropic-json-python", "gemini", "gemini-json", "openai-realtime"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -33,12 +34,18 @@ var USAGE = [
   "  openai-nonstrict   strict absent or false                (full JSON Schema, unenforced)",
   "  openai-realtime    Realtime function tools               (no strict field exists)",
   "  anthropic          tools[].input_schema                  (sent verbatim)",
-  "  anthropic-json     output_format: {type: json_schema}    (rebuilt, unknowns -> prose)",
+  "  anthropic-json     json_schema output, TypeScript SDK    (rebuilt, unknowns -> prose)",
+  "  anthropic-json-python  json_schema output, Python SDK    (same, but keeps enum + $defs)",
   "  gemini             responseSchema                        (narrow Schema proto)",
   "  gemini-json        responseJsonSchema                    (full JSON Schema)",
   "",
   "If you never set `strict`, you are on openai-nonstrict — it is optional and off by",
   "default, and some clients omit it for you (Instructor does, on every OpenAI path).",
+  "",
+  "The two anthropic-json targets are split by SDK LANGUAGE, not by version: Python",
+  "`anthropic` and `@anthropic-ai/sdk` ship the same version string (0.116.0) and",
+  "disagree on two things — Python keeps `enum` (JS demotes it to description prose)",
+  "and Python keeps `$defs` past a root `$ref` (JS drops it, losing the whole schema).",
   "",
   "Options:",
   "  --to <provider>   Target provider (required)",

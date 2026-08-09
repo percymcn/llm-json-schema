@@ -25,6 +25,7 @@
     openai: "https://developers.openai.com/api/docs/guides/structured-outputs",
     anthropic: "https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview",
     "anthropic-json": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
+    "anthropic-json-python": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
     gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
     "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
@@ -283,6 +284,16 @@
   // `properties` and no `additionalProperties`, so every object rule below
   // silently no-ops on it and the tool reports "already valid" for a schema
   // that is not. Hoist the referenced definition to the root instead.
+  // True when the root is a `$ref` whose target is actually present in `$defs`.
+  // Used to decide whether inlining is REQUIRED or merely harmless: a pointer
+  // with no local target is dead everywhere, so it never qualifies.
+  function rootRefResolvesInDefs(s) {
+    if (typeof s.$ref !== "string") return false;
+    var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
+    if (!m) return false;
+    return isPlainObject(s.$defs) && isPlainObject(s.$defs[m[1]]);
+  }
+
   function inlineRootRef(s, ledger, docUrl, why) {
     if (typeof s.$ref !== "string") return s;
     var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
@@ -331,7 +342,14 @@
       if (Array.isArray(node)) return node.map(function (n) { return visit(n, stack); });
       if (!isPlainObject(node)) return node;
 
-      var siblings = Object.keys(node).filter(function (k) { return k !== "$ref"; });
+      // `$defs` is the definition bag, not a constraining sibling: `{$ref, $defs}`
+      // is the canonical root-ref shape every generator emits, and counting it
+      // here would force an inline even where the vendor resolves the pointer
+      // correctly. Every other target inlines a root `$ref` earlier anyway, so
+      // this only changes the one path that deliberately does not.
+      var siblings = Object.keys(node).filter(function (k) {
+        return k !== "$ref" && k !== "$defs";
+      });
       var m = typeof node.$ref === "string" ? /^#\/\$defs\/(.+)$/.exec(node.$ref) : null;
 
       if (m && siblings.length && isPlainObject(defs[m[1]])) {
@@ -912,11 +930,20 @@
 
   // Keys `transform-json-schema.js` consumes; anything else on a node is
   // stringified into `description`.
-  function anthropicRecognises(node, key) {
+  // `pythonSdk` selects which of the vendor's TWO SDK implementations to model.
+  // They are not a version skew: `anthropic==0.116.0` (Python) and
+  // `@anthropic-ai/sdk@0.116.0` (JS) carry the SAME version string and disagree.
+  // Measured over 43 schema shapes, they agree semantically on 41; `enum` is one
+  // of the two exceptions (Python keeps it, JS stringifies it into `description`).
+  function anthropicRecognises(node, key, pythonSdk) {
     switch (key) {
       case "$ref": case "$defs": case "type": case "anyOf": case "oneOf":
       case "allOf": case "description": case "title":
         return true;
+      case "enum":
+        // Python: `enum = json_schema.pop("enum"); if is_list(enum): keep`.
+        // JS has no such clause, so it falls through to the prose demotion.
+        return !!pythonSdk;
       case "properties": case "required": case "additionalProperties":
         return node.type === "object";
       case "format":
@@ -971,10 +998,11 @@
   // default Anthropic mode is ANTHROPIC_TOOLS, so an ordinary Pydantic model
   // (tuple field, maxLength, $defs) is perfectly valid on the wire while the
   // old single target exited 1 and proposed a lossy tuple collapse.
-  function toAnthropic(schema, outputFormatPath) {
+  function toAnthropic(schema, outputFormatPath, pythonSdk) {
     var s = clone(schema);
     var ledger = [];
     var url = outputFormatPath ? DOCS["anthropic-json"] : DOCS.anthropic;
+    var otherSdk = pythonSdk ? "anthropic-json" : "anthropic-json-python";
 
     // Both paths: nothing on Anthropic's side ever RESOLVES a `$ref`, so a
     // pointer in a spelling that does not resolve locally is dead either way.
@@ -998,15 +1026,37 @@
 
     // A root `$ref` breaks BOTH paths, but for different reasons — so the fix
     // is shared and the explanation is not.
-    s = inlineRootRef(s, ledger, url, outputFormatPath
-      ? "Anthropic's transformer returns as soon as it sees a `$ref`, so a root `$ref` discards " +
-        "everything beside it: a real `{$ref, definitions}` from zod-to-json-schema comes out the " +
-        "other side as just `{\"$ref\":\"#/definitions/X\"}` — a dangling pointer with the whole schema " +
-        "gone, and no error raised."
-      : "A root `$ref` has no `type` of its own, and `betaTool()` throws \"JSON schema for tool ... " +
-        "must be an object, but got undefined\" on any root that is not `type: \"object\"`. Inlining " +
-        "the referenced definition gives the root its object type back. (Measured against " +
-        "@anthropic-ai/sdk@0.116.0.)");
+    //
+    // On the structured-output path this is the ONE place the two SDKs disagree
+    // about the shape of the output (the other, `enum`, only changes a warning).
+    // The Python transformer pops `$defs` BEFORE its `$ref` early-return, with a
+    // source comment naming exactly this case, so `{$ref, $defs}` survives intact
+    // and needs no edit. The JS transformer returns first and drops the bag,
+    // leaving a dangling pointer with the whole schema gone and no error raised.
+    // Measured, not inferred — and note the draft-07 spelling `{$ref, definitions}`
+    // is destroyed by BOTH, which is why the `definitions` -> `$defs` rename above
+    // is unconditional and this skip is not.
+    if (outputFormatPath && pythonSdk && rootRefResolvesInDefs(s)) {
+      ledger.push(entry("=", "root",
+        "Left the root `$ref` (`" + s.$ref + "`) alone. The Python `anthropic` SDK processes `$defs` " +
+        "before it returns on a `$ref`, so the definition travels with the pointer and the schema " +
+        "arrives whole. This is the one case where the two SDKs produce different SCHEMAS rather " +
+        "than different warnings: `@anthropic-ai/sdk` (JS) returns first and drops `$defs`, so the " +
+        "same file becomes a dangling `{\"$ref\":\"" + s.$ref + "\"}` with everything else gone. If a " +
+        "TypeScript service also sends this schema, run `--to anthropic-json` and take its edit.",
+        url, true));
+    } else {
+      s = inlineRootRef(s, ledger, url, outputFormatPath
+        ? "`@anthropic-ai/sdk`'s transformer returns as soon as it sees a `$ref`, so a root `$ref` " +
+          "discards everything beside it — `{$ref, $defs}` from Pydantic's `RootModel` and " +
+          "`{$ref, definitions}` from zod-to-json-schema both come out as just the bare pointer, " +
+          "dangling, with no error raised. (The Python SDK keeps `$defs` here, but is destroyed by " +
+          "the draft-07 `definitions` spelling just the same.)"
+        : "A root `$ref` has no `type` of its own, and `betaTool()` throws \"JSON schema for tool ... " +
+          "must be an object, but got undefined\" on any root that is not `type: \"object\"`. Inlining " +
+          "the referenced definition gives the root its object type back. (Measured against " +
+          "@anthropic-ai/sdk@0.116.0.)");
+    }
 
     if (outputFormatPath) {
       // The same early return means `$ref` siblings are dropped outright — not
@@ -1044,9 +1094,11 @@
         "Without it the schema is guidance the model can violate, so keep validating the response.",
         url, true));
       ledger.push(entry("=", "root",
-        "If you are actually using `output_format: {type: \"json_schema\"}` rather than a tool, this " +
-        "is the WRONG target — that path rebuilds the schema and demotes every keyword it does not " +
-        "recognise into `description` prose. Re-run with `--to anthropic-json`.",
+        "If you are actually using the structured-output path (`output_format` / `output_config`: " +
+        "`{type: \"json_schema\"}`) rather than a tool, this is the WRONG target — that path rebuilds " +
+        "the schema and demotes every keyword it does not recognise into `description` prose. Re-run " +
+        "with `--to anthropic-json` (TypeScript SDK) or `--to anthropic-json-python` (Python SDK); " +
+        "they differ on `enum` and on a root `$ref`.",
         url, true));
       return { schema: s, ledger: ledger };
     }
@@ -1131,10 +1183,25 @@
 
       // Everything the transformer does not recognise survives only as prose.
       Object.keys(node).forEach(function (k) {
-        if (anthropicRecognises(node, k)) return;
+        if (anthropicRecognises(node, k, pythonSdk)) return;
         if (k === "$schema" && path !== "root") return;
         demoted.push({ path: path, key: k, node: node });
       });
+
+      // The SDKs disagree about `enum`, so whichever target you picked, say what
+      // the OTHER one would do with this exact node. Advisory only: an `enum` is
+      // kept either way, so it can never be a gate failure (#317).
+      // On the JS target `enum` is already reported by the demotion pass below,
+      // so only the Python target needs a note here — otherwise the same node
+      // would be described twice in one ledger.
+      if (pythonSdk && Array.isArray(node.enum)) {
+        ledger.push(entry("=", path,
+          "`enum` IS enforced here — the Python `anthropic` SDK preserves it verbatim. Worth knowing " +
+          "if this schema is shared: the TypeScript SDK at the SAME version number does not. " +
+          "`@anthropic-ai/sdk@0.116.0` stringifies it into this node's `description`, so a service " +
+          "sending this file from TypeScript gets an unenforced enum. Check with `--to anthropic-json`.",
+          url, true));
+      }
     });
 
     // These are reported, never stripped. Stripping would destroy a constraint
@@ -1150,6 +1217,13 @@
       } else if (d.key === "additionalProperties") {
         extra = " On the output_format path the transformer discards your value and forces " +
           "`additionalProperties: false` regardless; on the tools path your value is sent as-is.";
+      } else if (d.key === "enum") {
+        // The one keyword where the vendor's two SDKs disagree about enforcement.
+        extra = " This one is SDK-specific: the Python `anthropic` SDK PRESERVES `enum` on this same " +
+          "path, so it really is enforced there. Not a version skew you can upgrade past — measured " +
+          "identical on Python 0.110.0/0.116.0/0.121.0 against `@anthropic-ai/sdk@0.116.0`, i.e. the " +
+          "same version string, opposite behaviour. If your request is built in Python, re-run with " +
+          "`--to anthropic-json-python`.";
       }
       ledger.push(entry("=", d.path,
         "`" + d.key + "` is NOT enforced on the `output_format` (structured output) path. " +
@@ -1799,7 +1873,12 @@
     // `output_format` rebuilds the schema. Which one you are on is the
     // caller's fact, so it is never inferred from the schema (#315/#319).
     anthropic: function (s) { return toAnthropic(s, false); },
-    "anthropic-json": function (s) { return toAnthropic(s, true); },
+    // The structured-output path is split again, by which SDK builds the request.
+    // That is a fact only the caller has (#319) and it is NOT inferable from the
+    // schema — and NOT a version skew: the two SDKs ship the same version string
+    // with different behaviour, so it will not resolve itself.
+    "anthropic-json": function (s) { return toAnthropic(s, true, false); },
+    "anthropic-json-python": function (s) { return toAnthropic(s, true, true); },
     // Two request fields, two dialects, two targets. Never inferred — see the
     // note on toGemini(): the routing switch belongs to one client, not to
     // Gemini, so guessing it produces a false pass for everyone else.
