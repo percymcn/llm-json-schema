@@ -1924,5 +1924,76 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     nonStrict.schema.properties.meta.additionalProperties.type === "string");
 })();
 
+// ---------------------------------------------------------------------------
+// #330: `required` naming a key `properties` does not declare.
+//
+// The forced-required rewrite set `required` to the keys of `properties`. That
+// is the documented strict-mode rule and it is also a repair that DELETES:
+// any name the caller put in `required` that `properties` does not declare was
+// dropped, silently, with no ledger entry -- and where `properties` was absent
+// entirely the rewrite was skipped, so the ledger claimed "Fixed" while the
+// output stayed REJECTED by openai@7.4.0's own transformer.
+//
+// Vendor verdicts measured 2026-08-09, not ported:
+//   openai@7.4.0 toStrictJsonSchema   -> THROWS on both shapes
+//   @anthropic-ai/sdk@0.116.0 (both paths) -> accepts, keeps `required` as given
+//   google-genai types.Schema         -> accepts
+// so the rule belongs to the strict OpenAI target and nowhere else.
+(function () {
+  var clone = function (x) { return JSON.parse(JSON.stringify(x)); };
+  var EXTRA = {
+    type: "object",
+    properties: { f: { type: "object", properties: { a: { type: "string" } }, required: ["a", "ghost"] } },
+    required: ["f"], additionalProperties: false
+  };
+  var NOPROPS = {
+    type: "object",
+    properties: { f: { type: "object", required: ["a"] } },
+    required: ["f"], additionalProperties: false
+  };
+
+  var r1 = E.convert(clone(EXTRA), "openai");
+  ok("an undeclared `required` key is a blocker, not a silent deletion",
+    blockers(r1).length > 0);
+  ok("...the blocker names the offending key",
+    has(r1.ledger, "`ghost`"));
+  ok("...and `ghost` is still in the output, not quietly dropped",
+    r1.schema.properties.f.required.indexOf("ghost") !== -1);
+  ok("...while the declared key is still forced required",
+    r1.schema.properties.f.required.indexOf("a") !== -1);
+
+  var r2 = E.convert(clone(NOPROPS), "openai");
+  ok("`required` with no `properties` at all is the same blocker",
+    blockers(r2).length > 0);
+  ok("...and the required key survives the conversion",
+    r2.schema.properties.f.required.indexOf("a") !== -1);
+
+  // Guard against over-blocking -- being merely stricter than the vendor is
+  // this project's most repeated bug (#312/#314/#317/#322).
+  var normal = E.convert({
+    type: "object",
+    properties: { f: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } },
+    required: ["f"], additionalProperties: false
+  }, "openai");
+  ok("an ordinary schema whose `required` matches `properties` is NOT blocked",
+    blockers(normal).length === 0);
+
+  var noRequired = E.convert({
+    type: "object",
+    properties: { f: { type: "object", properties: { a: { type: "string" } } } },
+    required: ["f"], additionalProperties: false
+  }, "openai");
+  ok("a node with `properties` and no `required` is NOT blocked",
+    blockers(noRequired).length === 0);
+
+  // The vendor accepts these two shapes on every other target, so blocking
+  // there would be a false CI failure.
+  ["openai-nonstrict", "openai-realtime", "anthropic", "anthropic-json",
+   "anthropic-json-python", "gemini", "gemini-json"].forEach(function (t) {
+    ok("`required` mismatch is not blocked on " + t + " (the vendor accepts it)",
+      blockers(E.convert(clone(EXTRA), t)).length === 0);
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

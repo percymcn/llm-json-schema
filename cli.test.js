@@ -735,8 +735,13 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   });
 
   var chk = run(["--to", "openai", "--check"], DICT);
+  // 3, not 1: an open map cannot be repaired by rerunning the converter, and
+  // exit 3 is the code that says so. This assertion read `=== 1` when the
+  // blocker shipped, because `--check` was tested before blockers and masked
+  // them; the intent ("fails the gate") was always the point, and 3 fails it
+  // while also telling a CI script that committing our output will not help.
   ok("an open map fails --check instead of reporting a one-line fix",
-    chk.status === 1, "status=" + chk.status);
+    chk.status === 3, "status=" + chk.status);
   ok("...and the diagnosis says the field could never be populated",
     /could never be populated/.test(chk.stderr), chk.stderr.slice(0, 300));
   ok("...and it is marked as needing a human fix, not an auto-fix",
@@ -755,6 +760,47 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   var gemJson = run(["--to", "gemini-json", "--check"], DICT);
   ok("...and on gemini-json, whose accepted list includes additionalProperties",
     gemJson.status === 0, "status=" + gemJson.status);
+})();
+
+// ---------------------------------------------------------------------------
+// #330: exit 3 must outrank exit 1 under --check.
+//
+// `changes` includes `!` entries, so testing `--check` first made exit 3 --
+// documented at the top of cli.js as "a blocker needs a human fix" --
+// unreachable in check mode: every blocker returned 1, the same code as a
+// schema the converter can fix for you. A CI script that resolves a 1 by
+// rerunning without --check and committing the output can never resolve a 3.
+(function () {
+  var UNDECLARED = JSON.stringify({
+    type: "object",
+    properties: { f: { type: "object", properties: { a: { type: "string" } }, required: ["a", "ghost"] } },
+    required: ["f"], additionalProperties: false
+  });
+
+  var chk = run(["--to", "openai", "--check"], UNDECLARED);
+  ok("--check exits 3 on an undeclared `required` key, not 1",
+    chk.status === 3, "status=" + chk.status);
+  ok("...and says which key and why no automatic fix exists",
+    /`ghost`/.test(chk.stderr) && /does not declare/.test(chk.stderr),
+    chk.stderr.slice(0, 300));
+
+  var conv = run(["--to", "openai"], UNDECLARED);
+  ok("converting also exits 3 rather than emitting a weakened schema",
+    conv.status === 3, "status=" + conv.status);
+  ok("...and the output still carries the undeclared key, left visible",
+    /ghost/.test(conv.stdout), conv.stdout.slice(0, 200));
+
+  // A fixable diff must still be 1, or the reordering has flattened the
+  // distinction in the other direction.
+  var fixable = JSON.stringify({
+    type: "object",
+    properties: { a: { type: "string" }, b: { type: "integer" } },
+    required: ["a"]
+  });
+  ok("an ordinary fixable schema still exits 1 under --check",
+    run(["--to", "openai", "--check"], fixable).status === 1);
+  ok("...and a fully valid one still exits 0",
+    run(["--to", "openai", "--check"], run(["--to", "openai"], fixable).stdout).status === 0);
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");

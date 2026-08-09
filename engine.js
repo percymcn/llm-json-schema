@@ -868,10 +868,38 @@
         }
         // every property must be required; keep optionals optional-in-spirit via nullable
         var props = node.properties ? Object.keys(node.properties) : [];
+        var prev = Array.isArray(node.required)
+          ? node.required.filter(function (k) { return typeof k === "string"; })
+          : [];
+
+        // A key in `required` that `properties` never declares. The vendor
+        // REFUSES this outright — openai@7.4.0 throws "requires property `x`
+        // but does not declare it in `properties`" — so it cannot be waved
+        // through. It also cannot be repaired: the rewrite below sets
+        // `required` to the declared keys, and doing that DELETES the
+        // undeclared name, silently dropping a constraint the caller wrote
+        // (and, where `properties` is absent entirely, leaves output the
+        // vendor still rejects while the ledger claims a fix). Neither branch
+        // is guessable from the schema — the name might be a stale leftover,
+        // or a property whose declaration was lost — so name it and stop.
+        var undeclared = prev.filter(function (k) { return props.indexOf(k) === -1; });
+        if (undeclared.length) {
+          ledger.push(entry("!", path,
+            "`required` lists " + undeclared.map(function (k) { return "`" + k + "`"; }).join(", ") +
+            ", which `properties` does not declare. OpenAI strict mode rejects this outright " +
+            "(`requires property `" + undeclared[0] + "` but does not declare it in `properties``), " +
+            "and there is no safe automatic fix: dropping the name from `required` would silently " +
+            "remove a constraint you wrote, and declaring it here would mean inventing a type for it. " +
+            "Either declare each one in `properties` (strict mode then also requires it to stay in " +
+            "`required`), or remove it from `required` if it is stale.",
+            DOCS.openai));
+        }
+
         if (props.length) {
-          var prev = Array.isArray(node.required) ? node.required.slice() : [];
           var added = props.filter(function (k) { return prev.indexOf(k) === -1; });
-          node.required = props.slice();
+          // Undeclared names are carried through rather than dropped, so the
+          // shape stays visible in the output the reader is looking at.
+          node.required = props.slice().concat(undeclared);
           added.forEach(function (k) {
             var pnode = node.properties[k];
             // make forced-required fields nullable so their optional semantics survive

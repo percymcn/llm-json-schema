@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 302 engine + 117 CLI + 31 ESM/library assertions = **450** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 317 engine + 123 CLI + 31 ESM/library assertions = **471** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -87,7 +87,14 @@ API contract — which is why the ledger cites the rule for every change.
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
 | `--quiet` | Suppress the ledger |
 
-**Exit codes:** `0` ok/compliant · `1` `--check` found changes · `2` usage or bad JSON · `3` converted, but a blocker needs a human fix.
+**Exit codes:** `0` ok/compliant · `1` `--check` found changes · `2` usage or bad JSON · `3` a blocker needs a human fix.
+
+`3` outranks `1`, and the difference is the one a CI gate cares about: **`1` means
+rerunning without `--check` and committing the output fixes it; `3` means no
+output of this tool will, because the schema has to be remodelled by hand.** A
+`required` key that `properties` never declares, an open map (`additionalProperties`
+with no `properties`), and a heterogeneous tuple are all `3` — each is a shape where
+the "obvious" repair silently deletes something you wrote.
 
 ## Why
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:

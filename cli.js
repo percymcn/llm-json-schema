@@ -221,8 +221,15 @@ function main(argv) {
       }
     }
 
-    if (opts.check && required.length) process.exit(1);
+    // Blockers outrank fixable diffs. `changes` (and therefore `required`)
+    // includes `!` entries, so checking `--check` first made exit 3 —
+    // documented at the top of this file as "a blocker needs a human fix" —
+    // UNREACHABLE under `--check`: every blocker came back as 1, the same code
+    // as a schema the tool can fix for you. That is the distinction a CI gate
+    // most needs, because a script that reruns without `--check` and commits
+    // the output resolves a 1 and can never resolve a 3.
     if (blockers.length) process.exit(3);
+    if (opts.check && required.length) process.exit(1);
     process.exit(0);
   });
   return 0;
