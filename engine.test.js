@@ -100,6 +100,146 @@ function has(ledger, substr) {
   ok("anthropic mentions strict:true", has(r.ledger, "strict"));
 })();
 
+// --- Anthropic: the two paths, pinned to @anthropic-ai/sdk@0.116.0 ----------
+// Every assertion below was measured by running the input through the vendor's
+// own `lib/transform-json-schema.js`, not read off a doc page.
+
+// A root `$ref` + `definitions` (verbatim zod-to-json-schema output) is the
+// worst input on the output_format path: the transformer returns early on
+// `$ref`, so the SDK reduces it to exactly {"$ref":"#/definitions/Ticket"} —
+// dangling pointer, whole schema gone, and nothing throws.
+(function () {
+  var r = E.toAnthropic({
+    $ref: "#/definitions/Ticket",
+    definitions: {
+      Ticket: {
+        type: "object",
+        properties: { title: { type: "string" }, priority: { type: "string", enum: ["low", "high"] } },
+        required: ["title", "priority"]
+      }
+    }
+  });
+  ok("anthropic inlines a root $ref instead of shipping a dangling pointer",
+    r.schema.$ref === undefined && r.schema.type === "object");
+  ok("anthropic recovers the properties the SDK would have dropped",
+    !!r.schema.properties && !!r.schema.properties.title);
+  ok("anthropic renames definitions to $defs", r.schema.definitions === undefined);
+})();
+
+// The transformer throws on any node with no `type`. A bare enum is the most
+// common way to hit it, and the type is recoverable from the members.
+(function () {
+  var r = E.toAnthropic({
+    type: "object",
+    properties: { lvl: { enum: ["low", "high"] }, n: { enum: [1, 2] } }
+  });
+  ok("anthropic infers string type for a bare enum", r.schema.properties.lvl.type === "string");
+  ok("anthropic infers integer type for a numeric enum", r.schema.properties.n.type === "integer");
+  ok("anthropic explains the throw it prevents", has(r.ledger, "must have a type defined"));
+})();
+
+// A typeless node with nothing to infer from is a genuine blocker.
+(function () {
+  var r = E.toAnthropic({ type: "object", properties: { x: { description: "mystery" } } });
+  ok("anthropic reports an un-inferable typeless node as a blocker",
+    r.ledger.some(function (l) { return l.op === "!"; }));
+})();
+
+// Demotion, the finding this whole path exists for: `enum` on a typed node is
+// NOT stripped and NOT enforced — the SDK appends it to `description`.
+(function () {
+  var r = E.toAnthropic({
+    type: "object",
+    properties: {
+      lvl: { type: "string", enum: ["low", "high"] },
+      title: { type: "string", minLength: 3, maxLength: 80 },
+      tags: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 5 },
+      mail: { type: "string", format: "email" },
+      slug: { type: "string", format: "slug" }
+    }
+  });
+  ok("anthropic keeps enum rather than stripping it",
+    r.schema.properties.lvl.enum.length === 2);
+  ok("anthropic flags enum as unenforced on the output_format path",
+    r.ledger.some(function (l) { return l.path === "root.lvl" && l.advisory && l.msg.indexOf("`enum`") === 0; }));
+  ok("anthropic flags minLength/maxLength as unenforced",
+    r.ledger.some(function (l) { return l.msg.indexOf("`minLength`") === 0; }) &&
+    r.ledger.some(function (l) { return l.msg.indexOf("`maxLength`") === 0; }));
+  ok("anthropic flags minItems 2 (only 0 and 1 survive)",
+    r.ledger.some(function (l) { return l.msg.indexOf("`minItems`") === 0; }));
+  ok("anthropic does NOT flag a supported format",
+    !r.ledger.some(function (l) { return l.path === "root.mail" && l.msg.indexOf("`format`") === 0; }));
+  ok("anthropic DOES flag an unsupported format",
+    r.ledger.some(function (l) { return l.path === "root.slug" && l.msg.indexOf("`format`") === 0; }));
+  // A gate that fails CI on these would be the #312 false-failure bug again:
+  // the schema is legal, the constraints just are not enforced on one path.
+  ok("every unenforced-keyword note is advisory so --check stays green",
+    r.ledger.filter(function (l) { return l.msg.indexOf("NOT enforced") !== -1; })
+      .every(function (l) { return l.advisory === true; }));
+})();
+
+// Anthropic must NOT inherit OpenAI's all-keys-required rule: the transformer
+// passes `required` through exactly as given.
+(function () {
+  var r = E.toAnthropic({
+    type: "object",
+    properties: { a: { type: "string" }, b: { type: "string" } },
+    required: ["a"]
+  });
+  ok("anthropic leaves a partial required list alone",
+    r.schema.required.length === 1 && r.schema.required[0] === "a");
+  ok("anthropic does not force additionalProperties on the tools path",
+    r.schema.additionalProperties === undefined);
+})();
+
+// The shared helpers (normalizeDefs / inlineRootRef / resolveRefSiblings) are
+// used by more than one provider and used to hardcode OpenAI's wording, so the
+// Anthropic path printed "OpenAI requires the root to be an object schema" to
+// users. Every reason a provider gives must name that provider.
+(function () {
+  var r = E.toAnthropic({
+    $ref: "#/definitions/T",
+    definitions: {
+      T: { type: "object", properties: { a: { $ref: "#/definitions/U", description: "d" } }, required: ["a"] },
+      U: { type: "string" }
+    }
+  });
+  ok("anthropic ledger never cites OpenAI",
+    !r.ledger.some(function (l) { return /OpenAI/.test(l.msg); }));
+  ok("anthropic ledger never links an OpenAI doc",
+    !r.ledger.some(function (l) { return /openai/.test(l.ruleUrl || ""); }));
+  var g = E.toGemini({ $ref: "#/definitions/T", definitions: { T: { type: "object", properties: { a: { type: "string" } } } } });
+  ok("gemini ledger never cites OpenAI either",
+    !g.ledger.some(function (l) { return /OpenAI/.test(l.msg); }));
+})();
+
+// `oneOf` is rewritten to `anyOf` by the transformer itself.
+(function () {
+  var r = E.toAnthropic({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }, { type: "number" }] } }
+  });
+  ok("anthropic rewrites oneOf to anyOf like the SDK does",
+    Array.isArray(r.schema.properties.v.anyOf) && r.schema.properties.v.oneOf === undefined);
+})();
+
+// Both tuple spellings reach the transformer with no `type` and throw.
+(function () {
+  var homo = E.toAnthropic({
+    type: "object",
+    properties: { bbox: { type: "array", prefixItems: [{ type: "number" }, { type: "number" }] } }
+  });
+  ok("anthropic collapses a homogeneous tuple losslessly",
+    homo.schema.properties.bbox.items.type === "number" &&
+    homo.schema.properties.bbox.minItems === 2 && homo.schema.properties.bbox.maxItems === 2);
+
+  var hetero = E.toAnthropic({
+    type: "object",
+    properties: { pair: { type: "array", items: [{ type: "string" }, { type: "number" }] } }
+  });
+  ok("anthropic blocks a heterogeneous tuple", hetero.ledger.some(function (l) { return l.op === "!"; }));
+})();
+
 // --- inference from a JSON example ---
 (function () {
   var s = E.inferSchema({ id: 1, tags: ["a"], meta: { ok: true } });

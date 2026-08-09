@@ -218,7 +218,7 @@
   // `properties` and no `additionalProperties`, so every object rule below
   // silently no-ops on it and the tool reports "already valid" for a schema
   // that is not. Hoist the referenced definition to the root instead.
-  function inlineRootRef(s, ledger) {
+  function inlineRootRef(s, ledger, docUrl, why) {
     if (typeof s.$ref !== "string") return s;
     var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
     if (!m) return s;
@@ -243,8 +243,10 @@
     if (Object.keys(remaining).length) out.$defs = remaining;
 
     ledger.push(entry("~", "root",
-      "Inlined the root `$ref` (`#/$defs/" + name + "`) into the root. OpenAI requires the root to be an object schema, and a bare `$ref` root leaves `additionalProperties`/`required` unset on the real object.",
-      DOCS.openai));
+      "Inlined the root `$ref` (`#/$defs/" + name + "`) into the root. " + (why ||
+        "OpenAI requires the root to be an object schema, and a bare `$ref` root leaves " +
+        "`additionalProperties`/`required` unset on the real object."),
+      docUrl || DOCS.openai));
     return out;
   }
 
@@ -256,7 +258,7 @@
   // why the failure looks maddeningly input-dependent.
   // Fix: inline the referenced definition at the use site and let the siblings
   // win. Bare `$ref`s (no siblings) are left alone — those are legal.
-  function resolveRefSiblings(s, ledger) {
+  function resolveRefSiblings(s, ledger, docUrl, whyFixed, whyRecursive) {
     if (!isPlainObject(s.$defs)) return s;
     var defs = s.$defs, fixed = 0, unresolved = [];
 
@@ -297,13 +299,17 @@
     }
     if (fixed) {
       ledger.push(entry("~", "root",
-        "Inlined " + fixed + " `$ref` that carried sibling keywords — OpenAI rejects those with \"$ref cannot have keywords\". Pydantic emits this for a nested-model or Enum field that also has a `description`.",
-        DOCS.openai));
+        "Inlined " + fixed + " `$ref` that carried sibling keywords — " + (whyFixed ||
+          "OpenAI rejects those with \"$ref cannot have keywords\"." ) +
+        " Pydantic emits this for a nested-model or Enum field that also has a `description`.",
+        docUrl || DOCS.openai));
     }
     unresolved.forEach(function (name) {
       ledger.push(entry("!", "root",
-        "`" + name + "` is recursive and its `$ref` carries sibling keywords, which OpenAI rejects. Move those keywords into the definition itself — a recursive `$ref` cannot be inlined.",
-        DOCS.openai));
+        "`" + name + "` is recursive and its `$ref` carries sibling keywords, which " + (whyRecursive ||
+          "OpenAI rejects") + ". Move those keywords into the definition itself — a recursive `$ref` " +
+        "cannot be inlined.",
+        docUrl || DOCS.openai));
     });
     return result;
   }
@@ -329,7 +335,12 @@
   // (union of the entries, losing per-position typing) or drop positions
   // entirely. That is a human fix, so it becomes a blocker rather than a
   // silent rewrite. Returns true when the tuple keyword must be left in place.
-  function normalizeTuple(node, path, ledger) {
+  // `why` names the provider-specific reason a tuple cannot survive; both
+  // OpenAI strict mode and Anthropic's structured-output transformer lack a
+  // tuple form, but they fail differently, so the message must not be shared
+  // blindly. (#314's rule: do not port one provider's wording or policy to
+  // another without reading what that provider actually does.)
+  function normalizeTuple(node, path, ledger, docUrl, whyBlocked, whyCollapsed) {
     var tuple = null, kw = null;
     if (Array.isArray(node.prefixItems)) { tuple = node.prefixItems; kw = "prefixItems"; }
     else if (Array.isArray(node.items)) { tuple = node.items; kw = "items"; }
@@ -340,11 +351,12 @@
 
     if (!homogeneous) {
       ledger.push(entry("!", path,
-        "This is a " + tuple.length + "-element tuple with differently-typed positions (`" + kw +
-        "`), which OpenAI strict mode cannot represent — it has no tuple form. Model it as an object " +
-        "with one named property per position instead; that keeps each position's type and is what the " +
-        "model fills in more reliably anyway.",
-        DOCS.openai));
+        "This is a " + tuple.length + "-element tuple with differently-typed positions (`" + kw + "`). " +
+        (whyBlocked ||
+          "OpenAI strict mode cannot represent it — it has no tuple form.") +
+        " Model it as an object with one named property per position instead; that keeps each " +
+        "position's type and is what the model fills in more reliably anyway.",
+        docUrl || DOCS.openai));
       return true;
     }
 
@@ -355,9 +367,10 @@
     if (node.maxItems === undefined) node.maxItems = n;
     ledger.push(entry("~", path,
       "Collapsed a " + n + "-element tuple (`" + kw + "`) into `items` with `minItems`/`maxItems` of " + n +
-      " — OpenAI strict mode has no tuple form, but every position here has the same schema, so the " +
-      "fixed length survives as a constraint.",
-      DOCS.openai));
+      ". " + (whyCollapsed ||
+        "OpenAI strict mode has no tuple form, but every position here has the same schema, so the " +
+        "fixed length survives as a constraint."),
+      docUrl || DOCS.openai));
     return false;
   }
 
@@ -450,38 +463,237 @@
     }
   }
 
-  // ---- Anthropic tool input_schema -----------------------------------------
-  // "pass a tool with an input_schema" — standard JSON Schema, light constraints.
-  // No forced required, no additionalProperties requirement. `strict: true` on the
-  // tool definition is the opt-in for guaranteed conformance.
+  // ---- Anthropic: TWO paths, and the switch is WHICH API FEATURE you call ---
+  //
+  // Verified 2026-08-09 against the vendor SDK `@anthropic-ai/sdk@0.116.0`, not
+  // the doc. Like Gemini (#314) Anthropic has two accepted dialects, but the
+  // routing is different: Gemini switches on a key inside the schema
+  // (`$schema`), Anthropic switches on the request field you put it in.
+  //
+  //   Path T — `tools[].input_schema`   (helpers/beta `betaTool`, `betaZodTool`)
+  //       NO client-side transform at all. Your JSON Schema is attached
+  //       verbatim. The only client-side check is that the ROOT is
+  //       `type: "object"`, which throws otherwise.
+  //
+  //   Path O — `output_format: { type: "json_schema" }`
+  //       (`helpers/json-schema.js` -> `jsonSchemaOutputFormat`, `zodOutputFormat`,
+  //        and the beta variants) runs `lib/transform-json-schema.js`, which
+  //       REBUILDS the schema from a small allowlist.
+  //
+  // The policy on Path O is a THIRD kind, and it is the reason this converter
+  // exists. OpenAI ERRORS on an unsupported keyword (#312). Gemini's
+  // `responseJsonSchema` IGNORES it (#314). Anthropic DEMOTES it: every
+  // unrecognised keyword left on a node is `JSON.stringify`'d and appended to
+  // that node's `description`. Measured:
+  //
+  //   {type:"string", enum:["low","high"]}
+  //     -> {"type":"string","description":"{enum: [\"low\",\"high\"]}"}
+  //
+  // The enum still reaches the model, as a sentence. It is no longer enforced.
+  // Nothing errors, nothing warns — the constraint just silently stops being a
+  // constraint, which is the worst of the three policies to debug.
+  //
+  // Recognised on Path O (everything else is demoted to prose):
+  //   any node : $ref (returns EARLY — all siblings dropped), $defs, type,
+  //              anyOf, oneOf (rewritten to anyOf), allOf, description, title
+  //   object   : properties, required (passed through AS GIVEN — Anthropic does
+  //              NOT require every key, unlike OpenAI), additionalProperties
+  //              (popped and forced to false regardless of your value)
+  //   string   : format, but only the 10 in SUPPORTED_STRING_FORMATS
+  //   array    : items, and minItems only when it is exactly 0 or 1
+  //
+  // And it THROWS ("JSON schema must have a type defined if anyOf/oneOf/allOf
+  // are not used") on any node with no `type`, because it recurses into that
+  // node and finds nothing to key on.
+  //
+  // The two tuple spellings fail DIFFERENTLY here, and the difference matters:
+  //   `items: [A, B]`  (draft-07)          -> recursed into as a schema -> THROWS
+  //   `prefixItems: [A, B]` + `items:false` -> `items:false` recursed into -> THROWS
+  //   `prefixItems: [A, B]` alone           -> NOT recognised -> demoted to prose,
+  //        leaving a bare `{"type":"array"}` — an array with NO item schema and
+  //        NO length, i.e. totally unconstrained. That is the worse outcome, and
+  //        it is exactly what zod v4's `z.toJSONSchema(z.tuple([...]))` emits.
+
+  var ANTHROPIC_STRING_FORMATS = {
+    "date-time": 1, "time": 1, "date": 1, "duration": 1, "email": 1,
+    "hostname": 1, "uri": 1, "ipv4": 1, "ipv6": 1, "uuid": 1
+  };
+
+  // Keys `transform-json-schema.js` consumes; anything else on a node is
+  // stringified into `description`.
+  function anthropicRecognises(node, key) {
+    switch (key) {
+      case "$ref": case "$defs": case "type": case "anyOf": case "oneOf":
+      case "allOf": case "description": case "title":
+        return true;
+      case "properties": case "required": case "additionalProperties":
+        return node.type === "object";
+      case "format":
+        return node.type === "string" && !!ANTHROPIC_STRING_FORMATS[node.format];
+      case "items":
+        return node.type === "array";
+      case "minItems":
+        return node.type === "array" && (node.minItems === 0 || node.minItems === 1);
+      default:
+        return false;
+    }
+  }
+
+  // A node with no `type` (and no anyOf/oneOf/allOf/$ref) throws on Path O.
+  // When the node carries an `enum` or `const` the intended type is recoverable
+  // losslessly, so add it rather than making the user do it.
+  function inferTypeFromValues(values) {
+    var types = {};
+    for (var i = 0; i < values.length; i++) {
+      var v = values[i];
+      if (v === null) types["null"] = 1;
+      else if (Array.isArray(v)) types["array"] = 1;
+      else if (typeof v === "object") types["object"] = 1;
+      else if (typeof v === "number") types[Number.isInteger(v) ? "integer" : "number"] = 1;
+      else if (typeof v === "boolean") types["boolean"] = 1;
+      else if (typeof v === "string") types["string"] = 1;
+      else return null;
+    }
+    var keys = Object.keys(types);
+    if (keys.length === 1) return keys[0];
+    if (keys.length === 2 && types["integer"] && types["number"]) return "number";
+    return null;
+  }
+
   function toAnthropic(schema) {
     var s = clone(schema);
     var ledger = [];
 
-    if (!s.type) {
+    // `definitions` is draft-07; the transformer only knows `$defs`. Left alone
+    // it is not merely ignored — it is stringified into the root `description`
+    // and every `#/definitions/...` pointer is left dangling.
+    s = normalizeDefs(s, ledger, DOCS.anthropic,
+      "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref`. Anthropic's " +
+      "structured-output transformer only reads `$defs`; a `definitions` bag is not ignored, it is " +
+      "stringified into the root `description` while every `#/definitions/...` pointer is left dangling.");
+
+    // A root `$ref` is the single most destructive input on Path O: the
+    // transformer returns immediately on `$ref`, so a real
+    // `{$ref:"#/definitions/X", definitions:{...}}` from zod-to-json-schema
+    // reduces to exactly `{"$ref":"#/definitions/X"}` — dangling pointer, whole
+    // schema gone, no error raised. Measured against the SDK.
+    s = inlineRootRef(s, ledger, DOCS.anthropic,
+      "Anthropic's transformer returns as soon as it sees a `$ref`, so a root `$ref` discards " +
+      "everything beside it: a real `{$ref, definitions}` from zod-to-json-schema comes out the " +
+      "other side as just `{\"$ref\":\"#/definitions/X\"}` — a dangling pointer with the whole schema " +
+      "gone, and no error raised.");
+    // Same early return means `$ref` siblings are dropped outright — not even
+    // demoted to prose, which is how the rest of the unknown keywords survive.
+    s = resolveRefSiblings(s, ledger, DOCS.anthropic,
+      "Anthropic's transformer returns immediately on `$ref` and drops every sibling key silently — " +
+      "a `description` next to a `$ref` simply vanishes rather than being demoted to prose",
+      "Anthropic's transformer drops silently");
+
+    if (!s.type && isObjectSchema(s)) {
       s.type = "object";
       ledger.push(entry("+", "root",
-        "Added `type: object` — a tool input_schema is an object schema.",
+        "Added `type: object` at the root. Both Anthropic paths require it: `betaTool()` throws " +
+        "unless `input_schema.type === \"object\"`, and `jsonSchemaOutputFormat()` throws " +
+        "\"JSON schema must be an object\".",
         DOCS.anthropic));
-    } else if (s.type !== "object") {
+    } else if (s.type && s.type !== "object") {
       ledger.push(entry("!", "root",
-        "A tool input_schema must be an object at the root. Wrap this schema in an object.",
-        DOCS.anthropic));
-    }
-    if (s.type === "object" && !s.properties) {
-      s.properties = {};
-      ledger.push(entry("+", "root",
-        "Added an empty `properties` — an object input_schema declares its properties.",
+        "The root must be an object on BOTH Anthropic paths — `betaTool()` and " +
+        "`jsonSchemaOutputFormat()` each throw on a non-object root. Wrap this schema in an object.",
         DOCS.anthropic));
     }
 
-    if (ledger.length === 0) {
+    var demoted = [];
+    walk(s, "root", function (node, path) {
+      // Tuples: `items`-as-array and `prefixItems` both reach the transformer
+      // with no `type` and throw. The error text ("must have a type defined")
+      // points nowhere near the real cause, so say what it is.
+      if (normalizeTuple(node, path, ledger, DOCS.anthropic,
+            "Anthropic's structured-output transformer has no tuple form, and the two spellings fail " +
+            "differently: array-form `items` (and `prefixItems` next to `items: false`) makes it throw " +
+            "\"JSON schema must have a type defined if anyOf/oneOf/allOf are not used\" — a message " +
+            "that never mentions tuples — while a bare `prefixItems` is quietly demoted to prose, " +
+            "leaving an array with no item schema and no length at all.",
+            "Anthropic's transformer has no tuple form — it would either throw or, for a bare " +
+            "`prefixItems`, leave an array with no item schema at all — so this recovers the element " +
+            "type, which is the part that was being lost outright. The length is a weaker guarantee " +
+            "here: on the `output_format` path `minItems` survives only when it is 0 or 1 and " +
+            "`maxItems` never does, so a fixed length of 2+ reaches the model as prose only. On the " +
+            "`tools[].input_schema` path both are sent as-is and do constrain.")) {
+        return;
+      }
+
+      // `oneOf` is rewritten to `anyOf` by the transformer. Do it here so the
+      // output matches the wire payload instead of differing from it.
+      if (Array.isArray(node.oneOf) && !Array.isArray(node.anyOf)) {
+        node.anyOf = node.oneOf;
+        delete node.oneOf;
+        ledger.push(entry("~", path,
+          "Rewrote `oneOf` to `anyOf` — the transformer does this itself, so this is what actually " +
+          "goes on the wire. Note the semantics differ: `oneOf` means exactly one branch matches, " +
+          "`anyOf` means at least one.",
+          DOCS.anthropic));
+      }
+
+      // No `type` and nothing to stand in for it -> throws on Path O.
+      if (node.type === undefined && !node.$ref &&
+          !Array.isArray(node.anyOf) && !Array.isArray(node.oneOf) && !Array.isArray(node.allOf)) {
+        var vals = Array.isArray(node.enum) ? node.enum
+                 : (node.const !== undefined ? [node.const] : null);
+        var inferred = vals ? inferTypeFromValues(vals) : null;
+        if (inferred) {
+          node.type = inferred;
+          ledger.push(entry("+", path,
+            "Added `type: " + inferred + "`, inferred from the " +
+            (Array.isArray(node.enum) ? "`enum` members" : "`const` value") +
+            ". Without a `type` the transformer throws \"JSON schema must have a type defined if " +
+            "anyOf/oneOf/allOf are not used\" — a bare enum is the most common way to hit that.",
+            DOCS.anthropic));
+        } else {
+          ledger.push(entry("!", path,
+            "This node has no `type` and no `anyOf`/`oneOf`/`allOf`, so Anthropic's " +
+            "structured-output transformer throws \"JSON schema must have a type defined if " +
+            "anyOf/oneOf/allOf are not used\". Give it an explicit `type`.",
+            DOCS.anthropic));
+        }
+      }
+
+      // Everything the transformer does not recognise survives only as prose.
+      Object.keys(node).forEach(function (k) {
+        if (anthropicRecognises(node, k)) return;
+        if (k === "$schema" && path !== "root") return;
+        demoted.push({ path: path, key: k, node: node });
+      });
+    });
+
+    // These are reported, never stripped. Stripping would destroy a constraint
+    // that IS still enforced on the tools path and buys nothing on either —
+    // the #314 rule: read the provider's error policy before porting a strip.
+    demoted.forEach(function (d) {
+      var extra = "";
+      if (d.key === "format") {
+        extra = " Only these 10 `format` values survive: " +
+          Object.keys(ANTHROPIC_STRING_FORMATS).join(", ") + ".";
+      } else if (d.key === "minItems") {
+        extra = " `minItems` survives only when it is exactly 0 or 1; any other value is demoted.";
+      } else if (d.key === "additionalProperties") {
+        extra = " On the output_format path the transformer discards your value and forces " +
+          "`additionalProperties: false` regardless; on the tools path your value is sent as-is.";
+      }
+      ledger.push(entry("=", d.path,
+        "`" + d.key + "` is NOT enforced on the `output_format` (structured output) path. " +
+        "Anthropic's transformer does not recognise it, so it is appended to this node's " +
+        "`description` as text — the model is told about it but nothing validates it. It IS sent " +
+        "as-is on the `tools[].input_schema` path, so this is kept, not stripped." + extra,
+        DOCS.anthropic, true));
+    });
+
+    var hasSubstantive = ledger.some(function (e) { return !e.advisory && e.op !== "="; });
+    if (!hasSubstantive) {
       ledger.push(entry("=", "root",
-        "No changes needed. Anthropic accepts standard JSON Schema as a tool `input_schema`. Add `strict: true` to the tool (not the schema) for guaranteed conformance.",
-        DOCS.anthropic));
-    } else {
-      ledger.push(entry("=", "root",
-        "Anthropic accepts standard JSON Schema; add `strict: true` to the tool definition for guaranteed conformance.",
+        "No structural changes needed. On `tools[].input_schema` this schema is sent verbatim — " +
+        "Anthropic applies no transform there; add `strict: true` to the TOOL definition (not the " +
+        "schema) for guaranteed conformance. On `output_format` see the unenforced-keyword notes above.",
         DOCS.anthropic));
     }
     return { schema: s, ledger: ledger };

@@ -67,7 +67,26 @@ API contract — which is why the ledger cites the rule for every change.
 ## Why
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
 - **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* The error is raised for keywords whose validation semantics strict mode cannot compile (`uniqueItems`, `patternProperties`, `contains`, `allOf`, `not`, `if`/`then`/`else`, …). Annotations and soft constraints — `description`, `title`, `default`, `examples`, `minLength`/`maxLength`, `$schema`, `$id` — are **accepted and passed through untouched**, so this tool leaves them alone.
-- **Anthropic tool `input_schema`:** standard JSON Schema, object root, light constraints; `strict: true` goes on the tool, not the schema.
+- **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`):
+  - **`tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. `strict: true` goes on the **tool**, not the schema.
+  - **`output_format: { type: "json_schema" }`** — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+
+  That third policy is the one to internalise. OpenAI **errors** on an unsupported keyword; Gemini's `responseJsonSchema` **ignores** it; Anthropic **demotes it to prose**:
+
+  ```js
+  {type: "string", enum: ["low","high"]}
+  // -> {"type":"string","description":"{enum: [\"low\",\"high\"]}"}
+  ```
+
+  The enum still reaches the model — as a sentence. It is no longer enforced, and nothing errors or warns. Same for `minLength`, `maxLength`, `pattern`, `maxItems`, `minItems` (unless it is exactly 0 or 1), and any `format` outside `date-time, time, date, duration, email, hostname, uri, ipv4, ipv6, uuid`.
+
+  Two more that bite real generator output:
+  - A **root `$ref`** is fatal: the transformer returns early on `$ref`, so `zod-to-json-schema`'s `{$ref, definitions}` becomes literally `{"$ref":"#/definitions/X"}` — dangling pointer, whole schema gone, no error. `$ref` siblings are dropped outright too (not even demoted).
+  - **Tuples** fail two different ways: array-form `items` (and `prefixItems` beside `items: false`) **throws** `JSON schema must have a type defined if anyOf/oneOf/allOf are not used` — a message that never mentions tuples — while a bare `prefixItems`, which is exactly what zod v4's `z.toJSONSchema(z.tuple([...]))` emits, is quietly demoted, leaving an array with **no item schema and no length at all**.
+
+  Unlike OpenAI, Anthropic does **not** require every key in `required` — the transformer passes your list through as given, so this tool does not force it.
+
+  This tool keeps every demoted keyword (it is still enforced on the tools path) and reports it as an advisory note, so `--check` stays green on a schema that is legal but only partly enforced.
 - **Gemini has TWO schema paths, and a top-level `$schema` is the switch between them.** `@google/genai`'s `maybeMoveToResponseJsonSchema()` checks for a top-level `$schema`; if it's there, the schema goes to the **`responseJsonSchema`** request field, otherwise to **`responseSchema`**, the narrow OpenAPI-style `Schema` proto. This matters because **`zod-to-json-schema` always emits `$schema` and Pydantic's `model_json_schema()` never does** — the two generators land on opposite paths by default.
 
   The two accepted subsets are **complementary — neither is a superset**:
