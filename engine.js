@@ -26,6 +26,7 @@
     anthropic: "https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview",
     "anthropic-json": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
     "anthropic-json-python": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
+    "anthropic-go": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
     gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
     "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
@@ -1006,7 +1007,91 @@
   // `@anthropic-ai/sdk@0.116.0` (JS) carry the SAME version string and disagree.
   // Measured over 43 schema shapes, they agree semantically on 41; `enum` is one
   // of the two exceptions (Python keeps it, JS stringifies it into `description`).
-  function anthropicRecognises(node, key, pythonSdk) {
+  // ---- Anthropic's THIRD SDK: `anthropic-sdk-go` ---------------------------
+  //
+  // Measured 2026-08-09 against `github.com/anthropics/anthropic-sdk-go@v1.62.0`
+  // by calling its exported helpers directly, not by reading the diff.
+  //
+  // Three things make Go its own target rather than an alias of the other two:
+  //
+  //  1. THERE IS NO VERBATIM PATH. In TypeScript and Python `tools[].input_schema`
+  //     applies no transform at all (#315/#321), which is what `--to anthropic`
+  //     exists for. In Go BOTH exported helpers — `BetaJSONSchemaOutputFormat`
+  //     and `BetaToolInputSchema` — call the same `transformSchemaMap`, so a Go
+  //     caller gets the rebuild on the tools path too. Verified: identical output
+  //     from both helpers on all 19 shapes probed.
+  //
+  //  2. IT KEEPS MORE. `supportedSchemaKeys` (schemautil.go) is a flat set that
+  //     includes `enum`, `const` AND `pattern`. TypeScript demotes all three to
+  //     prose; Python keeps `enum` only. So the three SDKs have three different
+  //     supported-key sets at the same vendor, and `pattern` is kept only by Go.
+  //
+  //  3. IT CAN LOSE EVERYTHING. `transformSchemaMap` round-trips your map through
+  //     `invopop/jsonschema.Schema` and `return nil`s on any unmarshal error,
+  //     swallowing it. That struct types `Type` as a `string` and `Items` as a
+  //     `*Schema`, so an array-valued `type` or a draft-07 tuple (`items: [A,B]`)
+  //     ANYWHERE in the document — including inside `$defs` — makes the WHOLE
+  //     schema come back `nil`. Measured, both at the root and nested.
+  //
+  // And a fourth difference that is not a policy but a bug, reported upstream:
+  // `formatExtraValue` walks pointers with reflect but then formats the ORIGINAL
+  // value, so every pointer-typed field renders as a hexadecimal address. The
+  // demote-to-prose policy is defeated for exactly those keys — the model is told
+  // `{maxLength: 0x162d307bcc80}`.
+  var ANTHROPIC_GO_SUPPORTED = {
+    "$ref": 1, "$defs": 1, "type": 1, "anyOf": 1, "oneOf": 1, "allOf": 1,
+    "description": 1, "title": 1, "enum": 1, "const": 1, "properties": 1,
+    "additionalProperties": 1, "required": 1, "items": 1, "minItems": 1,
+    "format": 1, "pattern": 1
+  };
+
+  // Keys `invopop/jsonschema@v0.14.0` gives a struct field. Anything OUTSIDE
+  // this set never survives the round-trip at all: `Schema.UnmarshalJSON` is a
+  // plain alias unmarshal, so unknown keys are dropped before `transformSchema`
+  // ever runs and never reach the extras-to-description path. Two different
+  // severities hide behind one "unsupported": modelled keys become prose,
+  // unmodelled keys vanish without a trace.
+  var GO_INVOPOP_MODELLED = {
+    "$schema": 1, "$id": 1, "$anchor": 1, "$ref": 1, "$dynamicRef": 1, "$defs": 1,
+    "$comment": 1, "allOf": 1, "anyOf": 1, "oneOf": 1, "not": 1, "if": 1, "then": 1,
+    "else": 1, "dependentSchemas": 1, "prefixItems": 1, "items": 1, "contains": 1,
+    "properties": 1, "patternProperties": 1, "additionalProperties": 1,
+    "propertyNames": 1, "type": 1, "enum": 1, "const": 1, "multipleOf": 1,
+    "maximum": 1, "exclusiveMaximum": 1, "minimum": 1, "exclusiveMinimum": 1,
+    "maxLength": 1, "minLength": 1, "pattern": 1, "maxItems": 1, "minItems": 1,
+    "uniqueItems": 1, "maxContains": 1, "minContains": 1, "maxProperties": 1,
+    "minProperties": 1, "required": 1, "dependentRequired": 1, "format": 1,
+    "contentEncoding": 1, "contentMediaType": 1, "contentSchema": 1, "title": 1,
+    "description": 1, "default": 1, "deprecated": 1, "readOnly": 1,
+    "writeOnly": 1, "examples": 1
+  };
+
+  // Fields invopop declares as `*uint64`, i.e. the ones `formatExtraValue`
+  // renders as a pointer address instead of a number. `minItems` is the one
+  // near-miss: the array branch dereferences it explicitly before demoting, so
+  // it is the only length keyword that prints its value.
+  var GO_POINTER_FORMATTED = {
+    "maxLength": 1, "minLength": 1, "maxItems": 1, "maxContains": 1,
+    "minContains": 1, "maxProperties": 1, "minProperties": 1
+  };
+
+  function anthropicGoRecognises(node, key) {
+    if (!ANTHROPIC_GO_SUPPORTED[key]) return false;
+    // `supportedSchemaKeys` is consulted before the per-type switch, so a key in
+    // the set survives on a node of any type. Only two get a second, type-gated
+    // demotion afterwards.
+    if (key === "format") {
+      return node.type !== "string" || !!ANTHROPIC_STRING_FORMATS[node.format];
+    }
+    if (key === "minItems") {
+      return node.type !== "array" || node.minItems === 0 || node.minItems === 1;
+    }
+    return true;
+  }
+
+  function anthropicRecognises(node, key, sdk) {
+    if (sdk === "go") return anthropicGoRecognises(node, key);
+    var pythonSdk = sdk === "python";
     switch (key) {
       case "$ref": case "$defs": case "type": case "anyOf": case "oneOf":
       case "allOf": case "description": case "title":
@@ -1068,7 +1153,23 @@
     return [];
   }
 
-  function normalizeAnthropicUnionType(node, path, ledger, url, pythonSdk) {
+  // What an array-valued `type` costs, per SDK. The Go entry is the loudest of
+  // the three and the only one that is not confined to this node.
+  var ANTHROPIC_UNION_TYPE_COST = {
+    python: "The Python `anthropic` SDK REFUSES TO BUILD the request for any array-valued `type` — " +
+      "`transform_schema` types it as a `Literal` of seven scalars and falls through to " +
+      "`assert_never`, raising `AssertionError: Expected code to be unreachable`. Even a " +
+      "one-element list raises. ",
+    go: "The Go SDK loses the ENTIRE DOCUMENT here, not just this node. `transformSchemaMap` " +
+      "unmarshals your map into `invopop/jsonschema.Schema`, whose `Type` field is a `string`; " +
+      "an array fails to unmarshal and the function `return nil`s, swallowing the error. Both " +
+      "`BetaJSONSchemaOutputFormat` and `BetaToolInputSchema` then hand the API a null schema, " +
+      "with nothing raised client-side. Measured on anthropic-sdk-go@v1.62.0 — and it fires " +
+      "wherever the union is, including inside `$defs`. "
+  };
+
+  function normalizeAnthropicUnionType(node, path, ledger, url, sdk) {
+    var pythonSdk = sdk !== "js";  // both Python and Go fail on ANY list
     var raw = node.type;
     if (!Array.isArray(raw)) return;
     // `type` beside a combinator: rewriting would have to invent a merge, so the
@@ -1081,11 +1182,16 @@
       if (pythonSdk) {
         ledger.push(entry("!", path,
           "This node has an array-valued `type` (`" + JSON.stringify(raw) + "`) alongside " +
-          "`anyOf`/`oneOf`/`allOf`. The Python `anthropic` SDK raises `AssertionError: Expected code " +
-          "to be unreachable` on the list REGARDLESS of the combinator — the assert runs before the " +
-          "combinator is consulted — so the request cannot be built. (The TypeScript SDK ignores the " +
-          "`type` once it sees a combinator, which is why this is a Python-only failure.) Merging " +
-          "these two is a semantic decision only you can make, so drop whichever one is redundant.",
+          "`anyOf`/`oneOf`/`allOf`. " + (sdk === "go"
+            ? "The Go SDK fails on the list before any of this is interpreted — the unmarshal into " +
+              "`invopop/jsonschema.Schema` errors on an array in `Type` and `transformSchemaMap` " +
+              "returns nil, so the WHOLE schema is dropped, combinator included."
+            : "The Python `anthropic` SDK raises `AssertionError: Expected code to be unreachable` on " +
+              "the list REGARDLESS of the combinator — the assert runs before the combinator is " +
+              "consulted — so the request cannot be built.") +
+          " (The TypeScript SDK ignores the `type` once it sees a combinator, which is why this is " +
+          "not a failure there.) Merging these two is a semantic decision only you can make, so drop " +
+          "whichever one is redundant.",
           url));
       }
       return;
@@ -1106,10 +1212,7 @@
 
     var before = JSON.stringify(raw);
     var loudly = pythonSdk
-      ? "The Python `anthropic` SDK REFUSES TO BUILD the request for any array-valued `type` — " +
-        "`transform_schema` types it as a `Literal` of seven scalars and falls through to " +
-        "`assert_never`, raising `AssertionError: Expected code to be unreachable, but got: " +
-        before + "`. Even a one-element list raises. "
+      ? ANTHROPIC_UNION_TYPE_COST[sdk]
       : "`@anthropic-ai/sdk` dispatches on `type === \"object\"`/`\"string\"`/`\"array\"` — strict " +
         "equality against a string — so an array-valued `type` matches no branch and the branch " +
         "that would have copied " +
@@ -1169,9 +1272,11 @@
 
     ledger.push(entry("~", path,
       "Rewrote `type: " + before + "` to " + shape + ". " + loudly +
-      "`anyOf` is the form BOTH SDKs handle: the TypeScript transformer maps itself over the " +
-      "variants, so the subtree survives and is processed properly, and the Python transformer " +
-      "passes `anyOf` through verbatim. Lossless — every keyword moves onto the branch it already " +
+      "`anyOf` is the form ALL THREE SDKs handle: the TypeScript transformer maps itself over the " +
+      "variants, so the subtree survives and is processed properly; the Python transformer passes " +
+      "`anyOf` through verbatim; and the Go transformer recurses into the variants (`AnyOf` is a " +
+      "`[]*Schema`, so it unmarshals cleanly where an array in `type` does not). Lossless — every " +
+      "keyword moves onto the branch it already " +
       "constrained (`properties` never applied to `null` in the first place), and `description`/" +
       "`title` stay where they are because they are recognised at any node.",
       url));
@@ -1218,11 +1323,21 @@
   // default Anthropic mode is ANTHROPIC_TOOLS, so an ordinary Pydantic model
   // (tuple field, maxLength, $defs) is perfectly valid on the wire while the
   // old single target exited 1 and proposed a lossy tuple collapse.
-  function toAnthropic(schema, outputFormatPath, pythonSdk) {
+  function toAnthropic(schema, outputFormatPath, sdk) {
+    sdk = sdk || "js";
+    var goSdk = sdk === "go";
+    var pythonSdk = sdk === "python";
     var s = clone(schema);
     var ledger = [];
     var url = outputFormatPath ? DOCS["anthropic-json"] : DOCS.anthropic;
-    var otherSdk = pythonSdk ? "anthropic-json" : "anthropic-json-python";
+    // On the Go SDK the tools path runs the SAME transform, so the sentence
+    // every other Anthropic message ends with — "it survives on
+    // tools[].input_schema" — is false there and must not be printed.
+    var VERBATIM_ESCAPE = goSdk
+      ? " Note there is no verbatim escape hatch in Go: `BetaToolInputSchema` calls the same " +
+        "`transformSchemaMap` as `BetaJSONSchemaOutputFormat`, so `--to anthropic` (which models the " +
+        "TypeScript/Python tools path, where no transform runs) does NOT describe your client."
+      : " It IS sent as-is on the `tools[].input_schema` path, so this is kept, not stripped.";
 
     // Both paths: nothing on Anthropic's side ever RESOLVES a `$ref`, so a
     // pointer in a spelling that does not resolve locally is dead either way.
@@ -1238,8 +1353,15 @@
       // `definitions` is draft-07; the transformer only knows `$defs`. Left
       // alone it is not merely ignored — it is stringified into the root
       // `description` and every `#/definitions/...` pointer is left dangling.
-      s = normalizeDefs(s, ledger, url,
-        "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref`. Anthropic's " +
+      s = normalizeDefs(s, ledger, url, goSdk
+        ? "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref`. The Go SDK does not " +
+          "merely ignore a `definitions` bag — `invopop/jsonschema.Schema` has no field for that " +
+          "spelling, so the whole bag is dropped during the unmarshal inside `transformSchemaMap`, " +
+          "silently, leaving every `#/definitions/...` pointer dangling with nothing to resolve to. " +
+          "Measured: `{$ref:\"#/definitions/T\", definitions:{...}}` nested under a property comes " +
+          "back as `{\"$ref\":\"#/definitions/T\"}` alone. This is the default output shape of " +
+          "`zod-to-json-schema`."
+        : "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref`. Anthropic's " +
         "structured-output transformer only reads `$defs`; a `definitions` bag is not ignored, it is " +
         "stringified into the root `description` while every `#/definitions/...` pointer is left dangling.");
     }
@@ -1270,7 +1392,16 @@
         "mis-send — run `--to anthropic-json` and take its edit.",
         url, true));
     } else {
-      s = inlineRootRef(s, ledger, url, outputFormatPath
+      s = inlineRootRef(s, ledger, url, (outputFormatPath && goSdk)
+        ? "A root `$ref` costs you the entire schema on the Go SDK, silently. `transformSchema` " +
+          "starts with `if s.Ref != \"\" { *s = jsonschema.Schema{Ref: s.Ref}; return }` — every " +
+          "sibling is discarded, `$defs` included, and neither `BetaJSONSchemaOutputFormat` nor " +
+          "`BetaToolInputSchema` has a root-type guard to catch it, so what reaches the API is a lone " +
+          "dangling pointer with no error raised. (The TypeScript helpers at least throw \"JSON schema " +
+          "must be an object\"; the Python SDK pops `$defs` first and survives.) Inlining fixes it on " +
+          "all three. `{$ref, $defs}` from Pydantic's `RootModel` and `{$ref, definitions}` from " +
+          "zod-to-json-schema are the two shapes that land here."
+        : outputFormatPath
         ? "A root `$ref` has no `type`, and `@anthropic-ai/sdk`'s public helpers " +
           "(`jsonSchemaOutputFormat`, `betaJSONSchemaOutputFormat`) reject that outright: \"JSON " +
           "schema must be an object, but got undefined\". Call the internal `transformJSONSchema` " +
@@ -1328,6 +1459,12 @@
         "with `--to anthropic-json` (TypeScript SDK) or `--to anthropic-json-python` (Python SDK); " +
         "they differ on `enum` and on a root `$ref`.",
         url, true));
+      ledger.push(entry("=", "root",
+        "And if your client is `anthropic-sdk-go`, this target is wrong even for tools. Go is the one " +
+        "SDK where `tools[].input_schema` is NOT verbatim: `BetaToolInputSchema` calls the same " +
+        "`transformSchemaMap` as `BetaJSONSchemaOutputFormat` (schemautil.go), so both surfaces get " +
+        "the rebuild. Use `--to anthropic-go`.",
+        url, true));
       return { schema: s, ledger: ledger };
     }
 
@@ -1344,6 +1481,22 @@
     // that is the established policy for everything this path destroys.
     walk(s, "root", function (node, path) {
       if (!isOpenMap(node)) return;
+      // Measured: the Go SDK is the only one of the three that gets this right.
+      // `transformSchema`'s object branch has an explicit dictionary clause —
+      // no `properties`, `additionalProperties` non-nil -> preserve and recurse
+      // into the value schema. Reporting a loss here would be the
+      // stricter-than-the-vendor bug this project has shipped four times.
+      if (goSdk) {
+        ledger.push(entry("=", path,
+          "This is an open map (`additionalProperties` with no `properties`), and the Go SDK keeps it " +
+          "— `transformSchema` has an explicit dictionary clause that preserves `additionalProperties` " +
+          "and recurses into the value schema. Nothing to fix. Worth knowing only because the other " +
+          "two paths differ: `--to anthropic-json` (TypeScript) rebuilds this node as " +
+          "`{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}`, so the field can " +
+          "never be populated, and `--to openai` blocks it outright.",
+          url, true));
+        return;
+      }
       ledger.push(entry("=", path,
         "This is an open map (`additionalProperties` with no `properties`). The " +
         "`output_format` transformer discards your `additionalProperties` and forces " +
@@ -1357,7 +1510,7 @@
 
     walk(s, "root", function (node, path) {
       if (path === "root") return;
-      normalizeAnthropicUnionType(node, path, ledger, url, pythonSdk);
+      normalizeAnthropicUnionType(node, path, ledger, url, sdk);
     });
 
     var demoted = [];
@@ -1365,13 +1518,27 @@
       // Tuples: `items`-as-array and `prefixItems` both reach the transformer
       // with no `type` and throw. The error text ("must have a type defined")
       // points nowhere near the real cause, so say what it is.
-      if (normalizeTuple(node, path, ledger, url,
-            "Anthropic's structured-output transformer has no tuple form, and the two spellings fail " +
+      if (normalizeTuple(node, path, ledger, url, goSdk
+            ? "The Go SDK has no tuple form, and the two spellings fail differently — the draft-07 " +
+              "one catastrophically. Array-form `items: [A, B]` cannot be unmarshalled into " +
+              "`invopop/jsonschema.Schema` at all (its `Items` field is a `*Schema`), so " +
+              "`transformSchemaMap` returns nil and the WHOLE document is dropped, swallowing the " +
+              "error — measured on anthropic-sdk-go@v1.62.0. A bare `prefixItems` survives the " +
+              "unmarshal but is not in `supportedSchemaKeys`, so it is demoted to prose, leaving an " +
+              "array with no item schema and no length at all."
+            : "Anthropic's structured-output transformer has no tuple form, and the two spellings fail " +
             "differently: array-form `items` (and `prefixItems` next to `items: false`) makes it throw " +
             "\"JSON schema must have a type defined if anyOf/oneOf/allOf are not used\" — a message " +
             "that never mentions tuples — while a bare `prefixItems` is quietly demoted to prose, " +
             "leaving an array with no item schema and no length at all.",
-            "Anthropic's transformer has no tuple form — it would either throw or, for a bare " +
+            goSdk
+            ? "The Go SDK has no tuple form — array-form `items` makes the whole document come back " +
+              "nil, and a bare `prefixItems` leaves an array with no item schema at all — so this " +
+              "recovers the element type, which is the part that was being lost outright. The length " +
+              "is a weaker guarantee here: `minItems` survives only when it is 0 or 1, and `maxItems` " +
+              "is not in `supportedSchemaKeys` at all, so a fixed length of 2+ reaches the model as " +
+              "prose only (and, because of the pointer-formatting bug, as a memory address)."
+            : "Anthropic's transformer has no tuple form — it would either throw or, for a bare " +
             "`prefixItems`, leave an array with no item schema at all — so this recovers the element " +
             "type, which is the part that was being lost outright. The length is a weaker guarantee " +
             "here: on the `output_format` path `minItems` survives only when it is 0 or 1 and " +
@@ -1425,22 +1592,33 @@
           node.type = inferred;
           ledger.push(entry("+", path,
             "Added `type: " + inferred + "`, inferred from the " +
-            (Array.isArray(node.enum) ? "`enum` members" : "`const` value") +
-            ". Without a `type` the transformer throws \"JSON schema must have a type defined if " +
-            "anyOf/oneOf/allOf are not used\" — a bare enum is the most common way to hit that.",
+            (Array.isArray(node.enum) ? "`enum` members" : "`const` value") + ". " + (goSdk
+              ? "The Go SDK treats a typeless node as unusable, but it does not say so: " +
+                "`transformSchema` overwrites it with the zero `jsonschema.Schema`, which marshals as " +
+                "the literal JSON `true` — a match-anything schema. (A bare `enum`/`const` node is " +
+                "actually spared, because those count as shape information, but adding the `type` " +
+                "makes the intent explicit and is lossless.)"
+              : "Without a `type` the transformer throws \"JSON schema must have a type defined if " +
+                "anyOf/oneOf/allOf are not used\" — a bare enum is the most common way to hit that."),
             url));
         } else {
-          ledger.push(entry("!", path,
-            "This node has no `type` and no `anyOf`/`oneOf`/`allOf`, so Anthropic's " +
-            "structured-output transformer throws \"JSON schema must have a type defined if " +
-            "anyOf/oneOf/allOf are not used\". Give it an explicit `type`.",
+          ledger.push(entry("!", path, goSdk
+            ? "This node has no `type` and no `anyOf`/`oneOf`/`allOf`/`enum`/`const`, and the Go SDK " +
+              "does not reject it — it REPLACES it with the literal JSON `true`, a schema that " +
+              "matches anything. `transformSchema` bails on a node it cannot key on by assigning the " +
+              "zero `jsonschema.Schema`, and `MarshalJSON` renders that as `true`. Measured: a node " +
+              "carrying only `{\"description\": \"...\"}` comes back as `true`, description included. " +
+              "Give it an explicit `type`."
+            : "This node has no `type` and no `anyOf`/`oneOf`/`allOf`, so Anthropic's " +
+              "structured-output transformer throws \"JSON schema must have a type defined if " +
+              "anyOf/oneOf/allOf are not used\". Give it an explicit `type`.",
             url));
         }
       }
 
       // Everything the transformer does not recognise survives only as prose.
       Object.keys(node).forEach(function (k) {
-        if (anthropicRecognises(node, k, pythonSdk)) return;
+        if (anthropicRecognises(node, k, sdk)) return;
         if (k === "$schema" && path !== "root") return;
         demoted.push({ path: path, key: k, node: node });
       });
@@ -1451,6 +1629,21 @@
       // On the JS target `enum` is already reported by the demotion pass below,
       // so only the Python target needs a note here — otherwise the same node
       // would be described twice in one ledger.
+      if (goSdk && (Array.isArray(node.enum) || node.pattern !== undefined || node.const !== undefined)) {
+        var kept = ["enum", "const", "pattern"].filter(function (k) {
+          return k === "enum" ? Array.isArray(node.enum) : node[k] !== undefined;
+        });
+        ledger.push(entry("=", path,
+          kept.map(function (k) { return "`" + k + "`"; }).join(" and ") +
+          " survive here — `anthropic-sdk-go`'s `supportedSchemaKeys` lists all three, so they reach " +
+          "the API rather than this node's `description`. Worth knowing if this schema is shared: the " +
+          "vendor's three SDKs have three different supported-key sets at the same vendor. " +
+          "`@anthropic-ai/sdk` demotes all three to prose; `anthropic` (Python) keeps `enum` only; " +
+          "`pattern` is kept by Go alone. Check the other two with `--to anthropic-json` and " +
+          "`--to anthropic-json-python`.",
+          url, true));
+      }
+
       if (pythonSdk && Array.isArray(node.enum)) {
         ledger.push(entry("=", path,
           "`enum` IS enforced here — the Python `anthropic` SDK preserves it verbatim. Worth knowing " +
@@ -1465,6 +1658,35 @@
     // that IS still enforced on the tools path and buys nothing on either —
     // the #314 rule: read the provider's error policy before porting a strip.
     demoted.forEach(function (d) {
+      // Go splits "unsupported" into two very different outcomes, and the worse
+      // one is invisible: a keyword `invopop/jsonschema` does not model is
+      // dropped by `Schema.UnmarshalJSON` before `transformSchema` runs, so it
+      // never reaches the extras-to-description path at all.
+      if (goSdk && !GO_INVOPOP_MODELLED[d.key]) {
+        ledger.push(entry("=", d.path,
+          "`" + d.key + "` is DELETED without a trace by the Go SDK — not demoted to prose like the " +
+          "keywords below it. `transformSchemaMap` round-trips your map through " +
+          "`invopop/jsonschema.Schema`, whose `UnmarshalJSON` is a plain alias unmarshal with no " +
+          "catch-all, so a keyword that library does not model is gone before Anthropic's own " +
+          "transform runs and cannot be appended to any `description`. Nothing is logged. If this " +
+          "keyword carries meaning for a downstream consumer, keep it somewhere other than the " +
+          "schema you hand the SDK." + VERBATIM_ESCAPE,
+          url, true));
+        return;
+      }
+      if (goSdk && GO_POINTER_FORMATTED[d.key]) {
+        ledger.push(entry("=", d.path,
+          "`" + d.key + "` is not enforced by the Go SDK — and it does not even arrive as readable " +
+          "prose. `formatExtraValue` (schemautil.go) dereferences pointers with reflect but then " +
+          "formats the ORIGINAL value, and `invopop` declares this field as `*uint64`, so this node's " +
+          "`description` gets a hexadecimal address: `{" + d.key + ": 0x162d307bcc80}`. The model is " +
+          "told a memory address. Measured on anthropic-sdk-go@v1.62.0; reported upstream. " +
+          "(`minItems` is the one length keyword that escapes this — the array branch dereferences it " +
+          "explicitly before demoting.) Kept here, not stripped, because your value is the thing that " +
+          "should have been quoted." + VERBATIM_ESCAPE,
+          url, true));
+        return;
+      }
       var extra = "";
       if (d.key === "format") {
         extra = " Only these 10 `format` values survive: " +
@@ -1483,17 +1705,26 @@
           "`--to anthropic-json-python`.";
       }
       ledger.push(entry("=", d.path,
-        "`" + d.key + "` is NOT enforced on the `output_format` (structured output) path. " +
-        "Anthropic's transformer does not recognise it, so it is appended to this node's " +
-        "`description` as text — the model is told about it but nothing validates it. It IS sent " +
-        "as-is on the `tools[].input_schema` path, so this is kept, not stripped." + extra,
+        "`" + d.key + "` is NOT enforced" + (goSdk
+          ? " by the Go SDK — " + (ANTHROPIC_GO_SUPPORTED[d.key]
+              ? "`supportedSchemaKeys` lists it, but `transformSchema`'s per-type branch demotes this " +
+                "particular value anyway, so"
+              : "it is not in `supportedSchemaKeys`, so")
+          : " on the `output_format` (structured output) path. Anthropic's transformer does not " +
+            "recognise it, so") +
+        " it is appended to this node's `description` as text — the model is told about it but " +
+        "nothing validates it." + VERBATIM_ESCAPE + extra,
         url, true));
     });
 
     var hasSubstantive = ledger.some(function (e) { return !e.advisory && e.op !== "="; });
     if (!hasSubstantive) {
-      ledger.push(entry("=", "root",
-        "No structural changes needed for the `output_format` path — but read the unenforced-keyword " +
+      ledger.push(entry("=", "root", goSdk
+        ? "No structural changes needed for `anthropic-sdk-go` — but read the notes above, because " +
+          "they are the point: `transformSchemaMap` accepts this schema and then quietly demotes what " +
+          "`supportedSchemaKeys` does not list, and deletes outright what `invopop/jsonschema` does " +
+          "not model. Both of Go's helpers run it, so there is no verbatim surface to fall back to."
+        : "No structural changes needed for the `output_format` path — but read the unenforced-keyword " +
         "notes above, because they are the point: the transformer accepts this schema and then " +
         "silently demotes what it does not recognise to `description` prose. If you are sending the " +
         "schema as `tools[].input_schema` instead, use `--to anthropic`, where it goes on the wire " +
@@ -2236,10 +2467,13 @@
     anthropic: function (s) { return toAnthropic(s, false); },
     // The structured-output path is split again, by which SDK builds the request.
     // That is a fact only the caller has (#319) and it is NOT inferable from the
-    // schema — and NOT a version skew: the two SDKs ship the same version string
-    // with different behaviour, so it will not resolve itself.
-    "anthropic-json": function (s) { return toAnthropic(s, true, false); },
-    "anthropic-json-python": function (s) { return toAnthropic(s, true, true); },
+    // schema — and NOT a version skew: the SDKs ship the same version string
+    // with different behaviour, so it will not resolve itself. Three now, and
+    // `anthropic-go` also covers the Go tools path, because Go is the one SDK
+    // where `tools[].input_schema` runs the transform too.
+    "anthropic-json": function (s) { return toAnthropic(s, true, "js"); },
+    "anthropic-json-python": function (s) { return toAnthropic(s, true, "python"); },
+    "anthropic-go": function (s) { return toAnthropic(s, true, "go"); },
     // Two request fields, two dialects, two targets. Never inferred — see the
     // note on toGemini(): the routing switch belongs to one client, not to
     // Gemini, so guessing it produces a false pass for everyone else.

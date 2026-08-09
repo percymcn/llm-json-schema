@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 329 engine + 123 CLI + 31 ESM/library assertions = **483** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 355 engine + 131 CLI + 31 ESM/library assertions = **517** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -81,7 +81,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 | Flag | Meaning |
 |---|---|
-| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `anthropic-json-python` \| `gemini` \| `gemini-json` (required) |
+| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `anthropic-json-python` \| `anthropic-go` \| `gemini` \| `gemini-json` (required) |
 | `--check` | Emit no schema; exit `1` if it isn't already compliant |
 | `--json` | Emit `{ok, compliant, schema, ledger, docUrl}` for scripting |
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
@@ -114,6 +114,27 @@ Each provider accepts a different schema dialect, so a schema that works with on
   - **`--to anthropic` → `tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. Tuples, `maxLength`, `format`, a draft-07 `definitions` bag and a non-exclusive `oneOf` all survive untouched, so this target reports them as fine rather than "fixing" them. `strict: true` goes on the **tool**, not the schema — the SDK documents it as *"guarantees schema validation on tool names and inputs"*; without it the schema is guidance the model can violate.
   - **`--to anthropic-json` → the structured-output path** (`output_format` / `output_config`: `{ type: "json_schema" }`) — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
   - **`--to anthropic-json-python`** — the same path, as implemented by the **Python** `anthropic` SDK, which is not the same program. This split is by **SDK language, not version**: `anthropic==0.116.0` and `@anthropic-ai/sdk@0.116.0` carry the same version string and disagree, so it is not a skew you can upgrade past.
+
+  - **`--to anthropic-go`** — `github.com/anthropics/anthropic-sdk-go`, and it is a **third** implementation, not an alias of either. Pick it for **any** use of that SDK, tools included: Go is the one language where `tools[].input_schema` is *not* verbatim, because `BetaToolInputSchema` calls the same `transformSchemaMap` as `BetaJSONSchemaOutputFormat` (`schemautil.go`). Measured identical output from both helpers on all 19 shapes probed, on `v1.62.0`.
+
+  **Anthropic ships three SDKs with three different supported-key sets, at the same vendor.** Measured 2026-08-09 by calling each SDK's own transform:
+
+  | keyword | Python `anthropic` | `@anthropic-ai/sdk` | `anthropic-sdk-go` |
+  |---|---|---|---|
+  | `enum` | preserved | demoted to prose | **preserved** |
+  | `const` | demoted | demoted | **preserved** |
+  | `pattern` | demoted | demoted | **preserved** |
+  | array-valued `type` | raises `AssertionError` | subtree stringified into `description` | **whole document dropped** |
+  | draft-07 tuple `items: [A,B]` | — | throws | **whole document dropped** |
+  | draft-07 `definitions` bag | lost | stringified into root `description` | **deleted before the transform runs** |
+  | open map (`additionalProperties`, no `properties`) | rebuilt as unsatisfiable | rebuilt as unsatisfiable | **preserved and recursed** |
+  | typeless node | throws | throws | **replaced by the literal `true`** |
+
+  Two of those Go rows are not "unsupported", they are total loss, and they share a cause worth knowing: `transformSchemaMap` round-trips your map through `invopop/jsonschema.Schema` and `return nil`s on **any** unmarshal error, swallowing it. That struct types `Type` as a `string` and `Items` as a `*Schema`, so an array in either field — anywhere in the document, including inside `$defs` — silently discards everything. Both helpers then hand the API a null schema with nothing raised client-side.
+
+  A third Go-only distinction: "unsupported" hides **two** severities. A keyword `invopop` *models* but Anthropic does not list (`minLength`, `uniqueItems`, `default`, `not`, `contains`, …) is demoted to `description` prose. A keyword `invopop` does not model at all (`unevaluatedProperties`, `additionalItems`, `discriminator`, `x-*`, `definitions`) is dropped by `Schema.UnmarshalJSON` — a plain alias unmarshal with no catch-all — **before** Anthropic's transform runs, so it cannot be appended to any description and vanishes without a trace.
+
+  And one outright bug, reported upstream: `formatExtraValue` walks pointers with `reflect` but then formats the **original** value, and `invopop` declares the length keywords as `*uint64`. So `minLength`/`maxLength`/`maxItems`/`min`-`maxProperties`/`min`-`maxContains` do not merely stop being enforced — the model is told `{maxLength: 0x162d307bcc80}`. (`minItems` escapes it: the array branch dereferences explicitly.)
 
   **The two Anthropic SDKs disagree about three things** (measured on `anthropic` 0.110.0 / 0.116.0 / 0.121.0 against `@anthropic-ai/sdk@0.116.0`; the first two over a 43-shape battery where they otherwise agree on 41, the third over a separate 16-shape union-`type` battery):
 

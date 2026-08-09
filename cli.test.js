@@ -803,5 +803,49 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     run(["--to", "openai", "--check"], run(["--to", "openai"], fixable).stdout).status === 0);
 })();
 
+// --- `anthropic-go` is a real target and disagrees with the other two -------
+(function () {
+  var UNION = JSON.stringify({
+    type: "object", properties: { a: { type: ["string", "null"] } }, required: ["a"]
+  });
+  ok("--to anthropic-go is accepted as a provider",
+    run(["--to", "anthropic-go", "--check"], UNION).status !== 2);
+  // The whole point of the split: the same file, two verdicts. Go loses the
+  // entire document to that union; the TypeScript SDK loses nothing (#327).
+  ok("the same union file exits 1 for anthropic-go and 0 for anthropic-json",
+    run(["--to", "anthropic-go", "--check"], UNION).status === 1 &&
+    run(["--to", "anthropic-json", "--check"], UNION).status === 0);
+  ok("...and converting it produces something anthropic-go then accepts",
+    run(["--to", "anthropic-go", "--check"],
+      run(["--to", "anthropic-go"], UNION).stdout).status === 0);
+
+  // A typeless node is a blocker, and a blocker must be 3, not 1 (#330).
+  var TYPELESS = JSON.stringify({
+    type: "object",
+    properties: { n: { properties: { a: { type: "string" } }, required: ["a"] } },
+    required: ["n"]
+  });
+  var t = run(["--to", "anthropic-go", "--check"], TYPELESS);
+  ok("a typeless node exits 3 on anthropic-go", t.status === 3, "status=" + t.status);
+  ok("...and the diagnosis names the `true` replacement",
+    /literal JSON `true`/.test(t.stderr), t.stderr.slice(0, 200));
+
+  // Not stricter than the vendor: enum/const/pattern all survive in Go, so a
+  // schema using them must pass cleanly.
+  var KEPT = JSON.stringify({
+    type: "object",
+    properties: { p: { type: "string", enum: ["a", "b"], pattern: "^a" } },
+    required: ["p"]
+  });
+  var k = run(["--to", "anthropic-go", "--check"], KEPT);
+  ok("enum + pattern pass anthropic-go untouched", k.status === 0, "status=" + k.status);
+  ok("...while anthropic-json still reports them unenforced",
+    /NOT enforced/.test(run(["--to", "anthropic-json", "--check"], KEPT).stderr));
+
+  ok("--help lists anthropic-go with the condition that selects it",
+    /anthropic-go/.test(run(["--help"], "").stdout) &&
+    /anthropic-sdk-go/.test(run(["--help"], "").stdout));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

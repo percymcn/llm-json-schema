@@ -19,7 +19,8 @@ var fs = require("fs");
 var E = require("./engine.js");
 
 var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json",
-  "anthropic-json-python", "gemini", "gemini-json", "openai-realtime"];
+  "anthropic-json-python", "anthropic-go", "gemini", "gemini-json",
+  "openai-realtime"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -36,16 +37,23 @@ var USAGE = [
   "  anthropic          tools[].input_schema                  (sent verbatim)",
   "  anthropic-json     json_schema output, TypeScript SDK    (rebuilt, unknowns -> prose)",
   "  anthropic-json-python  json_schema output, Python SDK    (same, but keeps enum + $defs)",
+  "  anthropic-go       anthropic-sdk-go, EITHER surface       (keeps enum/const/pattern)",
   "  gemini             responseSchema                        (narrow Schema proto)",
   "  gemini-json        responseJsonSchema                    (full JSON Schema)",
   "",
   "If you never set `strict`, you are on openai-nonstrict — it is optional and off by",
   "default, and some clients omit it for you (Instructor does, on every OpenAI path).",
   "",
-  "The two anthropic-json targets are split by SDK LANGUAGE, not by version: Python",
+  "The anthropic-json* targets are split by SDK LANGUAGE, not by version: Python",
   "`anthropic` and `@anthropic-ai/sdk` ship the same version string (0.116.0) and",
   "disagree on two things — Python keeps `enum` (JS demotes it to description prose)",
   "and Python keeps `$defs` past a root `$ref` (JS drops it, losing the whole schema).",
+  "",
+  "Pick anthropic-go for ANY use of `anthropic-sdk-go`, tools included: it is the one",
+  "SDK where tools[].input_schema is not verbatim — BetaToolInputSchema runs the same",
+  "transform as BetaJSONSchemaOutputFormat. It keeps more than the other two (enum,",
+  "const AND pattern) but can lose more: an array-valued `type` or a draft-07 tuple",
+  "anywhere makes transformSchemaMap return nil, dropping the ENTIRE schema silently.",
   "",
   "Options:",
   "  --to <provider>   Target provider (required)",

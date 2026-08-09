@@ -11,6 +11,7 @@ export type Provider =
   | "anthropic"
   | "anthropic-json"
   | "anthropic-json-python"
+  | "anthropic-go"
   | "gemini"
   | "gemini-json"
   | "openai-realtime";

@@ -2093,5 +2093,180 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 })();
 
+// --- Anthropic SDK #3: `anthropic-sdk-go` is its own dialect --------------
+//
+// Measured 2026-08-09 against github.com/anthropics/anthropic-sdk-go@v1.62.0 by
+// calling `BetaJSONSchemaOutputFormat` / `BetaToolInputSchema` directly. Every
+// "the Go SDK does X" comment below is the verbatim observed output, not a
+// reading of the diff. The raw-vs-converted round trip was run through that
+// same binary: 4 raw shapes come back as a literal `null` (the whole document
+// dropped) and all 4 converted outputs come back whole.
+(function () {
+  function blockers(r) {
+    if (!r || !r.ledger) return [];
+    return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  // A target that does not exist returns {ok:false} with no schema. Dereferencing
+  // that aborts the whole file and hides every later assertion (#322), so every
+  // lookup below goes through `at()`, which reports a failure instead.
+  function at(r, path) {
+    var cur = r && r.schema;
+    var parts = path ? path.split(".") : [];
+    for (var i = 0; i < parts.length && cur !== undefined && cur !== null; i++) cur = cur[parts[i]];
+    return cur;
+  }
+
+  // 1. An array-valued `type` fails the unmarshal into invopop's `Type string`,
+  //    so `transformSchemaMap` returns nil and the ENTIRE schema is dropped --
+  //    including when the union is buried in `$defs` and nothing else is wrong.
+  var UNION = { type: "object", properties: { a: { type: ["string", "null"] } }, required: ["a"] };
+  var rUnion = E.convert(clone(UNION), "anthropic-go");
+  ok("anthropic-go rewrites a bare nullable union to anyOf",
+    Array.isArray(at(rUnion, "properties.a.anyOf")) &&
+    at(rUnion, "properties.a.type") === undefined);
+  ok("anthropic-go says the WHOLE document is lost, not just the node",
+    has(rUnion.ledger, "ENTIRE DOCUMENT"));
+  // The TypeScript target must NOT touch this one: JS loses nothing on a bare
+  // `["string","null"]` (#327), so editing it there would be over-strictness.
+  var rUnionJs = E.convert(clone(UNION), "anthropic-json");
+  ok("anthropic-json still leaves the same bare union alone (targets disagree)",
+    at(rUnionJs, "properties.a.type") !== undefined);
+
+  // The `$defs` member must be REFERENCED, or the orphan pruner deletes it and
+  // the schema "survives" for the wrong reason -- caught by checking that the
+  // definition is still there afterwards, not just that the document is.
+  var UNION_DEFS = {
+    type: "object",
+    properties: { a: { type: "string" }, t: { $ref: "#/$defs/T" } },
+    required: ["a", "t"],
+    $defs: { T: { type: ["string", "null"] } }
+  };
+  var rUnionDefs = E.convert(clone(UNION_DEFS), "anthropic-go");
+  ok("anthropic-go rewrites a union buried in a referenced $defs",
+    Array.isArray(at(rUnionDefs, "$defs.T.anyOf")) &&
+    at(rUnionDefs, "$defs.T.type") === undefined);
+
+  // 2. Draft-07 array-form `items` cannot unmarshal into `Items *Schema`
+  //    either -- same total loss, and the collapse is what rescues it.
+  var TUPLE07 = {
+    type: "object",
+    properties: { b: { type: "array", items: [{ type: "integer" }, { type: "integer" }] } },
+    required: ["b"]
+  };
+  var rTuple = E.convert(clone(TUPLE07), "anthropic-go");
+  ok("anthropic-go collapses a homogeneous draft-07 tuple to items+min/maxItems",
+    at(rTuple, "properties.b.items.type") === "integer" &&
+    at(rTuple, "properties.b.minItems") === 2);
+  ok("anthropic-go names the nil-return as the cost of array-form items",
+    has(rTuple.ledger, "come back nil") || has(rTuple.ledger, "return nil"));
+
+  // 3. `definitions` has no field on invopop's Schema, so the bag is dropped
+  //    during the unmarshal -- earlier than Anthropic's own transform, which is
+  //    why it is not even demoted to prose. This is zod-to-json-schema's default.
+  var DEFINITIONS = {
+    type: "object", properties: { t: { $ref: "#/definitions/T" } }, required: ["t"],
+    definitions: { T: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } }
+  };
+  var rDefs = E.convert(clone(DEFINITIONS), "anthropic-go");
+  ok("anthropic-go renames definitions to $defs so the bag survives",
+    !!at(rDefs, "$defs") && !at(rDefs, "definitions") &&
+    at(rDefs, "properties.t.$ref") === "#/$defs/T");
+
+  // 4. Go keeps MORE than the other two: enum, const AND pattern are all in
+  //    `supportedSchemaKeys`. Reporting them as unenforced here would be the
+  //    stricter-than-the-vendor bug -- verified byte-identical through the SDK.
+  var KEPT = {
+    type: "object",
+    properties: { p: { type: "string", enum: ["a", "b"], pattern: "^a" }, c: { type: "string", const: "x" } },
+    required: ["p", "c"]
+  };
+  var rKept = E.convert(clone(KEPT), "anthropic-go");
+  ok("anthropic-go leaves enum/const/pattern untouched",
+    JSON.stringify(at(rKept, "")) === JSON.stringify(KEPT));
+  ok("anthropic-go reports enum/const/pattern as SURVIVING, not demoted",
+    has(rKept.ledger, "survive here"));
+  ok("anthropic-go does not fail the gate on a schema the Go SDK keeps verbatim",
+    blockers(rKept).length === 0);
+  // The TypeScript SDK demotes all three, so that target must still say so.
+  ok("anthropic-json still reports enum as unenforced (the SDKs disagree)",
+    has(E.convert(clone(KEPT), "anthropic-json").ledger, "NOT enforced"));
+
+  // 5. An open map is the one place Go is the CORRECT SDK: `transformSchema`
+  //    has an explicit dictionary clause. #329 blocks this for OpenAI and
+  //    advises for TypeScript; here it must do neither.
+  var OPEN_MAP = { type: "object", additionalProperties: { type: "string" } };
+  var rMap = E.convert(clone(OPEN_MAP), "anthropic-go");
+  ok("anthropic-go keeps an open map byte-identical",
+    JSON.stringify(at(rMap, "")) === JSON.stringify(OPEN_MAP));
+  ok("anthropic-go does not block an open map",
+    blockers(rMap).length === 0);
+  ok("anthropic-go says the Go SDK keeps the open map",
+    has(rMap.ledger, "the Go SDK keeps it"));
+  ok("openai still blocks the same open map (per-provider, not ported)",
+    blockers(E.convert(clone(OPEN_MAP), "openai")).length === 1);
+
+  // 6. The pointer-formatting bug: `formatExtraValue` dereferences with reflect
+  //    but formats the original value, and invopop declares these as *uint64.
+  //    Measured output: {maxLength: 0x162d307bcc80, minLength: 0x162d307bcc88}.
+  var LENGTHS = {
+    type: "object", properties: { p: { type: "string", minLength: 2, maxLength: 8 } }, required: ["p"]
+  };
+  var rLen = E.convert(clone(LENGTHS), "anthropic-go");
+  ok("anthropic-go warns that length keywords arrive as a memory address",
+    has(rLen.ledger, "hexadecimal address"));
+  ok("anthropic-go keeps the length keywords rather than stripping them",
+    at(rLen, "properties.p.minLength") === 2);
+
+  // 7. Two severities behind one word: a keyword invopop does not model is
+  //    deleted before the demote-to-prose path can see it.
+  var UNMODELLED = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    unevaluatedProperties: false
+  };
+  ok("anthropic-go distinguishes silent deletion from demotion to prose",
+    has(E.convert(clone(UNMODELLED), "anthropic-go").ledger, "DELETED without a trace"));
+
+  // 8. A typeless node is not rejected by Go -- it is replaced with the literal
+  //    JSON `true`, i.e. match-anything. Blocker, because no type is inferable.
+  var TYPELESS = {
+    type: "object",
+    properties: { n: { properties: { a: { type: "string" } }, required: ["a"] } },
+    required: ["n"]
+  };
+  var rTypeless = E.convert(clone(TYPELESS), "anthropic-go");
+  ok("anthropic-go blocks a typeless node", blockers(rTypeless).length === 1);
+  ok("anthropic-go names the `true` replacement rather than a throw",
+    has(rTypeless.ledger, "literal JSON `true`"));
+
+  // 9. A root `$ref` loses everything on Go with no root-type guard to catch it.
+  var ROOT_REF = {
+    $ref: "#/$defs/T",
+    $defs: { T: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } }
+  };
+  var rRoot = E.convert(clone(ROOT_REF), "anthropic-go");
+  ok("anthropic-go inlines a root $ref", at(rRoot, "type") === "object" && !at(rRoot, "$ref"));
+  // Python is the one SDK that survives this shape, so it must still skip.
+  ok("anthropic-json-python still leaves the same root $ref alone",
+    at(E.convert(clone(ROOT_REF), "anthropic-json-python"), "$ref") === "#/$defs/T");
+
+  // 10. Go has no verbatim surface: BetaToolInputSchema runs the same
+  //     transform, so the `--to anthropic` target must not be recommended blind.
+  ok("the tools target points Go callers at anthropic-go",
+    has(E.convert({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "anthropic").ledger,
+      "anthropic-go"));
+  ok("anthropic-go never claims the tools path is verbatim",
+    !has(rLen.ledger, "sent as-is on the `tools[].input_schema` path"));
+
+  // 11. An ordinary schema the Go SDK accepts unchanged must not be edited.
+  var PLAIN = {
+    type: "object", properties: { a: { type: "string" }, b: { type: "integer" } }, required: ["a", "b"]
+  };
+  var rPlain = E.convert(clone(PLAIN), "anthropic-go");
+  ok("anthropic-go leaves an ordinary schema byte-identical",
+    JSON.stringify(at(rPlain, "")) === JSON.stringify(PLAIN));
+  ok("anthropic-go does not block an ordinary schema", blockers(rPlain).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
