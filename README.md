@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 639 engine + 184 CLI + 34 ESM/library assertions = **857** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 657 engine + 191 CLI + 34 ESM/library assertions = **882** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -464,7 +464,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 857 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 882 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -598,6 +598,60 @@ holds numbers where subschemas belong — and leaves the two genuinely ambiguous
 cases (`{"title": ..., "description": ...}` alone, and `{}`) classified as data,
 unchanged. The CLI still prints `note: input looked like an example object` when
 it infers, and `--mode schema` still forces the other reading.
+
+
+## An empty collection usually means the opposite, not "less"
+
+For a collection keyword the empty instance is generally not a weaker version of
+the non-empty one — it is the **inverse**. A non-empty `enum` narrows the legal
+values; an empty one leaves none. A non-empty `anyOf` offers branches; an empty
+one offers nothing to match. `not` of a schema that matches everything excludes
+everything. Each of those nodes has an **empty set of legal values**, so the
+field can never be populated — and every provider accepts the schema as written,
+so nothing downstream tells you.
+
+These are not hand-written curiosities. Measured verbatim:
+
+| Source | Output |
+|---|---|
+| `pydantic==2.13.4`, `class Empty(Enum): pass` | `{"enum": [], "title": "Empty"}` |
+| `zod@4.4.3`, `z.enum([])` | `{"type": "string", "enum": []}` |
+| `zod@4.4.3`, `z.union([])` | `{"anyOf": []}` |
+| `zod@4.4.3`, `z.never()` | `{"not": {}}` |
+
+The usual real cause is an upstream list that filtered down to nothing
+(`z.enum(ALLOWED_ROLES)` where `ALLOWED_ROLES` came back empty), not intent. The
+tool reports every one of these as an **advisory** — never a gate failure, since
+the destination accepts the document.
+
+One case is worse than advisory. `not` is on OpenAI's strip list, and stripping
+it is normally a widening we accept: dropping `not: {const: "x"}` re-admits one
+value. But when the excluded schema matches everything, removing the keyword
+leaves `{}` — **"every value is legal", from a node that meant "no value is
+legal."** That is an inversion, not a repair, and it used to be reported as a
+routine one-line strip whose output then rechecked clean. `--to openai` now
+blocks it (exit 3) and leaves the keyword visible.
+
+Note also what is deliberately *not* flagged: an empty `allOf` is vacuously
+**true**, so it matches everything — the exact opposite of an empty `anyOf` —
+and `required: []`, `properties: {}` and `prefixItems: []` are merely empty
+constraints, not impossible ones.
+
+### Why "the vendor accepted it" was not enough
+
+The value proposition throughout this README is *raw rejected → ours accepted*.
+For this bug that metric pointed the wrong way, which is worth stating plainly:
+
+| Schema | `toStrictJsonSchema()` (openai@7.4.0) |
+|---|---|
+| raw `z.never()` → `{"not": {}}` | **THROW** |
+| **old** output `{}` | **ACCEPT** |
+| **new** output `{"not": {}}` (blocked, exit 3) | THROW |
+
+The broken behaviour scored as a win and the correct one does not. Acceptance
+bought by changing what the schema *means* is not a repair, so for this shape the
+honest answer is a blocker: strict mode cannot express an impossible field, and
+pretending otherwise hands back a schema that accepts anything.
 
 
 ## License

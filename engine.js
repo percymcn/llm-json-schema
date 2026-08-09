@@ -156,6 +156,75 @@
     return emptiedMapForm(node) !== null;
   }
 
+  // ---- unsatisfiable nodes --------------------------------------------------
+  //
+  // For a collection keyword the EMPTY instance usually does not mean "less of
+  // the constraint" — it means the OPPOSITE of the non-empty one. A non-empty
+  // `enum` narrows the legal values; an empty one leaves none. A non-empty
+  // `anyOf` offers branches; an empty one offers nothing to match. `not` of a
+  // schema that matches everything excludes everything. Each of these nodes has
+  // an EMPTY set of legal values, so the field can never be populated.
+  //
+  // Not hypothetical, and not hand-written. Measured verbatim:
+  //   pydantic 2.13.4, `class Empty(Enum): pass`  -> {"enum": [], "title": "Empty"}
+  //   zod 4.4.3, z.enum([])                       -> {"type": "string", "enum": []}
+  //   zod 4.4.3, z.union([])                      -> {"anyOf": []}
+  //   zod 4.4.3, z.never()                        -> {"not": {}}
+  // The usual real cause is an upstream list that came back empty
+  // (`z.enum(ALLOWED)` where ALLOWED filtered down to nothing), not intent.
+  //
+  // Note what is deliberately NOT here. An empty `allOf` is vacuously TRUE, so
+  // it matches everything, the exact opposite of an empty `anyOf`. `required:
+  // []`, `properties: {}` and `prefixItems: []` are merely empty constraints,
+  // not impossible ones. Flagging any of those would be the over-strictness
+  // this project has shipped repeatedly.
+  function matchesAnything(v) {
+    // The spec's two spellings of "any value is legal" — the boolean `true` and
+    // the empty object. They are the same schema.
+    return v === true || (isPlainObject(v) && Object.keys(v).length === 0);
+  }
+
+  function unsatisfiableForm(node) {
+    if (!isPlainObject(node)) return null;
+    if (Array.isArray(node["enum"]) && node["enum"].length === 0) return "enum";
+    if (Array.isArray(node.anyOf) && node.anyOf.length === 0) return "anyOf";
+    if (Array.isArray(node.oneOf) && node.oneOf.length === 0) return "oneOf";
+    if (Array.isArray(node.type) && node.type.length === 0) return "type";
+    if ("not" in node && matchesAnything(node["not"])) return "not";
+    return null;
+  }
+
+  // Per form: what makes it impossible, and the generator measured emitting it.
+  // Naming only the relevant producer keeps the message about the reader's
+  // schema rather than reciting a catalogue.
+  var UNSAT_WHY = {
+    "enum": ["`enum: []` lists no allowed value",
+      "an empty `Enum` class (pydantic 2.13.4) and `z.enum([])` (zod 4.4.3) both emit this"],
+    anyOf: ["`anyOf: []` offers no branch to match",
+      "`z.union([])` (zod 4.4.3) emits this"],
+    oneOf: ["`oneOf: []` offers no branch to match",
+      "an empty union emits this"],
+    type: ["`type: []` permits no JSON type",
+      "this usually survives a list-valued `type` that was filtered down to nothing"],
+    "not": ["`not` of a match-anything schema (`{}` or `true`) excludes every value",
+      "`z.never()` (zod 4.4.3) emits this"]
+  };
+
+  // Advisory, never a gate failure: the destination accepts the document as
+  // written, so failing CI here would be the mistake #317 fixed. What it adds is
+  // the one thing nothing downstream will tell you — the field is dead.
+  function noteUnsatisfiable(node, path, ledger, doc) {
+    var form = unsatisfiableForm(node);
+    if (!form) return null;
+    ledger.push(entry("!", path,
+      "No value can satisfy this node: " + UNSAT_WHY[form][0] + ". The field can never be " +
+      "populated, and providers accept the schema as written, so nothing downstream will " +
+      "say so. This is almost always a degenerate input rather than intent — " +
+      UNSAT_WHY[form][1] + " — so check the list that produced it upstream.",
+      doc, true));
+    return form;
+  }
+
   // ---- boolean subschemas ---------------------------------------------------
   //
   // JSON Schema defines a schema as "an object OR a boolean": `true` matches any
@@ -1240,9 +1309,43 @@
         }
       }
 
+      // `not` is on the strip list, and stripping it is normally a WIDENING we
+      // accept: dropping `not: {const: "x"}` re-admits one value. But when the
+      // excluded schema matches everything, the node means "no value is legal",
+      // and removing the keyword leaves `{}` — "every value is legal". That is
+      // not a widening, it is an INVERSION, and it is reported as a routine
+      // one-line strip whose output then rechecks clean.
+      //
+      // The tell that this was wrong: we already BLOCK a user-supplied `true`
+      // here, because a constrained decoder cannot express "anything goes" — and
+      // `{}` is the same schema. We were refusing that shape as input while
+      // manufacturing it as output. And the two spellings of the excluded
+      // schema disagreed with each other: `not: true` was caught by the boolean
+      // walker and blocked, `not: {}` was silently inverted.
+      //
+      // No repair exists — strict mode has no encoding for an impossible field —
+      // so the keyword stays visible and the remedy is named.
+      var notBlocked = false;
+      if ("not" in node && matchesAnything(node["not"])) {
+        notBlocked = true;
+        ledger.push(entry("!", path,
+          "`not` here excludes every value, so no value can satisfy this node. Removing `not` " +
+          "(strict mode does not support it) would not narrow this node, it would INVERT it — " +
+          "from matching nothing to matching anything. Strict mode cannot express an impossible " +
+          "field, so drop the field, or give it a real type if the `not` was not intended " +
+          "(`z.never()` and an empty union both produce this).",
+          DOCS.openai));
+      }
+
+      // The other empty-collection forms are CARRIED here (the vendor accepts
+      // them verbatim), so they are advisory rather than a gate failure.
+      if (!notBlocked) noteUnsatisfiable(node, path, ledger, DOCS.openai);
+
       // strip every keyword outside the supported set (unsupported => API error)
       Object.keys(node).forEach(function (k) {
         if (OPENAI_SUPPORTED[k]) return;
+        // Leave a blocked `not` visible: deleting it is the inversion above.
+        if (k === "not" && notBlocked) return;
         // A blocked tuple stays visible so the reader can see the shape they
         // have to remodel; deleting it would hide the very thing to fix.
         if (k === "prefixItems" && tupleBlocked) return;
@@ -1959,6 +2062,15 @@
         "legal value is `{}` — a tool input that can never be populated.",
         url));
     }
+
+    // A node with no legal values. Anthropic carries all of these — measured on
+    // @anthropic-ai/sdk@0.116.0: `anyOf: []` is accepted verbatim and `enum: []`
+    // is demoted to the prose `{enum: []}` — so it is advisory, never a failure.
+    // It must run ABOVE the tools-path return: that path applies no transform,
+    // which is exactly why nothing else would ever mention a dead field there.
+    walk(s, "root", function (node, path) {
+      noteUnsatisfiable(node, path, ledger, url);
+    });
 
     if (!outputFormatPath) {
       // Nothing else is a defect here, because nothing else runs. Saying so is
@@ -2710,6 +2822,13 @@
       "Gemini resolves `$ref` only on the `responseJsonSchema` path, and only for genuine local " +
       "pointers.");
 
+    // A node with no legal values. Hoisted ABOVE the path split on purpose:
+    // both Gemini paths carry these shapes, and Path A returns early, so a walk
+    // placed after the split would silently cover only the narrow path.
+    walk(s, "root", function (node, path) {
+      noteUnsatisfiable(node, path, ledger, DOCS.gemini);
+    });
+
     // Narrow path only. `types.Schema` is declared `extra="forbid"` and every
     // sub-schema slot is typed as a `Schema`, never a bool — measured on
     // google-genai==2.17.0, `model_validate` REJECTS a boolean at
@@ -3266,6 +3385,10 @@
     // specific keywords found so the reader can see the divergence is real and is
     // about their schema, not a generic disclaimer.
     var kept = [];
+    walk(schema, "root", function (node, path) {
+      noteUnsatisfiable(node, path, ledger, url);
+    });
+
     walk(schema, "root", function (node, path) {
       Object.keys(node).forEach(function (k) {
         if (OPENAI_SUPPORTED[k] || kept.indexOf(k) !== -1) return;

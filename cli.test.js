@@ -1119,5 +1119,52 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     fixed.status === 0 && JSON.parse(fixed.stdout).properties.b.items === undefined);
 })();
 
+// --- Cycle #347: a node no value can satisfy, at the CLI boundary -----------
+(function () {
+  // `additionalProperties: false` is part of the FIXTURE, not incidental: without
+  // it openai proposes adding it and the run exits 1 for a reason that has
+  // nothing to do with this rule, which would make the assertions below
+  // non-discriminating.
+  function doc(p) {
+    return JSON.stringify({ type: "object",
+      properties: { a: { type: "string" }, p: p }, required: ["a", "p"],
+      additionalProperties: false });
+  }
+  var ZOD_NEVER = doc({ not: {} });      // zod 4.4.3 z.never()
+  var ZOD_ENUM0 = doc({ type: "string", "enum": [] }); // zod 4.4.3 z.enum([])
+  var ZOD_UNION0 = doc({ anyOf: [] });   // zod 4.4.3 z.union([])
+  var CONTROL = doc({ type: "string", "enum": ["a", "b"] });
+
+  // Stripping a match-anything `not` inverts the node, so it is a blocker (3),
+  // not a fixable edit (1) whose output the user is told to commit.
+  var never = run(["--to", "openai", "--check"], ZOD_NEVER);
+  ok("`z.never()` exits 3 on openai, not 1", never.status === 3);
+  ok("the CLI explains the inversion rather than reporting a routine strip",
+    never.stderr.indexOf("INVERT") !== -1);
+
+  // The old behaviour, pinned as a regression: the emitted node must not be the
+  // match-anything `{}`.
+  var out = run(["--to", "openai"], ZOD_NEVER);
+  ok("`--to openai` does not emit a match-anything `{}` for `z.never()`",
+    JSON.stringify(JSON.parse(out.stdout).properties.p) !== "{}");
+
+  // The three spellings of "this node accepts anything / nothing" agree.
+  ok("a bare boolean `true` node is still a blocker (#333 pin)",
+    run(["--to", "openai", "--check"], doc(true)).status === 3);
+
+  // Carried shapes: advisory only. An advisory must never fail a build.
+  ok("`z.enum([])` passes the gate on openai and says the field is dead",
+    (function () { var r = run(["--to", "openai", "--check"], ZOD_ENUM0);
+      return r.status === 0 && r.stderr.indexOf("No value can satisfy") !== -1; })());
+  ok("`z.union([])` passes the gate on anthropic and still reports it",
+    (function () { var r = run(["--to", "anthropic", "--check"], ZOD_UNION0);
+      return r.status === 0 && r.stderr.indexOf("No value can satisfy") !== -1; })());
+
+  // Over-block guard at the CLI: an ordinary schema stays silent and clean.
+  var ctl = run(["--to", "openai", "--check"], CONTROL);
+  ok("an ordinary enum is untouched and unreported",
+    ctl.status === 0 && ctl.stderr.indexOf("No value can satisfy") === -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

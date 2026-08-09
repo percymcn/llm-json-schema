@@ -3915,5 +3915,127 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     het.ledger.some(function (l) { return l.op === "!"; }));
 })();
 
+// --- Cycle #347: the empty instance of a collection keyword inverts it -------
+//
+// For a collection keyword the EMPTY instance is usually not "less constraint"
+// but the OPPOSITE one: an empty `enum` allows nothing, an empty `anyOf` offers
+// no branch, and `not` of a match-anything schema excludes everything. Each is a
+// node no value can satisfy. Measured producers, verbatim:
+//   pydantic 2.13.4 `class Empty(Enum): pass` -> {"enum": [], "title": "Empty"}
+//   zod 4.4.3 z.enum([])  -> {"type":"string","enum":[]}
+//   zod 4.4.3 z.union([]) -> {"anyOf":[]}
+//   zod 4.4.3 z.never()   -> {"not":{}}
+(function () {
+  // Guarded locally so a reverted engine.js REPORTS instead of aborting the file.
+  function conv(p, sch) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function doc(p) {
+    return { type: "object", properties: { a: { type: "string" }, p: p },
+             required: ["a", "p"] };
+  }
+  function pnode(r) {
+    return (r.schema && r.schema.properties && r.schema.properties.p) || {};
+  }
+  function unsat(r) {
+    return (r.ledger || []).filter(function (l) {
+      return typeof l.msg === "string" && l.msg.indexOf("No value can satisfy") !== -1;
+    });
+  }
+  function blockers(r) {
+    return (r.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+
+  var CARRIED = ["openai-nonstrict", "openai-realtime", "anthropic", "anthropic-json",
+    "anthropic-json-python", "anthropic-go", "gemini", "gemini-json", "gemini-client"];
+
+  // (1) The four measured generator outputs are reported on every target that
+  //     CARRIES them, and always as an ADVISORY -- the destination accepts the
+  //     document, so failing the gate here would be #317's mistake.
+  var FORMS = [
+    ["zod z.enum([])", { type: "string", "enum": [] }],
+    ["pydantic empty Enum", { "enum": [], title: "Empty" }],
+    ["zod z.union([])", { anyOf: [] }],
+    ["zod z.never()", { not: {} }]
+  ];
+  FORMS.forEach(function (f) {
+    var missing = CARRIED.filter(function (t) {
+      var hits = unsat(conv(t, doc(f[1])));
+      return hits.length !== 1 || hits[0].advisory !== true;
+    });
+    ok("`" + f[0] + "` is an advisory on every carrying target", missing.length === 0);
+  });
+
+  // (2) `--to openai` STRIPS `not`, and on a match-anything `not` that strip is
+  //     not a widening but an INVERSION: matches-nothing becomes matches-
+  //     anything. It must block, and the keyword must stay visible (#318).
+  var never = conv("openai", doc({ not: {} }));
+  ok("`not: {}` blocks on openai instead of being stripped",
+    blockers(never).length > 0 && has(never.ledger, "it would INVERT it"));
+  ok("the blocked `not: {}` is left visible in the output",
+    pnode(never).not !== undefined);
+
+  // (3) The regression that names the bug: the old code emitted `{}` here --
+  //     a node matching ANY value where the input matched NONE.
+  ok("`not: {}` does not come out as a match-anything `{}`",
+    JSON.stringify(pnode(never)) !== "{}");
+
+  // (4) The two spellings of the excluded schema must agree. `{}` and `true` are
+  //     the same schema, and they used to get different severities: `not: true`
+  //     was caught by the boolean walker, `not: {}` was silently inverted.
+  var neverBool = conv("openai", doc({ not: true }));
+  ok("`not: true` and `not: {}` get the same verdict on openai",
+    (blockers(neverBool).length > 0) === (blockers(never).length > 0));
+
+  // --- over-block guards. Being merely stricter than the vendor is this
+  //     project's most repeated bug, so each of these must stay quiet. -------
+
+  // (5) An empty `allOf` is vacuously TRUE -- it matches everything, the exact
+  //     opposite of an empty `anyOf`. Flagging it would show the rule was
+  //     keyed on emptiness rather than on meaning.
+  ok("`allOf: []` is NOT called unsatisfiable (it matches everything)",
+    unsat(conv("openai", doc({ type: "string", allOf: [] }))).length === 0);
+
+  // (6) Empty constraints that are merely empty, not impossible.
+  ok("`required: []` / `properties: {}` are not called unsatisfiable",
+    unsat(conv("openai", doc({ type: "object", properties: {}, required: [] }))).length === 0);
+  ok("`prefixItems: []` is not called unsatisfiable (#346 pin)",
+    unsat(conv("openai", doc({ type: "array", prefixItems: [] }))).length === 0);
+
+  // (7) A bare `{}` matches everything and the vendor accepts it verbatim
+  //     (#329), so it must not be swept up by the `not` rule's helper.
+  ok("a bare `{}` node is not called unsatisfiable",
+    unsat(conv("openai", doc({}))).length === 0);
+
+  // (8) Non-empty collections are untouched.
+  ok("a non-empty `enum` is not called unsatisfiable",
+    unsat(conv("openai", doc({ type: "string", "enum": ["a", "b"] }))).length === 0);
+  ok("a non-empty `anyOf` is not called unsatisfiable",
+    unsat(conv("openai", doc({ anyOf: [{ type: "string" }, { type: "integer" }] }))).length === 0);
+
+  // (9) `not` with a REAL constraining subschema still excludes only some
+  //     values, so removing it is the ordinary documented widening, not a
+  //     blocker. This is the line between "narrower" and "impossible".
+  var realNot = conv("openai", doc({ type: "string", not: { "const": "x" } }));
+  ok("`not` with a real subschema is still an ordinary strip, not a blocker",
+    unsat(realNot).length === 0 && pnode(realNot).not === undefined);
+
+  // (10) Placement pins. Both of these converters return EARLY on one of their
+  //      paths, so a walk added after the branch would silently cover only the
+  //      other one -- and the tools path is exactly where nothing else would
+  //      ever mention a dead field, because no transform runs there.
+  ok("the advisory survives anthropic's no-transform tools-path early return",
+    unsat(conv("anthropic", doc({ anyOf: [] }))).length === 1);
+  ok("the advisory survives gemini's responseJsonSchema early return",
+    unsat(conv("gemini-json", doc({ anyOf: [] }))).length === 1);
+
+  // (11) An advisory must never be the thing that fails a build.
+  ok("the unsatisfiable advisory never registers as a gate failure",
+    blockers(conv("gemini-json", doc({ "enum": [] }))).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
