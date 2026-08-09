@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 285 engine + 110 CLI + 31 ESM/library assertions = **426** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 302 engine + 117 CLI + 31 ESM/library assertions = **450** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -205,6 +205,37 @@ Pydantic emits exactly that for any field whose type is a nested model or `Enum`
 description does not, so the failure looks maddeningly input-dependent: it
 appears and disappears depending on which of your fields happen to be nested
 types. This tool inlines those refs and keeps the sibling.
+
+A third trap has no fix at all, only a decision, and it is the one most likely
+to reach production silently: the **open map**. `Dict[str, str]` (Pydantic),
+`Record<string, string>` / `z.record()` (Zod) and OpenAPI free-form objects all
+render as `{"type": "object", "additionalProperties": {…}}` with **no**
+`properties`. OpenAI strict mode requires `additionalProperties: false` on
+every object — and on a node with no `properties`, setting `false` does not
+close the object, it *empties* it: the only legal instance becomes `{}`, so the
+field can never be populated and nothing in the request says so. This tool
+refuses to make that edit. It reports the node as a blocker, leaves the element
+type visible, and names the remedy (an array of `{key, value}` objects, or
+declaring the keys you actually expect). The narrow Gemini `responseSchema`
+proto loses it the same way — it has no `additionalProperties` field at all —
+so that target blocks it too and points at `--to gemini-json`, which accepts it.
+Anthropic's `output_format` transformer performs the destruction itself,
+rebuilding the node as `{"type":"object","properties":{},"additionalProperties":false}`
+with no error, so that target warns; `tools[].input_schema` sends it verbatim
+and needs nothing.
+
+Worth knowing where the open map comes from, because two of OpenAI's own
+implementations disagree about it. `openai==2.53.0`'s
+`_ensure_strict_json_schema` only inserts `additionalProperties: false` when
+`type == "object"` *and the key is absent* (`lib/_pydantic.py:50`), so a
+`Dict[str, str]` field, a `Dict[str, Any]` field and a model with
+`ConfigDict(extra="allow")` all keep their open `additionalProperties` — and the
+SDK then stamps `strict: True` anyway. `openai@7.4.0`'s `toStrictJsonSchema()`
+**throws** on all three, and OpenAI's own `openai-agents==0.19.4` raises a
+`UserError` (`strict_schema.py:118-129`, which also handles a union-valued
+`type` and a typeless node with `properties`, both of which the base SDK
+misses). The three payloads in this repo's tests are the verbatim output of the
+Python SDK, so they are a regression pin on that disagreement.
 
 This tool applies each provider's rules for you and shows a **change ledger** — every transform, with the exact official-doc rule it enforces cited inline.
 

@@ -48,6 +48,38 @@
     return false;
   }
 
+  // An OPEN MAP is `{"type":"object", "additionalProperties": <schema|true>}`
+  // with no declared `properties` — the standard rendering of `Dict[str, V]`
+  // (Pydantic), `Record<string, V>` / `z.record()` (Zod) and OpenAPI free-form
+  // objects. All of the node's content lives in `additionalProperties`.
+  //
+  // This matters because the usual repair is to set `additionalProperties:
+  // false`, and on a node with no `properties` that does not close the object —
+  // it EMPTIES it. The map becomes a schema whose only legal instance is `{}`,
+  // so the field can never be populated, and nothing in the request says so.
+  // A rule that deletes the only content a node has must fail closed.
+  function isOpenMap(node) {
+    if (!isPlainObject(node)) return false;
+    if (!("additionalProperties" in node)) return false;
+    var ap = node.additionalProperties;
+    if (ap === false) return false;                       // already closed on purpose
+    if (ap !== true && !isPlainObject(ap)) return false;  // not a schema we understand
+    if (isPlainObject(node.properties) && Object.keys(node.properties).length) return false;
+    // `type` may be absent or an array (a nullable map) — treat any of those as
+    // an object, per the spec's second form of `type`.
+    var t = node.type;
+    if (t === undefined) return true;
+    if (t === "object") return true;
+    if (Array.isArray(t) && t.indexOf("object") !== -1) return true;
+    return false;
+  }
+
+  var OPEN_MAP_REMEDY =
+    "An open map cannot be expressed here, and closing it would leave an object " +
+    "whose only legal value is `{}` — the field could never be populated. Remodel " +
+    "it as an array of `{\"key\": ..., \"value\": ...}` objects (both halves stay " +
+    "fully typed), or declare the keys you actually expect as fixed `properties`.";
+
   // Ledger entry: { op: "+"|"~"|"x"|"!", path, msg, ruleUrl, advisory }
   //   +  added        ~  changed        x  removed        !  violation (cannot auto-fix)
   //
@@ -814,13 +846,24 @@
         ledger.push(entry("x", path, "Removed `" + k + "` — " + why, DOCS.openai));
       });
 
-      if (isObjectSchema(node)) {
+      if (isObjectSchema(node) || isOpenMap(node)) {
         // additionalProperties: false on every object
-        if (node.additionalProperties !== false) {
+        if (isOpenMap(node)) {
+          // Do NOT rewrite: setting `false` here deletes the node's only content.
+          // Left visible so the reader can see the shape they have to remodel.
+          ledger.push(entry("!", path,
+            "This is an open map (`additionalProperties` with no `properties`). OpenAI " +
+            "strict mode requires `additionalProperties: false` on every object. " +
+            OPEN_MAP_REMEDY,
+            DOCS.openai));
+        } else if (node.additionalProperties !== false) {
           var was = "additionalProperties" in node;
+          var lost = was && node.additionalProperties !== false;
           node.additionalProperties = false;
           ledger.push(entry(was ? "~" : "+", path,
-            "Set `additionalProperties: false` — required on every object.",
+            "Set `additionalProperties: false` — required on every object." +
+            (lost ? " The extra keys your `additionalProperties` allowed are no longer " +
+              "accepted; only the declared `properties` survive." : ""),
             DOCS.openai));
         }
         // every property must be required; keep optionals optional-in-spirit via nullable
@@ -1265,6 +1308,25 @@
     // otherwise report a gutted subtree as an ordinary unenforced keyword. The
     // root is left out on purpose — a union root is a genuine blocker (both
     // paths require `type === "object"`) and is already reported as one above.
+    // An open map survives the tools path untouched, so this is not a defect of
+    // the schema — it is a defect of THIS path, and it is silent: the
+    // transformer rebuilds the node as `{"type":"object","properties":{},
+    // "additionalProperties":false}`, i.e. a field that can only ever be `{}`.
+    // Advisory, never a gate failure, because the request still returns 200 —
+    // that is the established policy for everything this path destroys.
+    walk(s, "root", function (node, path) {
+      if (!isOpenMap(node)) return;
+      ledger.push(entry("=", path,
+        "This is an open map (`additionalProperties` with no `properties`). The " +
+        "`output_format` transformer discards your `additionalProperties` and forces " +
+        "`false`, leaving `{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}` " +
+        "— an object whose only legal value is `{}`, so the model can never populate this " +
+        "field. No error is raised. " + OPEN_MAP_REMEDY +
+        " It survives intact on `tools[].input_schema` (`--to anthropic`), which applies no " +
+        "transform at all.",
+        url, true));
+    });
+
     walk(s, "root", function (node, path) {
       if (path === "root") return;
       normalizeAnthropicUnionType(node, path, ledger, url, pythonSdk);
@@ -1893,6 +1955,18 @@
           if (k === "$ref") {
             ledger.push(entry("!", path,
               "`$ref` is not supported by Gemini (except recursive `#`). Inline the referenced schema.",
+              DOCS.gemini));
+          } else if (k === "additionalProperties" && isOpenMap(node)) {
+            // Dropping it here is the same deletion as OpenAI's rewrite: the
+            // proto has no field for it, so the map's element type simply
+            // vanishes and `{"type":"OBJECT"}` is left behind. Keep it visible.
+            ledger.push(entry("!", path,
+              "This is an open map (`additionalProperties` with no `properties`). The " +
+              "`responseSchema` proto has no `additionalProperties` field, so the element " +
+              "type would be dropped and this node would become a bare object with no " +
+              "declared contents. " + OPEN_MAP_REMEDY +
+              " (The `responseJsonSchema` path DOES accept `additionalProperties` — if you " +
+              "can use it, run `--to gemini-json` instead.)",
               DOCS.gemini));
           } else if (k === "additionalProperties") {
             ledger.push(entry("x", path,

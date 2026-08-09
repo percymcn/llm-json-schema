@@ -720,5 +720,42 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   ok("the converted output then passes its own gate", twice.status === 0, "status=" + twice.status);
 })();
 
+// --- an open map is a blocker at the CLI, not a silent "fixed" -------------
+// Verbatim `to_strict_json_schema()` output from openai==2.53.0 for a Pydantic
+// model with `meta: Dict[str, str]`. Before this was a blocker the CLI printed
+// a one-line fix and exited 1; applying that fix produced a schema the API
+// accepts and the model can never populate.
+(function () {
+  var DICT = JSON.stringify({
+    properties: {
+      name: { title: "Name", type: "string" },
+      meta: { additionalProperties: { type: "string" }, title: "Meta", type: "object" }
+    },
+    required: ["name", "meta"], title: "M1", type: "object", additionalProperties: false
+  });
+
+  var chk = run(["--to", "openai", "--check"], DICT);
+  ok("an open map fails --check instead of reporting a one-line fix",
+    chk.status === 1, "status=" + chk.status);
+  ok("...and the diagnosis says the field could never be populated",
+    /could never be populated/.test(chk.stderr), chk.stderr.slice(0, 300));
+  ok("...and it is marked as needing a human fix, not an auto-fix",
+    /needs a human fix/.test(chk.stderr), chk.stderr.slice(0, 300));
+
+  var conv = run(["--to", "openai"], DICT);
+  ok("converting exits 3 — a blocker survived the conversion",
+    conv.status === 3, "status=" + conv.status);
+  ok("the element type is left visible instead of being deleted",
+    JSON.parse(conv.stdout).properties.meta.additionalProperties.type === "string", conv.stdout);
+
+  var tools = run(["--to", "anthropic", "--check"], DICT);
+  ok("the same file passes on anthropic tools, which sends it verbatim",
+    tools.status === 0, "status=" + tools.status);
+
+  var gemJson = run(["--to", "gemini-json", "--check"], DICT);
+  ok("...and on gemini-json, whose accepted list includes additionalProperties",
+    gemJson.status === 0, "status=" + gemJson.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -1825,5 +1825,104 @@ var PY_SDK_OK = {"properties":{"title":{"maxLength":80,"minLength":2,"pattern":"
     blockers(unionRoot).length > 0);
 })();
 
+// --- an OPEN MAP must never be "repaired" into an empty object --------------
+// `{"type":"object","additionalProperties":<schema>}` with no `properties` is
+// how `Dict[str, V]` (Pydantic), `Record<string, V>` / `z.record()` (Zod) and
+// OpenAPI free-form objects render. Setting `additionalProperties: false` on a
+// node with no `properties` does not close it, it EMPTIES it: the only legal
+// instance becomes `{}`, so the field can never be populated and nothing says
+// so. Third instance of a repair that deletes (#318 `allOf`, #320 `$defs`).
+//
+// The three inputs below are the VERBATIM output of
+// `openai.lib._pydantic.to_strict_json_schema()` on openai==2.53.0 /
+// pydantic==2.13.4 -- i.e. the payload the OpenAI Python SDK actually builds
+// and stamps `strict: True` on. `openai@7.4.0`'s `toStrictJsonSchema()` THROWS
+// on all three ("must set `additionalProperties: false`"), so these are also a
+// pin on the fourth same-vendor SDK disagreement.
+var PY_DICT_STR = { properties: { name: { title: "Name", type: "string" }, meta: { additionalProperties: { type: "string" }, title: "Meta", type: "object" } }, required: ["name", "meta"], title: "M1", type: "object", additionalProperties: false };
+var PY_DICT_ANY = { properties: { name: { title: "Name", type: "string" }, meta: { additionalProperties: true, title: "Meta", type: "object" } }, required: ["name", "meta"], title: "M2", type: "object", additionalProperties: false };
+var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: "Name", type: "string" } }, required: ["name"], title: "M3", type: "object" };
+(function () {
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+
+  var dictStr = E.convert(clone(PY_DICT_STR), "openai");
+  ok("openai blocks an open map rather than emptying it",
+    blockers(dictStr).length > 0);
+  ok("...and leaves the map's element type visible for remodelling",
+    dictStr.schema.properties.meta.additionalProperties &&
+    dictStr.schema.properties.meta.additionalProperties.type === "string");
+  ok("...and names the array-of-pairs remedy",
+    has(dictStr.ledger, "array of `{\"key\": ..., \"value\": ...}` objects"));
+
+  var dictAny = E.convert(clone(PY_DICT_ANY), "openai");
+  ok("`additionalProperties: true` with no properties is the same open map",
+    blockers(dictAny).length > 0 && dictAny.schema.properties.meta.additionalProperties === true);
+
+  // extra="allow" puts the open flag on a node that DOES declare properties, so
+  // closing it is a real (and the only) repair -- not a deletion. Being merely
+  // stricter than the vendor is this project's most repeated bug, so the
+  // blocker must not fire here.
+  var extraAllow = E.convert(clone(PY_EXTRA_ALLOW), "openai");
+  ok("a node WITH properties is closed, not blocked",
+    blockers(extraAllow).length === 0 && extraAllow.schema.additionalProperties === false);
+  ok("...and the ledger says the extra keys are no longer accepted",
+    has(extraAllow.ledger, "no longer"));
+  ok("...and the declared properties survive",
+    !!extraAllow.schema.properties.name);
+
+  // `additionalProperties: false` with no properties is the user's own choice
+  // (an intentionally empty object), not something to block.
+  var closedEmpty = E.convert({ type: "object", properties: { e: { type: "object", additionalProperties: false } }, required: ["e"], additionalProperties: false }, "openai");
+  ok("a deliberately closed empty object is not blocked",
+    blockers(closedEmpty).length === 0);
+
+  // The narrow Gemini proto has no `additionalProperties` field at all, so
+  // dropping it is the same deletion by another route.
+  var gem = E.convert(clone(PY_DICT_STR), "gemini");
+  ok("gemini (narrow proto) blocks an open map instead of dropping its element type",
+    blockers(gem).length > 0);
+  ok("...and points at the responseJsonSchema path, which does accept it",
+    has(gem.ledger, "--to gemini-json"));
+  var gemJson = E.convert(clone(PY_DICT_STR), "gemini-json");
+  ok("gemini-json accepts an open map unchanged",
+    blockers(gemJson).length === 0 &&
+    gemJson.schema.properties.meta.additionalProperties.type === "string");
+
+  // Anthropic: the tools path sends it verbatim, so nothing to say. The
+  // output_format path destroys it vendor-side (measured: the transformer
+  // returns `{"type":"object","properties":{},"additionalProperties":false}`),
+  // which is silent and returns 200 -- advisory, never a gate failure, which is
+  // the established policy for everything that path demotes.
+  var antTools = E.convert(clone(PY_DICT_STR), "anthropic");
+  ok("anthropic (tools) leaves an open map alone",
+    blockers(antTools).length === 0 &&
+    antTools.schema.properties.meta.additionalProperties.type === "string");
+  var antJson = E.convert(clone(PY_DICT_STR), "anthropic-json");
+  ok("anthropic-json warns that the transformer empties an open map",
+    has(antJson.ledger, "only legal value is `{}`"));
+  ok("...as an advisory, not a gate failure",
+    blockers(antJson).length === 0);
+
+  // A nullable map -- `type: ["object","null"]` -- is the same shape wearing
+  // the spec's second form of `type` (#327). A walker that only knows the
+  // scalar spelling skips it.
+  var nullableMap = E.convert({ type: "object", properties: { m: { type: ["object", "null"], additionalProperties: { type: "string" } } }, required: ["m"], additionalProperties: false }, "openai");
+  ok("a union-typed open map is still recognised as an open map",
+    blockers(nullableMap).length > 0);
+
+  // A typeless node whose only content is `additionalProperties` is the same
+  // shape again -- `type` is optional in JSON Schema and generators omit it.
+  var typelessMap = E.convert({ type: "object", properties: { m: { additionalProperties: { type: "string" } } }, required: ["m"], additionalProperties: false }, "openai");
+  ok("a typeless open map is still recognised as an open map",
+    blockers(typelessMap).length > 0);
+
+  // Non-strict OpenAI surfaces have no additionalProperties requirement at all,
+  // so the map is legal there and must NOT be blocked (#322).
+  var nonStrict = E.convert(clone(PY_DICT_STR), "openai-nonstrict");
+  ok("openai-nonstrict does not block an open map",
+    blockers(nonStrict).length === 0 &&
+    nonStrict.schema.properties.meta.additionalProperties.type === "string");
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
