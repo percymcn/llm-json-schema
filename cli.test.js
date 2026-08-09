@@ -80,15 +80,30 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--check says so on stderr", r.stderr.indexOf("Already valid") !== -1, r.stderr);
 })();
 
-// --- blockers that need a human ---------------------------------------------
+// --- $ref handling for Gemini (no $ref support => inline it) -----------------
 (function () {
+  // A plain, non-recursive $ref is NOT a human problem — it can be inlined.
   var r = run(["--to", "gemini"], JSON.stringify({
     type: "object",
     $defs: { A: { type: "string" } },
     properties: { a: { $ref: "#/$defs/A" } }
   }));
-  ok("exits 3 when a blocker needs a human fix", r.status === 3, "status=" + r.status);
-  ok("names the blocker on stderr", r.stderr.indexOf("$defs") !== -1, r.stderr);
+  ok("inlines a non-recursive $ref instead of blocking", r.status === 0, "status=" + r.status + " " + r.stderr);
+  var out = JSON.parse(r.stdout);
+  ok("the referenced definition is inlined at the use site", out.properties.a.type === "string", r.stdout);
+  ok("the $defs block is gone", out.$defs === undefined, r.stdout);
+})();
+
+// --- blockers that genuinely need a human ------------------------------------
+(function () {
+  // A self-referencing definition cannot be expressed in Gemini's subset at all.
+  var r = run(["--to", "gemini"], JSON.stringify({
+    type: "object",
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } },
+    properties: { root: { $ref: "#/$defs/Node" } }
+  }));
+  ok("exits 3 when a recursive $ref needs a human fix", r.status === 3, "status=" + r.status);
+  ok("names the recursive definition on stderr", r.stderr.indexOf("Node") !== -1, r.stderr);
 })();
 
 // --- machine-readable mode ---------------------------------------------------

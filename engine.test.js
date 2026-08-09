@@ -93,5 +93,88 @@ function has(ledger, substr) {
   ok("convert reports invalid JSON", bad.ok === false && /isn't valid JSON/.test(bad.error));
 })();
 
+// --- REAL generator output: zod v3 + zod-to-json-schema ----------------------
+// Verbatim `zodToJsonSchema()` output (zod 3, zod-to-json-schema 3.25.2) for a
+// schema using the most common idioms: .uuid() .min() .max() .email() .default()
+// .optional(). Before 2026-08-08 the engine reported this as "already valid":
+// the root is `{$ref, definitions}`, so every object rule no-opped on it.
+var ZOD_V3 = {
+  $ref: "#/definitions/Ticket",
+  definitions: {
+    Ticket: {
+      type: "object",
+      properties: {
+        id: { type: "string", format: "uuid" },
+        title: { type: "string", minLength: 1, maxLength: 120 },
+        priority: { type: "string", enum: ["low", "high"], "default": "low" },
+        score: { type: "number", minimum: 0, maximum: 100 },
+        notes: { type: "string" }
+      },
+      required: ["id", "title", "score"],
+      additionalProperties: false
+    }
+  },
+  $schema: "http://json-schema.org/draft-07/schema#"
+};
+
+(function () {
+  var r = E.toOpenAI(ZOD_V3);
+  var s = r.schema;
+  ok("zod-v3 root $ref is inlined to a real object root", s.type === "object" && !!s.properties);
+  ok("zod-v3 root $ref leaves no dangling $ref", s.$ref === undefined);
+  ok("zod-v3 definitions block is consumed", s.definitions === undefined && s.$defs === undefined);
+  ok("zod-v3 every property ends up required", s.required.length === 5);
+  ok("zod-v3 additionalProperties:false survives", s.additionalProperties === false);
+  ok("openai strips $schema", s.$schema === undefined);
+  ok("openai strips default (API rejects it)", s.properties.priority["default"] === undefined);
+  ok("openai strips minLength", s.properties.title.minLength === undefined);
+  ok("openai strips maxLength", s.properties.title.maxLength === undefined);
+  ok("openai keeps supported minimum/maximum", s.properties.score.minimum === 0 && s.properties.score.maximum === 100);
+  ok("openai keeps supported format", s.properties.id.format === "uuid");
+  ok("zod-v3 conversion is not a silent no-op", r.ledger.filter(function (l) { return l.op !== "="; }).length >= 8);
+  ok("ledger cites the default rejection verbatim", has(r.ledger, "not permitted, such as 'minimum' or 'default'"));
+})();
+
+// --- forced-required enum must admit null, or it is unsatisfiable ------------
+(function () {
+  var r = E.toOpenAI(ZOD_V3);
+  var p = r.schema.properties.priority;
+  ok("nullable enum field is typed nullable", p.type.indexOf("null") !== -1);
+  ok("nullable enum field admits null in enum", p.enum.indexOf(null) !== -1);
+})();
+
+// --- idempotence: the gate must not flag its own output ----------------------
+["openai", "anthropic", "gemini"].forEach(function (provider) {
+  var once = E.convert(ZOD_V3, provider, { mode: "schema" });
+  var twice = E.convert(once.schema, provider, { mode: "schema" });
+  var changes = twice.ledger.filter(function (l) { return l.op !== "="; });
+  ok(provider + " conversion is idempotent", changes.length === 0);
+});
+
+// --- oneOf is rewritten, not dropped ----------------------------------------
+(function () {
+  var r = E.toOpenAI({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }, { type: "integer" }] } }
+  });
+  var v = r.schema.properties.v;
+  ok("openai rewrites oneOf to anyOf", Array.isArray(v.anyOf) && v.anyOf.length === 2 && v.oneOf === undefined);
+})();
+
+// --- Gemini inlines $refs rather than emitting an empty schema --------------
+(function () {
+  var r = E.toGemini(ZOD_V3);
+  ok("gemini inlines the zod-v3 root $ref", r.schema.type === "object" && !!r.schema.properties);
+  ok("gemini output has no $ref left", JSON.stringify(r.schema).indexOf("$ref") === -1);
+  var rec = E.toGemini({
+    type: "object",
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } },
+    properties: { root: { $ref: "#/$defs/Node" } }
+  });
+  ok("gemini still blocks a genuinely recursive $ref", rec.ledger.some(function (l) {
+    return l.op === "!" && l.msg.indexOf("recursive") !== -1;
+  }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

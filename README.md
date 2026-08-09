@@ -66,9 +66,18 @@ API contract — which is why the ledger cites the rule for every change.
 
 ## Why
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
-- **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`; `allOf`/`not`/`if`/`then`/`else` unsupported.
+- **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* Supported string properties are `pattern` and `format` **only**, so the extremely common `minLength`/`maxLength` (from `z.string().min()/.max()`) are rejected, as is `default` (from `.default()`).
 - **Anthropic tool `input_schema`:** standard JSON Schema, object root, light constraints; `strict: true` goes on the tool, not the schema.
-- **Gemini `responseSchema`:** a JSON-Schema subset — needs `propertyOrdering`, drops `$ref`/`pattern`/`minLength`/`maxLength`, and limits string `format` to `date-time`/`date`/`time`.
+- **Gemini `responseSchema`:** a JSON-Schema subset — needs `propertyOrdering`, has no `$ref` at all (so definitions get inlined), drops `pattern`/`minLength`/`maxLength`, and limits string `format` to `date-time`/`date`/`time`.
+
+### What generators actually emit
+`zod-to-json-schema` wraps your schema as `{ "$ref": "#/definitions/X", "definitions": { … } }`.
+That root has no `type` and no `properties`, so a naive converter no-ops on it and
+reports "already valid" for a schema OpenAI will reject. This tool renames
+`definitions` → `$defs`, inlines the root `$ref`, and then applies the object
+rules to the real schema body. zod v4's `z.toJSONSchema()` and Pydantic's
+`model_json_schema()` emit a normal object root but still carry `$schema`,
+`default`, `minLength` and `maxLength`.
 
 This tool applies each provider's rules for you and shows a **change ledger** — every transform, with the exact official-doc rule it enforces cited inline.
 
@@ -109,10 +118,19 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { convert } from "llm-json-schema";
 
-const Result = z.object({ title: z.string(), notes: z.string().optional() });
+const Result = z.object({
+  title: z.string().min(1),               // -> minLength, which OpenAI rejects
+  priority: z.enum(["low", "high"]).default("low"),  // -> default, which OpenAI rejects
+  notes: z.string().optional(),           // -> absent from `required`, which OpenAI rejects
+});
 
 const { schema, ledger } = convert(zodToJsonSchema(Result), "openai");
-// notes -> type: ["string", "null"] and added to `required`, with the rule cited.
+// - root `$ref` into `definitions` is inlined, so the object rules actually apply
+// - `minLength` and `default` are removed (not in OpenAI's supported keyword set)
+// - `notes` -> type: ["string", "null"] and added to `required`
+// - `priority` is forced required, so `null` is added to its `enum` too —
+//   otherwise the nullable type and the enum contradict each other
+// every one of those is a ledger line citing the rule it enforces.
 ```
 
 Your input object is never mutated, so you can convert the same schema for more
@@ -126,10 +144,10 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 83 assertions total. Run: `npm test`. The CLI fixtures are the actual schemas from real reported failures, so a regression means the tool stopped fixing a bug people genuinely hit.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 108 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
-## Sources (verified 2026-07-30)
+## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
 - OpenAI — https://developers.openai.com/api/docs/guides/structured-outputs
 - Anthropic — https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview
 - Gemini — https://ai.google.dev/gemini-api/docs/structured-output

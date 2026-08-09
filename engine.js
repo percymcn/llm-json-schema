@@ -4,8 +4,9 @@
  * Dependency-free. Runs in the browser and in Node (for tests).
  *
  * Every rule encoded here is sourced from the provider's CURRENT official docs
- * (fetched 2026-07-30). Each RULE carries the doc URL it came from so the UI can
- * cite it — the provider-divergence logic IS the product's value.
+ * (fetched 2026-07-30; OpenAI keyword set re-verified 2026-08-08). Each RULE
+ * carries the doc URL it came from so the UI can cite it — the provider-
+ * divergence logic IS the product's value.
  *
  * Sources:
  *   OpenAI    https://developers.openai.com/api/docs/guides/structured-outputs
@@ -90,12 +91,118 @@
   //  - "additionalProperties: false must always be set in objects"
   //  - "All fields ... must be specified as required" (optional => union with null)
   //  - "the root level object of a schema must be an object, and not use anyOf"
-  //  - Unsupported: allOf, not, dependentRequired, dependentSchemas, if, then, else
-  var OPENAI_UNSUPPORTED = ["allOf", "not", "dependentRequired", "dependentSchemas", "if", "then", "else", "patternProperties"];
+  //  - "If you turn on Structured Outputs by supplying strict: true and call the
+  //     API with an unsupported JSON Schema, you will receive an error."
+  //
+  // Because unsupported keywords ERROR rather than being ignored, this is an
+  // ALLOWLIST, not a blocklist. The doc's "Supported properties" section names
+  // the keywords below and nothing else; anything absent is stripped. A
+  // blocklist silently passed through `default` / `minLength` / `maxLength` /
+  // `$schema` — which is exactly what zod-to-json-schema, zod v4's
+  // z.toJSONSchema() and Pydantic emit for `.min()`, `.max()` and `.default()`.
+  var OPENAI_SUPPORTED = {
+    // structural
+    type: 1, properties: 1, required: 1, additionalProperties: 1,
+    items: 1, prefixItems: 1, anyOf: 1, enum: 1, "const": 1, $ref: 1, $defs: 1,
+    // annotations OpenAI's own examples carry (and which steer the model)
+    description: 1, title: 1,
+    // string
+    pattern: 1, format: 1,
+    // number
+    multipleOf: 1, maximum: 1, exclusiveMaximum: 1, minimum: 1, exclusiveMinimum: 1,
+    // array
+    minItems: 1, maxItems: 1
+  };
+
+  // Why a given keyword is stripped. Anything not named here gets the generic
+  // reason. These are the ones real generators actually emit.
+  var OPENAI_STRIP_REASON = {
+    "default": "the API rejects it outright — \"certain properties in the schema are not permitted, such as 'minimum' or 'default' in specified contexts\". Zod `.default()` and Pydantic field defaults emit it.",
+    "minLength": "OpenAI's supported string properties are `pattern` and `format` only — `minLength` is not among them. Zod `z.string().min(n)` emits it.",
+    "maxLength": "OpenAI's supported string properties are `pattern` and `format` only — `maxLength` is not among them. Zod `z.string().max(n)` emits it.",
+    "uniqueItems": "OpenAI's supported array properties are `minItems` and `maxItems` only.",
+    "$schema": "not part of OpenAI's supported schema set. It carries no validation meaning for the API, and every Zod/Pydantic generator emits it at the root.",
+    "examples": "annotation-only keyword, not in OpenAI's supported set.",
+    "deprecated": "annotation-only keyword, not in OpenAI's supported set.",
+    "readOnly": "annotation-only keyword, not in OpenAI's supported set.",
+    "writeOnly": "annotation-only keyword, not in OpenAI's supported set.",
+    "minProperties": "OpenAI's only supported object property is `additionalProperties`.",
+    "maxProperties": "OpenAI's only supported object property is `additionalProperties`.",
+    "patternProperties": "OpenAI's only supported object property is `additionalProperties`.",
+    "propertyNames": "OpenAI's only supported object property is `additionalProperties`.",
+    "unevaluatedProperties": "OpenAI's only supported object property is `additionalProperties`."
+  };
+
+  // `definitions` is draft-07 (what zod-to-json-schema emits); OpenAI's doc and
+  // examples use `$defs`. Rename it and repoint every `$ref` that used it.
+  function normalizeDefs(s, ledger) {
+    if (!isPlainObject(s.definitions)) return s;
+    if (isPlainObject(s.$defs)) {
+      // both present — merge `definitions` in without clobbering `$defs`
+      Object.keys(s.definitions).forEach(function (k) {
+        if (!(k in s.$defs)) s.$defs[k] = s.definitions[k];
+      });
+    } else {
+      s.$defs = s.definitions;
+    }
+    delete s.definitions;
+    deepRepointRefs(s);
+    ledger.push(entry("~", "root",
+      "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref` — OpenAI's schema dialect uses `$defs`. (zod-to-json-schema emits `definitions`.)",
+      DOCS.openai));
+    return s;
+  }
+
+  // Structural (not string-replace) rewrite of #/definitions/X -> #/$defs/X.
+  function deepRepointRefs(v) {
+    if (Array.isArray(v)) { v.forEach(deepRepointRefs); return; }
+    if (!isPlainObject(v)) return;
+    if (typeof v.$ref === "string" && v.$ref.indexOf("#/definitions/") === 0) {
+      v.$ref = "#/$defs/" + v.$ref.slice("#/definitions/".length);
+    }
+    Object.keys(v).forEach(function (k) { deepRepointRefs(v[k]); });
+  }
+
+  // A root of `{ "$ref": "#/$defs/X", "$defs": {...} }` has no `type`, no
+  // `properties` and no `additionalProperties`, so every object rule below
+  // silently no-ops on it and the tool reports "already valid" for a schema
+  // that is not. Hoist the referenced definition to the root instead.
+  function inlineRootRef(s, ledger) {
+    if (typeof s.$ref !== "string") return s;
+    var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
+    if (!m) return s;
+    var name = m[1];
+    if (!isPlainObject(s.$defs) || !isPlainObject(s.$defs[name])) return s;
+
+    var out = clone(s.$defs[name]);
+    var defs = s.$defs;
+
+    // carry over any sibling keys the generator left next to `$ref`
+    Object.keys(s).forEach(function (k) {
+      if (k !== "$ref" && k !== "$defs" && !(k in out)) out[k] = s[k];
+    });
+
+    // keep only the definitions something still points at (recursive schemas
+    // reference themselves, so `name` may need to stay)
+    var remaining = {};
+    Object.keys(defs).forEach(function (k) { if (k !== name) remaining[k] = defs[k]; });
+    if (JSON.stringify([out, remaining]).indexOf('"#/$defs/' + name + '"') !== -1) {
+      remaining[name] = defs[name];
+    }
+    if (Object.keys(remaining).length) out.$defs = remaining;
+
+    ledger.push(entry("~", "root",
+      "Inlined the root `$ref` (`#/$defs/" + name + "`) into the root. OpenAI requires the root to be an object schema, and a bare `$ref` root leaves `additionalProperties`/`required` unset on the real object.",
+      DOCS.openai));
+    return out;
+  }
 
   function toOpenAI(schema) {
     var s = clone(schema);
     var ledger = [];
+
+    s = normalizeDefs(s, ledger);
+    s = inlineRootRef(s, ledger);
 
     if (s.type && s.type !== "object") {
       ledger.push(entry("!", "root",
@@ -109,14 +216,23 @@
     }
 
     walk(s, "root", function (node, path) {
-      // strip unsupported composition keywords
-      OPENAI_UNSUPPORTED.forEach(function (kw) {
-        if (kw in node) {
-          delete node[kw];
-          ledger.push(entry("x", path,
-            "Removed unsupported keyword `" + kw + "` (OpenAI strict mode does not support it).",
-            DOCS.openai));
-        }
+      // `anyOf` is the union OpenAI supports; `oneOf` is never named in the doc.
+      // Rewrite rather than strip — dropping it would silently widen the schema.
+      if (Array.isArray(node.oneOf) && !node.anyOf) {
+        node.anyOf = node.oneOf;
+        delete node.oneOf;
+        ledger.push(entry("~", path,
+          "Rewrote `oneOf` as `anyOf` — `anyOf` is the only union keyword in OpenAI's supported set.",
+          DOCS.openai));
+      }
+
+      // strip every keyword outside the supported set (unsupported => API error)
+      Object.keys(node).forEach(function (k) {
+        if (OPENAI_SUPPORTED[k]) return;
+        var why = OPENAI_STRIP_REASON[k] ||
+          "not in OpenAI's supported keyword set, and strict mode errors on unsupported keywords.";
+        delete node[k];
+        ledger.push(entry("x", path, "Removed `" + k + "` — " + why, DOCS.openai));
       });
 
       if (isObjectSchema(node)) {
@@ -155,6 +271,12 @@
       if (node.type.indexOf("null") === -1) node.type.push("null");
     } else if (typeof node.type === "string") {
       if (node.type !== "null") node.type = [node.type, "null"];
+    }
+    // An `enum` alongside a nullable type has to admit null as well, or the two
+    // constraints are unsatisfiable and the model can never legally emit null.
+    // zod `z.enum([...]).optional()` / `.default()` hits this every time.
+    if (Array.isArray(node.enum) && node.enum.indexOf(null) === -1) {
+      node.enum = node.enum.concat([null]);
     }
   }
 
@@ -209,15 +331,67 @@
   };
   var GEMINI_STRING_FORMATS = { "date-time": 1, "date": 1, "time": 1, "enum": 1 };
 
+  // Gemini has no `$ref`, so the only correct transform is to inline the
+  // definitions — not to warn and then strip the `$defs` bag, which is what
+  // this used to do and which turned `{ $ref, definitions }` (the exact shape
+  // zod-to-json-schema emits) into an empty `{ "$ref": ... }`.
+  // Returns the inlined schema; pushes a blocker for genuinely recursive refs,
+  // which Gemini cannot express at all.
+  function inlineRefs(s, ledger, docUrl) {
+    var defs = {};
+    [s.$defs, s.definitions].forEach(function (bag) {
+      if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { defs[k] = bag[k]; });
+    });
+    if (!Object.keys(defs).length) return s;
+
+    var inlined = 0, recursive = [];
+
+    function resolve(node, stack) {
+      if (Array.isArray(node)) return node.map(function (n) { return resolve(n, stack); });
+      if (!isPlainObject(node)) return node;
+
+      var ref = typeof node.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref) : null;
+      if (ref && defs[ref[1]]) {
+        var name = ref[1];
+        if (stack.indexOf(name) !== -1) {
+          if (recursive.indexOf(name) === -1) recursive.push(name);
+          return node; // leave it; a blocker is reported below
+        }
+        var target = resolve(clone(defs[name]), stack.concat([name]));
+        // siblings alongside `$ref` win over the definition's own keys
+        Object.keys(node).forEach(function (k) { if (k !== "$ref") target[k] = resolve(node[k], stack); });
+        inlined++;
+        return target;
+      }
+
+      var out = {};
+      Object.keys(node).forEach(function (k) { out[k] = resolve(node[k], stack); });
+      return out;
+    }
+
+    var result = resolve(s, []);
+    delete result.$defs;
+    delete result.definitions;
+
+    if (inlined) {
+      ledger.push(entry("~", "root",
+        "Inlined " + inlined + " `$ref` reference" + (inlined === 1 ? "" : "s") +
+        " and dropped the `$defs`/`definitions` block — Gemini's schema subset has no `$ref`.",
+        docUrl));
+    }
+    recursive.forEach(function (name) {
+      ledger.push(entry("!", "root",
+        "`" + name + "` is recursive (it references itself). Gemini cannot express a recursive schema — flatten it to a fixed depth before sending.",
+        docUrl));
+    });
+    return result;
+  }
+
   function toGemini(schema) {
     var s = clone(schema);
     var ledger = [];
 
-    if (s.$defs || s.definitions) {
-      ledger.push(entry("!", "root",
-        "Gemini does not support `$defs`/`definitions` + `$ref`. Inline your definitions before sending.",
-        DOCS.gemini));
-    }
+    s = inlineRefs(s, ledger, DOCS.gemini);
 
     walk(s, "root", function (node, path) {
       // drop keywords outside the supported subset
@@ -281,9 +455,11 @@
         node[kw].forEach(function (sub, i) { walk(sub, path + "/" + kw + "[" + i + "]", fn); });
       }
     });
-    if (isPlainObject(node.$defs)) {
-      Object.keys(node.$defs).forEach(function (k) { walk(node.$defs[k], "$defs." + k, fn); });
-    }
+    ["$defs", "definitions"].forEach(function (bag) {
+      if (isPlainObject(node[bag])) {
+        Object.keys(node[bag]).forEach(function (k) { walk(node[bag][k], bag + "." + k, fn); });
+      }
+    });
   }
 
   var CONVERTERS = { openai: toOpenAI, anthropic: toAnthropic, gemini: toGemini };
