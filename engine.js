@@ -197,12 +197,73 @@
     return out;
   }
 
+  // OpenAI supports `$ref`, but rejects a `$ref` that carries sibling keywords:
+  //   Invalid schema ... context=('properties','x'), $ref cannot have keywords {'description'}
+  // Pydantic emits exactly that shape for any field whose type is a nested model
+  // or Enum AND which has a Field(description=...) — verified against pydantic
+  // 2.13.4. A plain `str` field with a description does NOT produce it, which is
+  // why the failure looks maddeningly input-dependent.
+  // Fix: inline the referenced definition at the use site and let the siblings
+  // win. Bare `$ref`s (no siblings) are left alone — those are legal.
+  function resolveRefSiblings(s, ledger) {
+    if (!isPlainObject(s.$defs)) return s;
+    var defs = s.$defs, fixed = 0, unresolved = [];
+
+    function visit(node, stack) {
+      if (Array.isArray(node)) return node.map(function (n) { return visit(n, stack); });
+      if (!isPlainObject(node)) return node;
+
+      var siblings = Object.keys(node).filter(function (k) { return k !== "$ref"; });
+      var m = typeof node.$ref === "string" ? /^#\/\$defs\/(.+)$/.exec(node.$ref) : null;
+
+      if (m && siblings.length && isPlainObject(defs[m[1]])) {
+        var name = m[1];
+        if (stack.indexOf(name) !== -1) {
+          if (unresolved.indexOf(name) === -1) unresolved.push(name);
+        } else {
+          var target = visit(clone(defs[name]), stack.concat([name]));
+          siblings.forEach(function (k) { target[k] = visit(node[k], stack); });
+          fixed++;
+          return target;
+        }
+      }
+
+      var out = {};
+      Object.keys(node).forEach(function (k) { out[k] = visit(node[k], stack); });
+      return out;
+    }
+
+    var result = visit(s, []);
+    // once refs are inlined the definitions they pointed at may be orphaned;
+    // dead `$defs` still count against OpenAI's 5000-property budget.
+    if (isPlainObject(result.$defs)) {
+      var kept = {};
+      Object.keys(result.$defs).forEach(function (k) {
+        var probe = clone(result); delete probe.$defs;
+        if (JSON.stringify([probe, result.$defs]).indexOf('"#/$defs/' + k + '"') !== -1) kept[k] = result.$defs[k];
+      });
+      if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
+    }
+    if (fixed) {
+      ledger.push(entry("~", "root",
+        "Inlined " + fixed + " `$ref` that carried sibling keywords — OpenAI rejects those with \"$ref cannot have keywords\". Pydantic emits this for a nested-model or Enum field that also has a `description`.",
+        DOCS.openai));
+    }
+    unresolved.forEach(function (name) {
+      ledger.push(entry("!", "root",
+        "`" + name + "` is recursive and its `$ref` carries sibling keywords, which OpenAI rejects. Move those keywords into the definition itself — a recursive `$ref` cannot be inlined.",
+        DOCS.openai));
+    });
+    return result;
+  }
+
   function toOpenAI(schema) {
     var s = clone(schema);
     var ledger = [];
 
     s = normalizeDefs(s, ledger);
     s = inlineRootRef(s, ledger);
+    s = resolveRefSiblings(s, ledger);
 
     if (s.type && s.type !== "object") {
       ledger.push(entry("!", "root",

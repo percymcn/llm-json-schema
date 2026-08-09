@@ -79,6 +79,14 @@ rules to the real schema body. zod v4's `z.toJSONSchema()` and Pydantic's
 `model_json_schema()` emit a normal object root but still carry `$schema`,
 `default`, `minLength` and `maxLength`.
 
+Pydantic has a sharper trap. OpenAI supports `$ref`, but rejects a `$ref` that
+carries **sibling keywords** — `$ref cannot have keywords {'description'}`.
+Pydantic emits exactly that for any field whose type is a nested model or `Enum`
+*and* which has a `Field(description=...)`. A plain `str` field with a
+description does not, so the failure looks maddeningly input-dependent: it
+appears and disappears depending on which of your fields happen to be nested
+types. This tool inlines those refs and keeps the sibling.
+
 This tool applies each provider's rules for you and shows a **change ledger** — every transform, with the exact official-doc rule it enforces cited inline.
 
 ## Features
@@ -144,7 +152,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 108 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 120 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

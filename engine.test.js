@@ -176,5 +176,70 @@ var ZOD_V3 = {
   }));
 })();
 
+// --- REAL generator output: Pydantic 2.13.4 ---------------------------------
+// Verbatim `model_json_schema()`. A field whose type is a nested model or Enum
+// AND which carries a Field(description=...) emits `$ref` WITH a sibling, which
+// OpenAI rejects: "$ref cannot have keywords {'description'}". A plain str field
+// with a description does not — which is why the failure looks input-dependent.
+// Seen in the wild: destiny-evidence/data-extraction-evaluation-toolkit#338.
+var PYDANTIC = {
+  $defs: {
+    Grade: { "enum": ["low", "high"], title: "Grade", type: "string" },
+    Nested: { properties: { v: { title: "V", type: "string" } }, required: ["v"], title: "Nested", type: "object" }
+  },
+  properties: {
+    attribute_2: { $ref: "#/$defs/Nested", description: "the annotation for attribute 2" },
+    grade: { $ref: "#/$defs/Grade", description: "a graded enum with a description" },
+    plain: { description: "a plain string", title: "Plain", type: "string" }
+  },
+  required: ["attribute_2", "grade", "plain"],
+  title: "Resp",
+  type: "object"
+};
+
+(function () {
+  var r = E.toOpenAI(PYDANTIC);
+  var s = r.schema;
+  ok("pydantic $ref+description is inlined", s.properties.attribute_2.$ref === undefined &&
+    s.properties.attribute_2.type === "object");
+  ok("the sibling description survives inlining", s.properties.attribute_2.description === "the annotation for attribute 2");
+  ok("enum $ref+description is inlined too", s.properties.grade.$ref === undefined &&
+    Array.isArray(s.properties.grade.enum));
+  ok("orphaned $defs are pruned", s.$defs === undefined);
+  ok("no $ref-with-sibling survives anywhere", JSON.stringify(s).indexOf('"$ref"') === -1);
+  ok("ledger names the rule", has(r.ledger, "$ref cannot have keywords"));
+})();
+
+(function () {
+  // A bare $ref (no siblings) is legal for OpenAI — leave it alone.
+  var r = E.toOpenAI({
+    type: "object",
+    $defs: { A: { type: "object", properties: { x: { type: "string" } }, required: ["x"] } },
+    properties: { a: { $ref: "#/$defs/A" } },
+    required: ["a"]
+  });
+  ok("bare $ref is preserved (OpenAI supports it)", r.schema.properties.a.$ref === "#/$defs/A");
+  ok("its definition is kept", !!r.schema.$defs && !!r.schema.$defs.A);
+})();
+
+(function () {
+  // Recursive + sibling cannot be inlined; must be reported, not silently wrong.
+  var r = E.toOpenAI({
+    type: "object",
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node", description: "d" } } } },
+    properties: { root: { $ref: "#/$defs/Node" } }
+  });
+  ok("recursive $ref-with-sibling is reported as a blocker", r.ledger.some(function (l) {
+    return l.op === "!" && l.msg.indexOf("recursive") !== -1;
+  }));
+})();
+
+["openai", "anthropic", "gemini"].forEach(function (provider) {
+  var once = E.convert(PYDANTIC, provider, { mode: "schema" });
+  var twice = E.convert(once.schema, provider, { mode: "schema" });
+  ok(provider + " is idempotent on pydantic output",
+    twice.ledger.filter(function (l) { return l.op !== "="; }).length === 0);
+});
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
