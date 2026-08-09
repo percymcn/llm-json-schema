@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1 — ESM + TypeScript types added** (Cycle #310). Unit-tested: 21 engine + 31 CLI + 31 ESM/library assertions = 83 (`npm test`). Provider rules verified against official docs on 2026-07-30.
+> Status: **v0.1**. Unit-tested: 243 engine + 97 CLI + 31 ESM/library assertions = **371** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -34,6 +34,31 @@ The fixed schema goes to **stdout**; the explanation ledger goes to **stderr**, 
 The developers who hit these errors mostly don't have a schema to paste into a
 browser — it's generated at runtime by Zod or Pydantic inside an AI SDK. A CLI
 runs where the schema actually is: in your repo, in your test suite, in CI.
+
+**If you write Python, nothing else checks this for you.** OpenAI's two SDKs do not
+agree about what they will send:
+
+| | `openai@7.4.0` (JS/TS) | `openai==2.53.0` (Python) |
+|---|---|---|
+| Builds the schema | `toStrictJsonSchema()` | `_ensure_strict_json_schema()` |
+| Adds `additionalProperties: false`, widens `required` | yes | yes |
+| **Rejects a schema strict mode can't represent** | **yes — throws locally** | **no — sends it** |
+| Sets `strict: true` | yes | yes, hardcoded at all three builders |
+
+Measured over a 33-shape battery, the Python transformer accepts **17 shapes the
+JavaScript one throws on** — `uniqueItems`, `prefixItems`, tuple-form `items`,
+`not`, `if`/`then`, `patternProperties`, `dependentRequired`, nested `$id`, an
+array with no `items`, and more. It doesn't repair them; it passes them through
+verbatim and stamps `strict: true` on the request. The failure still happens, just
+later and further away — as a runtime 400 instead of a build-time exception.
+
+That is not a corner case. Seven ordinary Pydantic models, run through the Python
+SDK's own public path, produced **three payloads the JavaScript SDK refuses to
+send** — a `Tuple[int, int, int, int]`, a `List[int]` with `uniqueItems`, and a
+model combining a tuple with a literal union. All three are caught by
+`--check --to openai`, and all three are accepted by the vendor's validator after
+`--to openai`. Those exact payloads are pinned as regression fixtures in
+`engine.test.js`, so this claim is a test, not a sentence.
 
 ```
 $ echo '{"type":"object","properties":{"args":{"type":"object"}}}' | llm-schema --to openai

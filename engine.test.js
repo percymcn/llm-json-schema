@@ -1532,5 +1532,65 @@ var LC_PY_ROOT_REF = {
   });
 })();
 
+// --- OpenAI's PYTHON SDK does not validate what its JS SDK refuses to send ---
+// openai@7.4.0 (JS) runs every strict schema through toStrictJsonSchema(), which
+// THROWS on an unrepresentable keyword before the request leaves the process.
+// openai==2.53.0 (Python) runs _ensure_strict_json_schema(), which only ADDS
+// `additionalProperties: false` and widens `required` -- it validates nothing --
+// and then hardcodes `strict: True` at all three of its builders
+// (lib/_parsing/_completions.py:286, lib/_parsing/_responses.py:47, lib/_tools.py:54).
+// So the same model that fails at build time in TypeScript ships to production in
+// Python and fails as a runtime 400. These fixtures are the VERBATIM output of
+// openai.lib._pydantic.to_strict_json_schema() for ordinary Pydantic models.
+var PY_SDK_BBOX = {"properties":{"bbox":{"maxItems":4,"minItems":4,"prefixItems":[{"type":"integer"},{"type":"integer"},{"type":"integer"},{"type":"integer"}],"title":"Bbox","type":"array"}},"required":["bbox"],"title":"BBox","type":"object","additionalProperties":false};
+var PY_SDK_UNIQUE = {"properties":{"ids":{"items":{"type":"integer"},"title":"Ids","type":"array","uniqueItems":true}},"required":["ids"],"title":"UniqueList","type":"object","additionalProperties":false};
+var PY_SDK_SHAPE = {"properties":{"kind":{"anyOf":[{"const":"circle","type":"string"},{"const":"square","type":"string"}],"title":"Kind"},"dims":{"maxItems":2,"minItems":2,"prefixItems":[{"type":"number"},{"type":"number"}],"title":"Dims","type":"array"}},"required":["kind","dims"],"title":"Shape","type":"object","additionalProperties":false};
+// Control: the Python SDK sends this one and the JS SDK accepts it byte-identical.
+// If our gate ever starts editing it, we have become stricter than the vendor --
+// the false-CI-failure class of #312/#314/#317/#322.
+var PY_SDK_OK = {"properties":{"title":{"maxLength":80,"minLength":2,"pattern":"^[A-Z]","title":"Title","type":"string"},"count":{"maximum":10,"minimum":0,"title":"Count","type":"integer"}},"required":["title","count"],"title":"Constrained","type":"object","additionalProperties":false};
+
+(function () {
+  var clone = function (o) { return JSON.parse(JSON.stringify(o)); };
+
+  var bbox = E.convert(clone(PY_SDK_BBOX), "openai");
+  var bboxOut = bbox.schema.properties.bbox;
+  ok("python-sdk tuple payload: prefixItems is removed",
+    bboxOut.prefixItems === undefined);
+  ok("python-sdk tuple payload: collapses losslessly to items + fixed length",
+    !!bboxOut.items && bboxOut.items.type === "integer" &&
+    bboxOut.minItems === 4 && bboxOut.maxItems === 4);
+
+  var uniq = E.convert(clone(PY_SDK_UNIQUE), "openai");
+  ok("python-sdk uniqueItems payload: uniqueItems is removed",
+    uniq.schema.properties.ids.uniqueItems === undefined);
+  ok("python-sdk uniqueItems payload: the array itself survives",
+    uniq.schema.properties.ids.items.type === "integer");
+
+  var shape = E.convert(clone(PY_SDK_SHAPE), "openai");
+  ok("python-sdk mixed payload: the tuple field is repaired",
+    shape.schema.properties.dims.prefixItems === undefined &&
+    shape.schema.properties.dims.items.type === "number");
+  ok("python-sdk mixed payload: the const-union field is left alone",
+    Array.isArray(shape.schema.properties.kind.anyOf) &&
+    shape.schema.properties.kind.anyOf.length === 2 &&
+    shape.schema.properties.kind.anyOf[0].const === "circle");
+
+  [["bbox", PY_SDK_BBOX], ["unique", PY_SDK_UNIQUE], ["shape", PY_SDK_SHAPE]].forEach(function (pair) {
+    var r = E.convert(clone(pair[1]), "openai");
+    ok("python-sdk " + pair[0] + " payload is reported as needing a fix",
+      blockers(r).length > 0 || JSON.stringify(r.schema) !== JSON.stringify(pair[1]));
+    var twice = E.convert(clone(r.schema), "openai");
+    ok("openai is idempotent on the python-sdk " + pair[0] + " payload",
+      JSON.stringify(r.schema) === JSON.stringify(twice.schema));
+  });
+
+  var control = E.convert(clone(PY_SDK_OK), "openai");
+  ok("python-sdk payload the vendor accepts is NOT edited by us",
+    JSON.stringify(control.schema) === JSON.stringify(PY_SDK_OK));
+  ok("python-sdk payload the vendor accepts raises no blocker",
+    blockers(control).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
