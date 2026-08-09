@@ -1,0 +1,3 @@
+
+# packed tarballs from `npm pack` consumer verification (#310)
+*.tgz
