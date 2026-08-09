@@ -216,8 +216,16 @@ var CAROUSEL_SCHEMA = JSON.stringify({
     $ref: "#/definitions/S",
     definitions: { S: { type: "object", properties: { name: { type: "string", minLength: 3 } }, required: ["name"] } }
   });
+  // Raw zod output does NOT pass: `definitions` is the draft-07 spelling and
+  // the accepted list only has `$defs`, so it needs the rename + repoint.
   var z = run(["--to", "gemini", "--check"], ZOD);
-  ok("--check passes on zod output for gemini", z.status === 0, z.stderr);
+  ok("--check fails on raw zod output for gemini (definitions -> $defs)", z.status === 1, z.stderr);
+  ok("--check keeps the $schema routing key", !/Removed .\$schema/.test(z.stderr), z.stderr);
+
+  // ...and the converted output then passes, i.e. the fix is complete.
+  var fixed = run(["--to", "gemini"], ZOD);
+  var again = run(["--to", "gemini", "--check"], fixed.stdout);
+  ok("--check passes on our own gemini output (idempotent)", again.status === 0, again.stderr);
 
   // ...but a real violation still fails: prefixItems has no home in the proto.
   var bad = run(["--to", "gemini", "--check"], JSON.stringify({

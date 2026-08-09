@@ -207,8 +207,52 @@ var ZOD_V3 = {
   ok("gemini explains the responseJsonSchema routing", keep.ledger.some(function (l) {
     return l.msg.indexOf("responseJsonSchema") !== -1;
   }));
-  ok("gemini makes no destructive change on the $schema path",
-    keep.ledger.every(function (l) { return l.op === "="; }));
+
+  // $ref sub-schemas may carry no non-`$` siblings on this path.
+  var sib = E.toGemini({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: { u: { $ref: "#/$defs/U", description: "the user" } },
+    $defs: { U: { type: "object", properties: { n: { type: "string" } } } }
+  });
+  ok("gemini drops non-$ siblings of a $ref on the $schema path",
+    !("description" in sib.schema.properties.u) && sib.schema.properties.u.$ref === "#/$defs/U");
+
+  // Cycles are allowed, but only inside NON-required properties.
+  var cyc = E.toGemini({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: { root: { $ref: "#/$defs/Node" } },
+    required: ["root"],
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } }
+  });
+  ok("gemini flags a required cyclic property", cyc.ledger.some(function (l) {
+    return l.op === "!" && l.msg.indexOf("cyclic") !== -1;
+  }));
+  var cycOk = E.toGemini({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: { root: { $ref: "#/$defs/Node" } },
+    $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } }
+  });
+  ok("gemini allows a cycle in a non-required property",
+    !cycOk.ledger.some(function (l) { return l.op === "!"; }));
+  // "Sent verbatim" is the TRANSPORT, not acceptance: the backend's accepted
+  // property list for `responseJsonSchema` (enumerated on the Python SDK's
+  // `response_json_schema` field) has no `minLength`/`maxLength`/`default`.
+  ok("gemini strips minLength on the $schema path", !("minLength" in keep.schema.$defs.Ticket.properties.title));
+  ok("gemini strips default on the $schema path", !("default" in keep.schema.$defs.Ticket.properties.priority));
+  // ...but keeps what that path DOES accept, incl. additionalProperties, which
+  // the narrow proto path drops. The two subsets are complementary.
+  ok("gemini keeps additionalProperties on the $schema path",
+    keep.schema.$defs.Ticket.additionalProperties === false);
+  ok("gemini keeps minimum/maximum on the $schema path",
+    keep.schema.$defs.Ticket.properties.score.minimum === 0);
+  // `definitions` is not in the accepted list — but deleting it would orphan
+  // every $ref, so it must be RENAMED to $defs and the refs repointed.
+  ok("gemini renames definitions -> $defs rather than deleting the bag",
+    !!keep.schema.$defs && !keep.schema.definitions &&
+    keep.schema.$ref === "#/$defs/Ticket");
 
   // Same generator output with `$schema` removed = the narrow proto path, where
   // #311's inlining fix must still hold (that bug emptied the whole schema).

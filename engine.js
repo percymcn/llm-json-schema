@@ -186,7 +186,7 @@
 
   // `definitions` is draft-07 (what zod-to-json-schema emits); OpenAI's doc and
   // examples use `$defs`. Rename it and repoint every `$ref` that used it.
-  function normalizeDefs(s, ledger) {
+  function normalizeDefs(s, ledger, docUrl, why) {
     if (!isPlainObject(s.definitions)) return s;
     if (isPlainObject(s.$defs)) {
       // both present — merge `definitions` in without clobbering `$defs`
@@ -199,8 +199,8 @@
     delete s.definitions;
     deepRepointRefs(s);
     ledger.push(entry("~", "root",
-      "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref` — OpenAI's schema dialect uses `$defs`. (zod-to-json-schema emits `definitions`.)",
-      DOCS.openai));
+      why || "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref` — OpenAI's schema dialect uses `$defs`. (zod-to-json-schema emits `definitions`.)",
+      docUrl || DOCS.openai));
     return s;
   }
 
@@ -531,6 +531,30 @@
   };
   var GEMINI_STRING_FORMATS = { "date-time": 1, "date": 1, "time": 1, "enum": 1 };
 
+  // The OTHER path. `google-genai` (Python) 2.17.0 documents the backend's
+  // accepted set for `response_json_schema` verbatim on the field itself:
+  //   "While the full JSON Schema may be sent, not all features are supported.
+  //    Specifically, only the following properties are supported: $id, $defs,
+  //    $ref, $anchor, type, format, title, description, enum (for strings and
+  //    numbers), items, prefixItems, minItems, maxItems, minimum, maximum,
+  //    anyOf, oneOf (interpreted the same as anyOf), properties,
+  //    additionalProperties, required. The non-standard propertyOrdering
+  //    property may also be set."
+  //
+  // So "the JS SDK sends it verbatim" describes the TRANSPORT, not acceptance —
+  // the two paths are partly COMPLEMENTARY, and neither is a superset:
+  //   only responseSchema     : pattern, minLength, maxLength, minProperties,
+  //                             maxProperties, default, example, nullable
+  //   only responseJsonSchema : $ref, $defs, $anchor, $id, prefixItems,
+  //                             additionalProperties, oneOf
+  var GEMINI_JSON_ALLOWED = {
+    "$schema": 1, "$id": 1, "$defs": 1, "$ref": 1, "$anchor": 1,
+    "type": 1, "format": 1, "title": 1, "description": 1, "enum": 1,
+    "items": 1, "prefixItems": 1, "minItems": 1, "maxItems": 1,
+    "minimum": 1, "maximum": 1, "anyOf": 1, "oneOf": 1, "properties": 1,
+    "additionalProperties": 1, "required": 1, "propertyOrdering": 1
+  };
+
   // Gemini has no `$ref`, so the only correct transform is to inline the
   // definitions — not to warn and then strip the `$defs` bag, which is what
   // this used to do and which turned `{ $ref, definitions }` (the exact shape
@@ -587,6 +611,61 @@
     return result;
   }
 
+  // Paths of `required` properties whose type is cyclic. Gemini's JSON-Schema
+  // path unrolls cycles only inside NON-required properties, so a recursive
+  // required field is a human fix, not something we can rewrite.
+  function cyclicRequired(s) {
+    var defs = {};
+    [s.$defs, s.definitions].forEach(function (bag) {
+      if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { defs[k] = bag[k]; });
+    });
+    if (!Object.keys(defs).length) return [];
+    var out = [];
+
+    function refName(node) {
+      var m = isPlainObject(node) && typeof node.$ref === "string"
+        ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref) : null;
+      return m ? m[1] : null;
+    }
+
+    function reachesCycle(node, stack) {
+      if (Array.isArray(node)) {
+        return node.some(function (n) { return reachesCycle(n, stack); });
+      }
+      if (!isPlainObject(node)) return false;
+      var name = refName(node);
+      if (name) {
+        if (stack.indexOf(name) !== -1) return true;
+        if (!defs[name]) return false;
+        return reachesCycle(defs[name], stack.concat([name]));
+      }
+      return Object.keys(node).some(function (k) { return reachesCycle(node[k], stack); });
+    }
+
+    function scan(node, path, seen) {
+      if (!isPlainObject(node)) return;
+      if (isPlainObject(node.properties) && Array.isArray(node.required)) {
+        node.required.forEach(function (k) {
+          var child = node.properties[k];
+          if (child && reachesCycle(child, [])) out.push(path + "." + k);
+        });
+      }
+      if (isPlainObject(node.properties)) {
+        Object.keys(node.properties).forEach(function (k) {
+          scan(node.properties[k], path + "." + k, seen);
+        });
+      }
+      if (isPlainObject(node.items)) scan(node.items, path + "[]", seen);
+      var n = refName(node);
+      if (n && defs[n] && seen.indexOf(n) === -1) scan(defs[n], path, seen.concat([n]));
+    }
+
+    scan(s, "root", []);
+    Object.keys(defs).forEach(function (k) { scan(defs[k], "$defs." + k, [k]); });
+    // de-dupe
+    return out.filter(function (v, i) { return out.indexOf(v) === i; });
+  }
+
   function toGemini(schema) {
     var s = clone(schema);
     var ledger = [];
@@ -599,21 +678,63 @@
     // that path accepts. This is what the previous doc-derived version did to
     // every `zod-to-json-schema` user.
     if (typeof s.$schema === "string") {
+      // Keep `$schema`: it is the routing switch. Stripping it would silently
+      // downgrade the caller to the narrow proto path. But "sent verbatim" is
+      // the TRANSPORT, not acceptance — the backend still has its own allowlist.
       ledger.push(entry("=", "root",
-        "Left unchanged — and that is the fix. This schema has a top-level `$schema`, " +
-        "so @google/genai routes it to the `responseJsonSchema` request field and sends it " +
-        "verbatim; `$ref`, `$defs` and recursion all survive. Do NOT strip `$schema` to fit " +
-        "the narrow `responseSchema` subset — removing it silently downgrades you to a path " +
-        "that drops `pattern`, `minLength` and the rest.",
+        "Kept `$schema` — it is the routing switch. With it, @google/genai moves this to the " +
+        "`responseJsonSchema` request field (in Python, set `response_json_schema` yourself). " +
+        "That path keeps `$ref`/`$defs`, but it does NOT accept `pattern`, `minLength`, " +
+        "`maxLength`, `min/maxProperties`, `default` or `example` — those work only on the " +
+        "narrow `responseSchema` path. The two subsets are complementary; neither is a superset.",
         DOCS.gemini));
-      // Deliberately op "=", not "!": nothing needs fixing, so `--check` must
-      // exit 0. A "!" here would fail CI for every zod-to-json-schema user —
-      // the same false-failure class as the OpenAI allowlist bug.
-      ledger.push(entry("=", "root",
-        "Caveat: this holds when you call through the SDK (or set `responseJsonSchema` yourself). " +
-        "If you POST to `responseSchema` directly over REST, you are on the narrow proto path — " +
-        "delete `$schema` and re-run to get the subsetted form.",
-        DOCS.gemini));
+
+      // `definitions` is the draft-07 spelling zod-to-json-schema emits, and it
+      // is NOT in the accepted list — only `$defs` is. Renaming it (and
+      // repointing every `$ref`) is the fix; deleting it as an unknown keyword
+      // would orphan every reference and leave a schema of nothing but `$ref`.
+      s = normalizeDefs(s, ledger, DOCS.gemini,
+        "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref` — " +
+        "`responseJsonSchema` accepts `$defs`, not `definitions`. (zod-to-json-schema emits `definitions`.)");
+
+      walk(s, "root", function (node, path) {
+        Object.keys(node).forEach(function (k) {
+          if (!GEMINI_JSON_ALLOWED[k]) {
+            ledger.push(entry("x", path,
+              "Removed `" + k + "` — not in the accepted property list for " +
+              "`responseJsonSchema` (enumerated on the `response_json_schema` field of " +
+              "`google-genai`). If you need it enforced, drop the top-level `$schema` to " +
+              "take the `responseSchema` path instead, or restate it in `description`.",
+              DOCS.gemini));
+            delete node[k];
+          }
+        });
+
+        // "If $ref is set on a sub-schema, no other properties, except for
+        //  than those starting as a `$`, may be set."
+        if (typeof node.$ref === "string") {
+          Object.keys(node).forEach(function (k) {
+            if (k.charAt(0) !== "$") {
+              ledger.push(entry("x", path,
+                "Removed `" + k + "` alongside `$ref` — on the `responseJsonSchema` path a " +
+                "`$ref` sub-schema may carry no properties except ones starting with `$`. " +
+                "Inline the definition if you need `" + k + "` on it.",
+                DOCS.gemini));
+              delete node[k];
+            }
+          });
+        }
+      });
+
+      // Cyclic refs are allowed here, but only in NON-required properties.
+      var cyc = cyclicRequired(s);
+      cyc.forEach(function (p) {
+        ledger.push(entry("!", p,
+          "This property is `required` and its type is cyclic. Gemini unrolls cyclic " +
+          "references only to a limited degree and only within non-required properties " +
+          "(nullable is not sufficient) — make it optional or flatten it to a fixed depth.",
+          DOCS.gemini));
+      });
       return { schema: s, ledger: ledger };
     }
 

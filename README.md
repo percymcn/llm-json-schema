@@ -68,9 +68,17 @@ API contract — which is why the ledger cites the rule for every change.
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
 - **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* The error is raised for keywords whose validation semantics strict mode cannot compile (`uniqueItems`, `patternProperties`, `contains`, `allOf`, `not`, `if`/`then`/`else`, …). Annotations and soft constraints — `description`, `title`, `default`, `examples`, `minLength`/`maxLength`, `$schema`, `$id` — are **accepted and passed through untouched**, so this tool leaves them alone.
 - **Anthropic tool `input_schema`:** standard JSON Schema, object root, light constraints; `strict: true` goes on the tool, not the schema.
-- **Gemini — two paths, and a top-level `$schema` is the switch between them.** `@google/genai`'s `maybeMoveToResponseJsonSchema()` checks for a top-level `$schema`; if it's there the schema is moved to the **`responseJsonSchema`** request field and sent **verbatim** (full JSON Schema — `$ref`, `$defs` and recursion all survive). With no `$schema` it goes to **`responseSchema`**, the narrow `Schema` proto: `$ref` must be inlined, `additionalProperties` and `prefixItems` are dropped, string `format` is limited to `date-time`/`date`/`time`, and `propertyOrdering` is worth adding.
+- **Gemini has TWO schema paths, and a top-level `$schema` is the switch between them.** `@google/genai`'s `maybeMoveToResponseJsonSchema()` checks for a top-level `$schema`; if it's there, the schema goes to the **`responseJsonSchema`** request field, otherwise to **`responseSchema`**, the narrow OpenAPI-style `Schema` proto. This matters because **`zod-to-json-schema` always emits `$schema` and Pydantic's `model_json_schema()` never does** — the two generators land on opposite paths by default.
 
-  This matters because **`zod-to-json-schema` always emits `$schema` and Pydantic's `model_json_schema()` never does** — the two generators land on opposite paths by default. Note that `pattern`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, `default` and `example` are all fields of the SDK's own `Schema` type, so they are kept on **both** paths; stripping them (as the Gemini doc's narrower "supported properties" list implies) silently throws away your validation constraints.
+  The two accepted subsets are **complementary — neither is a superset**:
+
+  | | `responseSchema` (proto) | `responseJsonSchema` |
+  |---|---|---|
+  | `pattern`, `minLength`, `maxLength`, `min/maxProperties`, `default`, `example`, `nullable` | ✅ | ❌ |
+  | `$ref`, `$defs`, `$anchor`, `$id`, `prefixItems`, `additionalProperties`, `oneOf` | ❌ | ✅ |
+  | `type`, `format`, `title`, `description`, `enum`, `items`, `min/maxItems`, `minimum`, `maximum`, `anyOf`, `properties`, `required`, `propertyOrdering` | ✅ | ✅ |
+
+  So the tool converts for whichever path your schema is on, and tells you when a keyword would only survive on the other one. On the JSON-Schema path it also enforces two rules the API states but the structured-output doc doesn't: a `$ref` sub-schema may carry no non-`$` siblings, and cyclic references are only allowed inside **non-required** properties.
 
 ### What generators actually emit
 `zod-to-json-schema` wraps your schema as `{ "$ref": "#/definitions/X", "definitions": { … } }`.
@@ -160,7 +168,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
 - OpenAI — https://developers.openai.com/api/docs/guides/structured-outputs
 - Anthropic — https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview
-- Gemini — https://ai.google.dev/gemini-api/docs/structured-output plus `@google/genai@2.16.0` (the `Schema` type, `processJsonSchema()` and `maybeMoveToResponseJsonSchema()`), verified 2026-08-09 by capturing the request body the SDK actually builds
+- Gemini — https://ai.google.dev/gemini-api/docs/structured-output plus the vendor SDKs, verified 2026-08-09: `@google/genai@2.16.0` (the `Schema` type, `processJsonSchema()`, `maybeMoveToResponseJsonSchema()`) by capturing the request body the SDK actually builds, and `google-genai@2.17.0` (Python), whose `response_json_schema` field documents the accepted property list for the JSON-Schema path verbatim
 
 Where a vendor ships a client SDK, the SDK outranks the doc: docs describe the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 
