@@ -56,7 +56,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 | Flag | Meaning |
 |---|---|
-| `--to <provider>` | `openai` \| `openai-realtime` \| `anthropic` \| `gemini` \| `gemini-json` (required) |
+| `--to <provider>` | `openai` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `gemini` \| `gemini-json` (required) |
 | `--check` | Emit no schema; exit `1` if it isn't already compliant |
 | `--json` | Emit `{ok, compliant, schema, ledger, docUrl}` for scripting |
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
@@ -72,9 +72,11 @@ Each provider accepts a different schema dialect, so a schema that works with on
   - **`oneOf`** is rewritten to `anyOf` **only when the branches are provably mutually exclusive**. `oneOf` means exactly one branch matches and `anyOf` means at least one, so rewriting an overlapping union silently widens it. `openai@7.4.0`'s `helpers/standard-schema.js` proves exclusivity first and otherwise throws: *"OpenAI strict schemas do not support `oneOf`; use `anyOf` or add a discriminator with distinct literal values."* We follow that rule and flag the unprovable case instead of guessing. (Note the vendor's own two helper families disagree: the five `helpers/zod.js` builders run `toStrictJsonSchema()` alone, which passes a non-exclusive `oneOf` straight through to the API.)
   - **`allOf`** is **not** flatly unsupported. A single-member `allOf` is flattened (annotations kept) and an `allOf` of *open* object schemas is merged; only closed-object members (*"cannot be merged without changing Draft 7 validation"*) and multi-member non-object `allOf` throw. `{"allOf": [{"$ref": …}], "description": …}` — the standard Pydantic output for a referenced model with a field description — is therefore perfectly valid, and stripping it would delete the whole subschema.
   - **`$id`** is legal at the **root** and fatal **anywhere else** (*"Nested $id … establishes a separate JSON Schema resource scope"*). Likewise `"type": "array"` is legal but fatal without `items`.
-- **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`):
-  - **`tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. `strict: true` goes on the **tool**, not the schema.
-  - **`output_format: { type: "json_schema" }`** — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+- **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`). Because nothing in the schema tells you which one you are on, each is its own target:
+  - **`--to anthropic` → `tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. Tuples, `maxLength`, `format`, a draft-07 `definitions` bag and a non-exclusive `oneOf` all survive untouched, so this target reports them as fine rather than "fixing" them. `strict: true` goes on the **tool**, not the schema — the SDK documents it as *"guarantees schema validation on tool names and inputs"*; without it the schema is guidance the model can violate.
+  - **`--to anthropic-json` → `output_format: { type: "json_schema" }`** — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+
+  Picking the wrong one is not cosmetic. `instructor`'s default Anthropic mode is `ANTHROPIC_TOOLS`, so an ordinary Pydantic model with a `tuple[int, int, int, int]` field goes on the wire **byte-identical** — gating it against the `output_format` rules is a CI failure on a payload Anthropic accepts exactly as written.
 
   That third policy is the one to internalise. OpenAI **errors** on an unsupported keyword; Gemini's `responseJsonSchema` **ignores** it; Anthropic **demotes it to prose**:
 
@@ -91,7 +93,7 @@ Each provider accepts a different schema dialect, so a schema that works with on
 
   Unlike OpenAI, Anthropic does **not** require every key in `required` — the transformer passes your list through as given, so this tool does not force it.
 
-  This tool keeps every demoted keyword (it is still enforced on the tools path) and reports it as an advisory note, so `--check` stays green on a schema that is legal but only partly enforced.
+  On `--to anthropic-json` this tool keeps every demoted keyword (it is still enforced on the tools path) and reports it as an advisory note, so `--check` stays green on a schema that is legal but only partly enforced. On `--to anthropic` those notes do not appear at all, because nothing is demoted — the two targets deliberately disagree about the same file.
 - **Gemini has TWO schema paths, and which one you land on is a property of YOUR CLIENT, not of your schema.** The two request fields are **`responseJsonSchema`** (full JSON Schema) and **`responseSchema`** (the narrow OpenAPI-style `Schema` proto). Only one client picks for you:
 
   | client | routes to `responseJsonSchema`? |

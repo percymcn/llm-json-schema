@@ -5,7 +5,7 @@
  * tool use, or Gemini responseSchema.
  */
 
-export type Provider = "openai" | "anthropic" | "gemini" | "gemini-json" | "openai-realtime";
+export type Provider = "openai" | "anthropic" | "anthropic-json" | "gemini" | "gemini-json" | "openai-realtime";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */
 export type JSONSchema = Record<string, any>;
@@ -76,10 +76,25 @@ export interface TransformResult {
 
 /** Transform a schema for OpenAI strict structured outputs. */
 export function toOpenAI(schema: JSONSchema): TransformResult;
-/** Transform a schema for Anthropic tool use `input_schema`. */
-export function toAnthropic(schema: JSONSchema): TransformResult;
-/** Transform a schema for Gemini `responseSchema`. */
-export function toGemini(schema: JSONSchema): TransformResult;
+/**
+ * Transform a schema for Anthropic.
+ *
+ * Anthropic has two dialects and the switch is which request field you use, not
+ * anything in the schema — so the path is a parameter, never inferred.
+ *
+ * @param outputFormatPath `false`/omitted targets `tools[].input_schema`, where
+ * Anthropic applies no transform and the schema is sent verbatim. `true` targets
+ * `output_format: {type: "json_schema"}`, which rebuilds the schema and demotes
+ * unrecognised keywords to `description` prose.
+ */
+export function toAnthropic(schema: JSONSchema, outputFormatPath?: boolean): TransformResult;
+/**
+ * Transform a schema for Gemini.
+ *
+ * @param jsonPath `false`/omitted targets the narrow `responseSchema` proto;
+ * `true` targets the permissive `responseJsonSchema` field.
+ */
+export function toGemini(schema: JSONSchema, jsonPath?: boolean): TransformResult;
 
 /** Infer a JSON Schema from a sample JSON value. */
 export function inferSchema(value: unknown): JSONSchema;

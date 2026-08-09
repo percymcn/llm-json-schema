@@ -367,5 +367,130 @@ var CAROUSEL_SCHEMA = JSON.stringify({
 })();
 
 
+// --- #321 Instructor: the same file must pass one Anthropic target and fail
+// the other. Captured verbatim from instructor==1.15.4 (Mode.ANTHROPIC_TOOLS,
+// the default) via an httpx intercept on an ordinary Pydantic model.
+var INSTRUCTOR_ANTHROPIC = JSON.stringify({
+  "$defs": {
+    "Priority": {
+      "enum": [
+        "low",
+        "high"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "Tag": {
+      "properties": {
+        "name": {
+          "maxLength": 20,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Score",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "score"
+      ],
+      "title": "Tag",
+      "type": "object"
+    }
+  },
+  "description": "A support ticket.",
+  "properties": {
+    "title": {
+      "description": "Short title",
+      "maxLength": 80,
+      "title": "Title",
+      "type": "string"
+    },
+    "priority": {
+      "$ref": "#/$defs/Priority"
+    },
+    "tags": {
+      "items": {
+        "$ref": "#/$defs/Tag"
+      },
+      "title": "Tags",
+      "type": "array"
+    },
+    "bbox": {
+      "maxItems": 4,
+      "minItems": 4,
+      "prefixItems": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        }
+      ],
+      "title": "Bbox",
+      "type": "array"
+    },
+    "assignee": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Assignee"
+    },
+    "retries": {
+      "default": 0,
+      "title": "Retries",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "title",
+    "priority",
+    "tags",
+    "bbox"
+  ],
+  "title": "Ticket",
+  "type": "object"
+});
+
+(function () {
+  var tools = run(["--to", "anthropic", "--check"], INSTRUCTOR_ANTHROPIC);
+  ok("--check --to anthropic exits 0 on the real Instructor payload (tools path is verbatim)",
+    tools.status === 0, tools.stderr);
+  ok("the tools path does not propose a tuple collapse",
+    !/prefixItems/.test(tools.stderr) || /verbatim|byte-identical/.test(tools.stderr), tools.stderr);
+
+  var json = run(["--to", "anthropic-json", "--check"], INSTRUCTOR_ANTHROPIC);
+  ok("--check --to anthropic-json exits 1 on the same payload", json.status === 1, json.stderr);
+  ok("anthropic-json explains the demote-to-prose loss",
+    /NOT enforced on the .output_format/.test(json.stderr), json.stderr);
+
+  var out = run(["--to", "anthropic"], INSTRUCTOR_ANTHROPIC);
+  ok("--to anthropic emits the schema unchanged",
+    out.status === 0 &&
+    JSON.stringify(JSON.parse(out.stdout)) === JSON.stringify(JSON.parse(INSTRUCTOR_ANTHROPIC)),
+    out.stderr);
+
+  var bad = run(["--to", "anthropic-jsonn", "--check"], INSTRUCTOR_ANTHROPIC);
+  ok("an unknown provider still lists anthropic-json as valid",
+    bad.status === 2 && /anthropic-json/.test(bad.stderr), bad.stderr);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

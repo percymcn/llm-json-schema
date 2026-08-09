@@ -100,6 +100,10 @@ function has(ledger, substr) {
   ok("anthropic mentions strict:true", has(r.ledger, "strict"));
 })();
 
+// The output_format path is now an explicit target (`--to anthropic-json`);
+// `toAnthropic(s)` alone means tools[].input_schema, where NO transform runs.
+function toAnthropicJSON(s) { return E.toAnthropic(s, true); }
+
 // --- Anthropic: the two paths, pinned to @anthropic-ai/sdk@0.116.0 ----------
 // Every assertion below was measured by running the input through the vendor's
 // own `lib/transform-json-schema.js`, not read off a doc page.
@@ -109,7 +113,7 @@ function has(ledger, substr) {
 // `$ref`, so the SDK reduces it to exactly {"$ref":"#/definitions/Ticket"} —
 // dangling pointer, whole schema gone, and nothing throws.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     $ref: "#/definitions/Ticket",
     definitions: {
       Ticket: {
@@ -129,7 +133,7 @@ function has(ledger, substr) {
 // The transformer throws on any node with no `type`. A bare enum is the most
 // common way to hit it, and the type is recoverable from the members.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     type: "object",
     properties: { lvl: { enum: ["low", "high"] }, n: { enum: [1, 2] } }
   });
@@ -140,7 +144,7 @@ function has(ledger, substr) {
 
 // A typeless node with nothing to infer from is a genuine blocker.
 (function () {
-  var r = E.toAnthropic({ type: "object", properties: { x: { description: "mystery" } } });
+  var r = toAnthropicJSON({ type: "object", properties: { x: { description: "mystery" } } });
   ok("anthropic reports an un-inferable typeless node as a blocker",
     r.ledger.some(function (l) { return l.op === "!"; }));
 })();
@@ -148,7 +152,7 @@ function has(ledger, substr) {
 // Demotion, the finding this whole path exists for: `enum` on a typed node is
 // NOT stripped and NOT enforced — the SDK appends it to `description`.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     type: "object",
     properties: {
       lvl: { type: "string", enum: ["low", "high"] },
@@ -181,7 +185,7 @@ function has(ledger, substr) {
 // Anthropic must NOT inherit OpenAI's all-keys-required rule: the transformer
 // passes `required` through exactly as given.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     type: "object",
     properties: { a: { type: "string" }, b: { type: "string" } },
     required: ["a"]
@@ -197,7 +201,7 @@ function has(ledger, substr) {
 // Anthropic path printed "OpenAI requires the root to be an object schema" to
 // users. Every reason a provider gives must name that provider.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     $ref: "#/definitions/T",
     definitions: {
       T: { type: "object", properties: { a: { $ref: "#/definitions/U", description: "d" } }, required: ["a"] },
@@ -215,7 +219,7 @@ function has(ledger, substr) {
 
 // `oneOf` is rewritten to `anyOf` by the transformer itself.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     type: "object",
     properties: { v: { oneOf: [{ type: "string" }, { type: "number" }] } }
   });
@@ -225,7 +229,7 @@ function has(ledger, substr) {
 
 // Both tuple spellings reach the transformer with no `type` and throw.
 (function () {
-  var homo = E.toAnthropic({
+  var homo = toAnthropicJSON({
     type: "object",
     properties: { bbox: { type: "array", prefixItems: [{ type: "number" }, { type: "number" }] } }
   });
@@ -233,7 +237,7 @@ function has(ledger, substr) {
     homo.schema.properties.bbox.items.type === "number" &&
     homo.schema.properties.bbox.minItems === 2 && homo.schema.properties.bbox.maxItems === 2);
 
-  var hetero = E.toAnthropic({
+  var hetero = toAnthropicJSON({
     type: "object",
     properties: { pair: { type: "array", items: [{ type: "string" }, { type: "number" }] } }
   });
@@ -511,7 +515,7 @@ function blockers(r) {
 // `transformJSONSchema` rewrites oneOf -> anyOf with no exclusivity proof, so
 // the same input that is a hard blocker for OpenAI is only a warning here.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     type: "object",
     properties: { v: { oneOf: [{ type: "string" }, { type: "string", minLength: 2 }] } }
   });
@@ -520,7 +524,7 @@ function blockers(r) {
   ok("anthropic warns about the widening", has(r.ledger, "at least one"));
   ok("anthropic does NOT fail the gate for it", blockers(r).length === 0);
 
-  var both = E.toAnthropic({
+  var both = toAnthropicJSON({
     type: "object",
     properties: { v: { oneOf: [{ type: "string" }], anyOf: [{ type: "number" }] } }
   });
@@ -964,7 +968,7 @@ var LITELLM_ANTHROPIC = {
 };
 
 (function () {
-  var r = E.toAnthropic(JSON.parse(JSON.stringify(LITELLM_ANTHROPIC)));
+  var r = toAnthropicJSON(JSON.parse(JSON.stringify(LITELLM_ANTHROPIC)));
   ok("litellm's /$defs/ ref is repointed to a real local pointer",
     r.schema.properties.priority.$ref === "#/$defs/Priority");
   // The regression that mattered most: the definition used to be deleted.
@@ -980,7 +984,7 @@ var LITELLM_ANTHROPIC = {
 
 // A root `$ref` in litellm's spelling: the false pass that started this.
 (function () {
-  var r = E.toAnthropic({
+  var r = toAnthropicJSON({
     $ref: "/$defs/Priority",
     $defs: { Priority: { type: "object", properties: { level: { type: "string" } }, required: ["level"] } }
   });
@@ -1009,6 +1013,182 @@ var LITELLM_ANTHROPIC = {
       required: ["p"] });
     var str = JSON.stringify(r.schema);
     ok(fn + " repoints litellm's ref spelling", str.indexOf('"/$defs/P"') === -1);
+  });
+})();
+
+// --- #321 Instructor: Anthropic's two paths are two TARGETS -----------------
+// Captured verbatim from instructor==1.15.4 + anthropic SDK by intercepting
+// httpx (`Mode.ANTHROPIC_TOOLS`, the default) on an ordinary Pydantic model.
+// Re-verified against @anthropic-ai/sdk@0.116.0: `betaTool()` returns this
+// byte-identical, and the ONLY input that makes it throw is a root that is not
+// `type: "object"`. The old single `anthropic` target exited 1 on this payload.
+var INSTRUCTOR_ANTHROPIC = {
+  "$defs": {
+    "Priority": {
+      "enum": [
+        "low",
+        "high"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "Tag": {
+      "properties": {
+        "name": {
+          "maxLength": 20,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "score": {
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Score",
+          "type": "number"
+        }
+      },
+      "required": [
+        "name",
+        "score"
+      ],
+      "title": "Tag",
+      "type": "object"
+    }
+  },
+  "description": "A support ticket.",
+  "properties": {
+    "title": {
+      "description": "Short title",
+      "maxLength": 80,
+      "title": "Title",
+      "type": "string"
+    },
+    "priority": {
+      "$ref": "#/$defs/Priority"
+    },
+    "tags": {
+      "items": {
+        "$ref": "#/$defs/Tag"
+      },
+      "title": "Tags",
+      "type": "array"
+    },
+    "bbox": {
+      "maxItems": 4,
+      "minItems": 4,
+      "prefixItems": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "integer"
+        }
+      ],
+      "title": "Bbox",
+      "type": "array"
+    },
+    "assignee": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Assignee"
+    },
+    "retries": {
+      "default": 0,
+      "title": "Retries",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "title",
+    "priority",
+    "tags",
+    "bbox"
+  ],
+  "title": "Ticket",
+  "type": "object"
+};
+
+(function () {
+  var src = JSON.parse(JSON.stringify(INSTRUCTOR_ANTHROPIC));
+  var r = E.toAnthropic(src);
+  var substantive = r.ledger.filter(function (l) { return !l.advisory && l.op !== "="; });
+  ok("anthropic tools path reports no substantive change on the real Instructor payload",
+    substantive.length === 0);
+  ok("anthropic tools path keeps the tuple intact (sent verbatim)",
+    Array.isArray(r.schema.properties.bbox.prefixItems) &&
+    r.schema.properties.bbox.prefixItems.length === 4);
+  ok("anthropic tools path keeps maxLength",
+    r.schema.properties.title.maxLength === 80);
+  ok("anthropic tools path keeps $defs rather than inlining",
+    r.schema.$defs && r.schema.$defs.Tag !== undefined);
+  ok("anthropic tools path emits the schema byte-identical",
+    JSON.stringify(r.schema) === JSON.stringify(INSTRUCTOR_ANTHROPIC));
+  ok("anthropic tools path says the schema goes on the wire verbatim",
+    has(r.ledger, "byte-identical"));
+  ok("anthropic tools path points at anthropic-json for the other path",
+    has(r.ledger, "--to anthropic-json"));
+})();
+
+(function () {
+  // Same file, other target: the two paths must DISAGREE, which is the whole
+  // reason the path is an explicit parameter rather than an inference.
+  var tools = E.toAnthropic(JSON.parse(JSON.stringify(INSTRUCTOR_ANTHROPIC)));
+  var json = toAnthropicJSON(JSON.parse(JSON.stringify(INSTRUCTOR_ANTHROPIC)));
+  ok("the two anthropic targets disagree on the same schema",
+    JSON.stringify(tools.schema) !== JSON.stringify(json.schema));
+  ok("anthropic-json collapses the tuple the tools path keeps",
+    json.schema.properties.bbox.prefixItems === undefined &&
+    json.schema.properties.bbox.items !== undefined);
+  ok("anthropic-json still reports maxLength as demoted to prose",
+    has(json.ledger, "NOT enforced on the `output_format`"));
+  ok("anthropic tools path does NOT emit the demote-to-prose notes",
+    !has(tools.ledger, "NOT enforced on the `output_format`"));
+})();
+
+(function () {
+  // Real blockers survive on the tools path — they are just a much shorter list.
+  var rootRef = E.toAnthropic({ $ref: "#/$defs/T",
+    $defs: { T: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } } });
+  ok("anthropic tools path still inlines a root $ref (betaTool needs a type)",
+    rootRef.schema.type === "object" && rootRef.schema.$ref === undefined);
+  ok("anthropic tools path cites the betaTool throw, not the transformer",
+    has(rootRef.ledger, "must be an object, but got undefined"));
+
+  var strRoot = E.toAnthropic({ type: "string" });
+  ok("anthropic tools path still blocks a non-object root",
+    strRoot.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+
+  // ...and the edits the tools path must NOT make, because nothing transforms.
+  var defs = E.toAnthropic({ type: "object", properties: { p: { $ref: "#/definitions/X" } },
+    definitions: { X: { type: "string" } }, required: ["p"] });
+  ok("anthropic tools path leaves a draft-07 definitions bag alone",
+    defs.schema.definitions !== undefined && defs.schema.$defs === undefined);
+
+  var one = E.toAnthropic({ type: "object", properties: {
+    u: { oneOf: [{ type: "string" }, { type: "string", minLength: 2 }] } } });
+  ok("anthropic tools path does not rewrite oneOf to anyOf",
+    Array.isArray(one.schema.properties.u.oneOf) && one.schema.properties.u.anyOf === undefined);
+})();
+
+(function () {
+  ["anthropic", "anthropic-json"].forEach(function (p) {
+    var once = E.convert(JSON.parse(JSON.stringify(INSTRUCTOR_ANTHROPIC)), p);
+    var twice = E.convert(JSON.parse(JSON.stringify(once.schema)), p);
+    ok(p + " is idempotent on the Instructor payload",
+      JSON.stringify(once.schema) === JSON.stringify(twice.schema));
   });
 })();
 

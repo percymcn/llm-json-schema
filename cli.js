@@ -18,7 +18,7 @@
 var fs = require("fs");
 var E = require("./engine.js");
 
-var PROVIDERS = ["openai", "anthropic", "gemini", "gemini-json", "openai-realtime"];
+var PROVIDERS = ["openai", "anthropic", "anthropic-json", "gemini", "gemini-json", "openai-realtime"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
