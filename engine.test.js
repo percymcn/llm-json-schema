@@ -2853,5 +2853,88 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     !has(conv(AGNO_OPTIONAL_DICT, "gemini").ledger, "Rewrote `type: \"null\"`"));
 })();
 
+// --- agno 2.8.7 TOOLS path: a SECOND module, with a different Dict policy ----
+// #337 measured agno's response-schema/Gemini layer. `process_schema_for_strict`
+// (`agno/tools/function.py:643`) is a different module reached by every @tool,
+// and it disagrees with that layer about Dict fields in the opposite direction.
+// All payloads below are the VERBATIM output of that function on agno 2.8.7 /
+// pydantic 2.13.4 (#311), and each verdict is pinned against `openai@7.4.0`'s
+// `toStrictJsonSchema()` as measured, not assumed.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+
+  // `Dict[str, str]` -> the value schema is REPLACED by `false`. Vendor THROWS
+  // (on the surviving `propertyNames`), so the emptying does not even buy
+  // acceptance -- it only changes which error you get.
+  var AGNO_TOOL_EMPTIED_MAP = {
+    type: "object",
+    properties: { tags: { type: "object", propertyNames: { type: "string" }, additionalProperties: false } },
+    additionalProperties: false, required: ["tags"]
+  };
+  ok("agno tools: an emptied Dict param is reported as a fossil, not silently 'fixed'",
+    has(conv(AGNO_TOOL_EMPTIED_MAP, "openai").ledger, "its only legal value is `{}`"));
+  ok("agno tools: the unsupported `propertyNames` beside it is still removed",
+    has(conv(AGNO_TOOL_EMPTIED_MAP, "openai").ledger, "propertyNames"));
+  // The advisory cites the layers that PRODUCE this, and there are now two
+  // measured ones in different ecosystems -- citing only the first would
+  // under-state it as a JS/Zod quirk when it also hits Python tool params.
+  ok("agno tools: the fossil advisory names both measured producers",
+    has(conv(AGNO_TOOL_EMPTIED_MAP, "openai").ledger, "make_nested_strict") &&
+    has(conv(AGNO_TOOL_EMPTIED_MAP, "openai").ledger, "schema-compat"));
+
+  // Both gaps reported in agno-agi/agno#9413, in one payload: `p` keeps
+  // pydantic's `required` (1 of 2 properties), and the `Inner` object sitting
+  // inside `anyOf` was never visited at all -- no `additionalProperties: false`,
+  // `required` short by one. Vendor THROWS on the nested defaulted field.
+  var AGNO_TOOL_ANYOF = {
+    type: "object",
+    properties: { p: {
+      properties: {
+        name: { title: "Name", type: "string" },
+        inner: { anyOf: [
+          { properties: { label: { title: "Label", type: "string" },
+                          weight: { default: 1.0, title: "Weight", type: "number" } },
+            required: ["label"], title: "Inner", type: "object" },
+          { type: "null" }
+        ], default: null }
+      },
+      required: ["name"], title: "WithOptModel", type: "object", additionalProperties: false
+    } },
+    additionalProperties: false, required: ["p"]
+  };
+  var anyofLedger = conv(AGNO_TOOL_ANYOF, "openai").ledger;
+  ok("agno tools: an under-populated nested `required` is caught",
+    has(anyofLedger, "added to required"));
+  ok("agno tools: the object inside `anyOf` that agno never visited is reached by us",
+    has(anyofLedger, "weight"));
+
+  // Over-blocking guards: agno's processing is CORRECT for these two, the vendor
+  // accepts both verbatim, and so must we. Without these the block above could
+  // pass by being merely stricter than the vendor (#312/#314/#317/#322).
+  ok("agno tools: an ordinary tool schema is left alone",
+    conv({ type: "object", properties: { name: { type: "string" }, count: { type: "integer" } },
+           additionalProperties: false, required: ["name", "count"] }, "openai").ledger.length === 0);
+  ok("agno tools: a collapsed tuple param is left alone",
+    conv({ type: "object", properties: { bbox: { type: "array", items: { type: "integer" } } },
+           additionalProperties: false, required: ["bbox"] }, "openai").ledger.length === 0);
+
+  // The OTHER Dict policy, for contrast: agno's response path PRESERVES the open
+  // map and drops the field from `required`; openai-python's own
+  // `to_strict_json_schema` preserves it and keeps it in `required`. The vendor
+  // THROWS on both, so neither is a reference implementation to copy.
+  var AGNO_RESPONSE_PATH_DICT = {
+    properties: { tags: { additionalProperties: { type: "string" }, title: "Tags", type: "object" },
+                  name: { title: "Name", type: "string" } },
+    required: ["name"], title: "DictModel", type: "object", additionalProperties: false
+  };
+  ok("agno response path: the preserved open map is a blocker, not an advisory",
+    has(conv(AGNO_RESPONSE_PATH_DICT, "openai").ledger, "open map"));
+  ok("agno response path: the Dict dropped from `required` is also caught",
+    has(conv(AGNO_RESPONSE_PATH_DICT, "openai").ledger, "added to required"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

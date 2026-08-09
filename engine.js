@@ -2879,8 +2879,10 @@
         "provider accepts this, so nothing will warn you. Most often it is not what anyone " +
         "wrote: it is what is left after a compatibility layer \"fixed\" a map/dictionary by " +
         "setting `additionalProperties: false`, which does not close an open map, it empties " +
-        "it (measured: `@mastra/schema-compat`'s `prepareJsonSchemaForOpenAIStrictMode` does " +
-        "exactly this to an ordinary `z.record(z.string())`). The value type is already gone " +
+        "it. Two measured producers, in different ecosystems: `@mastra/schema-compat`'s " +
+        "`prepareJsonSchemaForOpenAIStrictMode` does exactly this to an ordinary " +
+        "`z.record(z.string())`, and agno 2.8.7's `make_nested_strict` " +
+        "(`agno/tools/function.py`) does it to a `Dict[str, str]` TOOL PARAMETER. The value type is already gone " +
         "here and cannot be recovered — check the schema BEFORE that layer runs. If you really " +
         "did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
         DOCS[provider], true));
