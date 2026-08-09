@@ -106,6 +106,12 @@ function main(argv) {
 
     var changes = res.ledger.filter(function (l) { return l.op !== "="; });
     var blockers = res.ledger.filter(function (l) { return l.op === "!"; });
+    // Advisory "=" entries record something the caller needs to KNOW but that
+    // requires no edit — e.g. a keyword Gemini's `responseJsonSchema` path
+    // silently ignores rather than rejects. They are not `changes`, so without
+    // this they would be swallowed by the "No changes needed" branch and the
+    // user would never learn their constraint is unenforced.
+    var notes = res.ledger.filter(function (l) { return l.op === "=" && l.advisory; });
     // Advisory entries are optional improvements — the schema is already
     // accepted without them, so they must never turn a CI gate red.
     var required = changes.filter(function (l) { return !l.advisory; });
@@ -139,6 +145,11 @@ function main(argv) {
         process.stderr.write((opts.check ? "Not compliant with " : "Fixed for ") + opts.provider +
           " (" + changes.length + " change" + (changes.length === 1 ? "" : "s") + "):\n");
         process.stderr.write(renderLedger(changes) + "\n");
+      }
+      if (notes.length) {
+        process.stderr.write("\n" + notes.length + " note" + (notes.length === 1 ? "" : "s") +
+          " (no edit needed, but read them):\n");
+        process.stderr.write(renderLedger(notes) + "\n");
       }
       if (blockers.length) {
         process.stderr.write("\n" + blockers.length + " item" + (blockers.length === 1 ? "" : "s") +

@@ -237,11 +237,23 @@ var ZOD_V3 = {
   });
   ok("gemini allows a cycle in a non-required property",
     !cycOk.ledger.some(function (l) { return l.op === "!"; }));
-  // "Sent verbatim" is the TRANSPORT, not acceptance: the backend's accepted
-  // property list for `responseJsonSchema` (enumerated on the Python SDK's
+  // "Sent verbatim" is the TRANSPORT, not acceptance: the accepted property
+  // list for `responseJsonSchema` (enumerated on the Python SDK's
   // `response_json_schema` field) has no `minLength`/`maxLength`/`default`.
-  ok("gemini strips minLength on the $schema path", !("minLength" in keep.schema.$defs.Ticket.properties.title));
-  ok("gemini strips default on the $schema path", !("default" in keep.schema.$defs.Ticket.properties.priority));
+  // But that field says the full JSON Schema MAY BE SENT and merely that not
+  // all features are supported — i.e. unsupported keywords are IGNORED, not
+  // rejected (contrast OpenAI, whose doc says "you will receive an error").
+  // So we KEEP them and warn that they are unenforced; deleting a keyword the
+  // request tolerates would destroy a real constraint to buy nothing.
+  ok("gemini keeps minLength on the $schema path", keep.schema.$defs.Ticket.properties.title.minLength === 1);
+  ok("gemini warns minLength is unenforced there", keep.ledger.some(function (l) {
+    return l.advisory && l.msg.indexOf("minLength") !== -1 && l.msg.indexOf("NOT enforced") !== -1;
+  }));
+  ok("gemini keeps default on the $schema path", keep.schema.$defs.Ticket.properties.priority["default"] === "low");
+  // ...and an unenforced keyword must not fail a CI gate.
+  ok("unenforced-keyword notes are advisory, not changes",
+    keep.ledger.filter(function (l) { return l.op !== "=" && !l.advisory; })
+      .every(function (l) { return l.msg.indexOf("definitions") !== -1; }));
   // ...but keeps what that path DOES accept, incl. additionalProperties, which
   // the narrow proto path drops. The two subsets are complementary.
   ok("gemini keeps additionalProperties on the $schema path",

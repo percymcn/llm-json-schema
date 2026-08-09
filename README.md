@@ -78,7 +78,11 @@ Each provider accepts a different schema dialect, so a schema that works with on
   | `$ref`, `$defs`, `$anchor`, `$id`, `prefixItems`, `additionalProperties`, `oneOf` | ❌ | ✅ |
   | `type`, `format`, `title`, `description`, `enum`, `items`, `min/maxItems`, `minimum`, `maximum`, `anyOf`, `properties`, `required`, `propertyOrdering` | ✅ | ✅ |
 
-  So the tool converts for whichever path your schema is on, and tells you when a keyword would only survive on the other one. On the JSON-Schema path it also enforces two rules the API states but the structured-output doc doesn't: a `$ref` sub-schema may carry no non-`$` siblings, and cyclic references are only allowed inside **non-required** properties.
+  So the tool converts for whichever path your schema is on, and tells you when a keyword would only survive on the other one.
+
+  The two paths also differ in how they treat an unsupported keyword, which is why the tool treats them differently. OpenAI's doc says outright that an unsupported schema means "you will receive an error", so unsupported keywords are **removed**. Gemini's `response_json_schema` says the full JSON Schema **may be sent** and merely that not all features are supported — so on that path unsupported keywords are **kept and flagged as unenforced**, because deleting a constraint the request tolerates costs you something and buys nothing. On the narrow proto path they are removed (unknown fields there are a hard `Unknown name … Cannot find field`).
+
+  On the JSON-Schema path the tool also enforces two rules stated only on that SDK field: a `$ref` sub-schema may carry no non-`$` siblings, and cyclic references are only allowed inside **non-required** properties.
 
 ### What generators actually emit
 `zod-to-json-schema` wraps your schema as `{ "$ref": "#/definitions/X", "definitions": { … } }`.

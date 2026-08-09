@@ -541,8 +541,19 @@
   //    additionalProperties, required. The non-standard propertyOrdering
   //    property may also be set."
   //
-  // So "the JS SDK sends it verbatim" describes the TRANSPORT, not acceptance —
-  // the two paths are partly COMPLEMENTARY, and neither is a superset:
+  // So "the JS SDK sends it verbatim" describes the TRANSPORT, not acceptance.
+  // Both SDKs' JSON-Schema path is a literal identity function (`t_json_schema`
+  // in Python, `tJsonSchema` in JS), so — unlike the `responseSchema` path,
+  // where `types.Schema` is `extra="forbid"` and therefore a hard oracle — the
+  // vendor gives NO machine verdict here. The field text is the only source,
+  // and it says the full schema MAY BE SENT: unsupported keywords are ignored,
+  // not rejected. That is why unsupported keywords are kept + flagged advisory
+  // below instead of stripped. Two clauses ARE phrased as prohibitions, and
+  // those are treated as real findings: a `$ref` sub-schema may carry no
+  // non-`$` siblings, and cyclic refs may only be used in non-required
+  // properties.
+  //
+  // The two paths are partly COMPLEMENTARY, and neither is a superset:
   //   only responseSchema     : pattern, minLength, maxLength, minProperties,
   //                             maxProperties, default, example, nullable
   //   only responseJsonSchema : $ref, $defs, $anchor, $id, prefixItems,
@@ -686,10 +697,12 @@
       ledger.push(entry("=", "root",
         "Kept `$schema` — it is the routing switch. With it, @google/genai moves this to the " +
         "`responseJsonSchema` request field (in Python, set `response_json_schema` yourself). " +
-        "That path keeps `$ref`/`$defs`, but it does NOT accept `pattern`, `minLength`, " +
-        "`maxLength`, `min/maxProperties`, `default` or `example` — those work only on the " +
-        "narrow `responseSchema` path. The two subsets are complementary; neither is a superset.",
-        DOCS.gemini));
+        "That path keeps `$ref`/`$defs` and recursion, but it does NOT ENFORCE `pattern`, " +
+        "`minLength`, `maxLength`, `min/maxProperties`, `default` or `example` — those are " +
+        "silently ignored here and work only on the narrow `responseSchema` path. The two " +
+        "subsets are complementary; neither is a superset. Nothing below is an error: " +
+        "unsupported keywords are ignored, so `--check` stays green.",
+        DOCS.gemini, true));
 
       // `definitions` is the draft-07 spelling zod-to-json-schema emits, and it
       // is NOT in the accepted list — only `$defs` is. Renaming it (and
@@ -702,13 +715,23 @@
       walk(s, "root", function (node, path) {
         Object.keys(node).forEach(function (k) {
           if (!GEMINI_JSON_ALLOWED[k]) {
-            ledger.push(entry("x", path,
-              "Removed `" + k + "` — not in the accepted property list for " +
-              "`responseJsonSchema` (enumerated on the `response_json_schema` field of " +
-              "`google-genai`). If you need it enforced, drop the top-level `$schema` to " +
-              "take the `responseSchema` path instead, or restate it in `description`.",
-              DOCS.gemini));
-            delete node[k];
+            // KEPT, not removed — and the wording of the source is the whole
+            // reason. The field doc says "While the full JSON Schema MAY BE
+            // SENT, not all features are supported", i.e. an unsupported
+            // keyword is IGNORED, not rejected. Contrast OpenAI, whose doc
+            // says outright "you will receive an error" — that is what makes
+            // stripping correct there and wrong here. Deleting a keyword the
+            // request would have accepted destroys a real constraint to buy
+            // nothing, which is precisely the bug the previous cycle fixed.
+            ledger.push(entry("=", path,
+              "Kept `" + k + "`, but it is NOT enforced on this path — it is absent from the " +
+              "accepted property list enumerated on the `response_json_schema` field of " +
+              "`google-genai`. The full JSON Schema may be sent, so this is ignored rather " +
+              "than rejected; your request still succeeds, but nothing constrains `" + k + "`. " +
+              "If you need it enforced, drop the top-level `$schema` to take the narrow " +
+              "`responseSchema` path (which does enforce `pattern`, `minLength`, `maxLength`, " +
+              "`min/maxProperties`, `default`, `example`), or restate it in `description`.",
+              DOCS.gemini, true));
           }
         });
 
