@@ -448,6 +448,15 @@ Nullability is where that stops being cosmetic. Measured against the live
 | `{"type":"STRING","nullable":true}` | **accepted** | `nullable` **dropped** — field stops being nullable |
 | `{"type":["string","null"]}` | **rejected** — `Unknown name "type"` | converted to `nullable` correctly |
 
+**Scope, checked rather than assumed.** google-adk 2.6.3 defaults
+`JSON_SCHEMA_FOR_FUNC_DECL` to `True`, so its *tool declarations* are now sent
+as `parameters_json_schema` and skip `_to_gemini_schema` entirely. Everything
+measured here is of that function, which is still shipped and still reached with
+the flag disabled. So this target is justified by the structural fact — `nullable`
+is not a JSON Schema keyword, so **any** layer that reads JSON Schema drops it —
+with ADK as the measured instance, not by a claim that every ADK user hits this
+today.
+
 There is no document that satisfies both. `nullable` is not a field of ADK's
 `_ExtendedJSONSchema` — which *does* extend `JSONSchema` with
 `property_ordering`, so this is not a blanket refusal of proto fields — and the

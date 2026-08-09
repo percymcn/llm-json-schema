@@ -2198,7 +2198,8 @@
       ledger.push(entry("~", path,
         "Rewrote `type: " + before + "` to `anyOf`. A client that converts JSON Schema to " +
         "the `Schema` proto keeps only ONE member of a multi-type union — measured on " +
-        "google-adk 2.6.3, `[\"string\",\"integer\"]` arrives as `STRING` and the integer " +
+        "google-adk 2.6.3's `_to_gemini_schema`, `[\"string\",\"integer\"]` arrives as " +
+        "`STRING` and the integer " +
         "branch is discarded with no error. `anyOf` is carried through that conversion " +
         "intact, so every branch survives. Lossless.",
         DOCS.gemini));
@@ -2427,7 +2428,8 @@
         ledger.push(entry("=", path,
           "This array declares no element type. The `responseSchema` proto accepts that " +
           "(verified against the live v1beta endpoint) and simply leaves the elements " +
-          "unconstrained — but a converting client will not: google-adk 2.6.3 inserts " +
+          "unconstrained — but a converting client will not: google-adk 2.6.3's " +
+          "`_to_gemini_schema` inserts " +
           "`items: {\"type\": \"string\"}`, the backend accepts the result, and the model " +
           "is told the elements are strings. Declare the real element type in `items`.",
           DOCS.gemini, true));
@@ -2590,7 +2592,8 @@
           "This output now carries `nullable`, which is correct ONLY if you assign it " +
           "straight to `responseSchema`. If you instead hand it to a library that does " +
           "its own JSON-Schema-to-`Schema` conversion, `nullable` is dropped and those " +
-          "fields silently stop being nullable — measured on google-adk 2.6.3, where " +
+          "fields silently stop being nullable — measured on google-adk 2.6.3's " +
+          "`_to_gemini_schema`, where " +
           "`nullable` is not a field of its `_ExtendedJSONSchema` (which does extend " +
           "JSONSchema with `property_ordering`, so proto fields are not refused across " +
           "the board). The two spellings are exclusive, not merely different: the " +
@@ -2781,6 +2784,15 @@
     // union `type` is dropped by `responseSchema` and converted correctly by
     // that layer. There is no intersection form here, which is why this is a
     // separate target rather than a wider rule on `gemini`.
+    //
+    // Scope, checked rather than assumed: google-adk 2.6.3 defaults
+    // `JSON_SCHEMA_FOR_FUNC_DECL` to True, so its TOOL declarations now go to
+    // `parameters_json_schema` and skip `_to_gemini_schema` entirely. The
+    // measurements above are of that function, which is still shipped and still
+    // reached with the flag disabled — so this target is justified by the
+    // structural fact (`nullable` is not a JSON Schema keyword, so any layer
+    // reading JSON Schema drops it), with ADK as the measured instance, NOT by a
+    // claim that every ADK user hits it today.
     "gemini-client": function (s) { return toGemini(s, false, true); },
     // Non-strict is a property of the `strict` flag, not of one API surface, so the
     // primary name is the CONDITION. `openai-realtime` stays as the surface where
