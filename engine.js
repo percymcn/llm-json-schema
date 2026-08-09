@@ -957,6 +957,155 @@
     }
   }
 
+  // ---- Anthropic: an array-valued `type` is a DISPATCH MISS, and the two SDKs
+  // fail on it in opposite directions ----------------------------------------
+  //
+  // Measured 2026-08-09 against `@anthropic-ai/sdk@0.116.0` and
+  // `anthropic==0.121.0`:
+  //
+  //   * JS `_transformJSONSchema` dispatches on `type === "object" | "string" |
+  //     "array"` — strict equality against a STRING — so an array-valued `type`
+  //     matches no branch. The branch that would have copied `properties`,
+  //     `items` or `format` never runs, and those keys fall through to the
+  //     catch-all that stringifies leftovers into `description`. For
+  //     `{type:["object","null"], properties:{…}, required:[…]}` the ENTIRE
+  //     subtree becomes one line of prose and the transformer never recurses
+  //     into it. No error, no warning. That is a different kind of loss from an
+  //     ordinary demotion (#315): it is the structure, not a constraint.
+  //   * Python `transform_schema` types `type` as a `Literal` of seven scalars
+  //     and ends in `assert_never`, so ANY list raises `AssertionError: Expected
+  //     code to be unreachable` — including the one-element `["string"]` and the
+  //     canonical nullable spelling `["string","null"]`. The request cannot be
+  //     built at all.
+  //
+  // `anyOf` is the form BOTH accept: the JS transformer maps itself over the
+  // variants (so the subtree survives AND is processed properly — a nested
+  // `minLength` is demoted at the leaf, which is the correct minimal loss) and
+  // the Python transformer passes it through verbatim. Verified on both.
+  //
+  // Not exotic: our own `--to openai` output creates `type:["object","null"]`
+  // for an optional object property (the forced-required rewrite from #311), and
+  // `zod-to-json-schema` emits `type:["string","null"]` for a nullable primitive.
+  // (Corrected while measuring: Zod v4's native `z.toJSONSchema` and Pydantic
+  // v2 both emit `anyOf` instead, so this reaches Anthropic mainly through
+  // hand-written / OpenAPI-derived schemas and through our own output — not
+  // through those two generators, as I had first assumed.)
+  function anthropicTypeBranchKeys(member) {
+    if (member === "object") return ["properties", "required"];
+    if (member === "array") return ["items", "minItems"];
+    if (member === "string") return ["format"];
+    return [];
+  }
+
+  function normalizeAnthropicUnionType(node, path, ledger, url, pythonSdk) {
+    var raw = node.type;
+    if (!Array.isArray(raw)) return;
+    // `type` beside a combinator: rewriting would have to invent a merge, so the
+    // keyword is left visible. But bailing silently is only safe for the JS SDK,
+    // which ignores the `type` once it sees `anyOf`. The Python SDK asserts on
+    // the LIST before it ever looks at the combinator, so the request still
+    // cannot be built — measured: `{type:["string","null"], anyOf:[…]}` raises
+    // `AssertionError` there. Say so rather than exit 0 on a schema that throws.
+    if (node.anyOf !== undefined || node.oneOf !== undefined || node.allOf !== undefined) {
+      if (pythonSdk) {
+        ledger.push(entry("!", path,
+          "This node has an array-valued `type` (`" + JSON.stringify(raw) + "`) alongside " +
+          "`anyOf`/`oneOf`/`allOf`. The Python `anthropic` SDK raises `AssertionError: Expected code " +
+          "to be unreachable` on the list REGARDLESS of the combinator — the assert runs before the " +
+          "combinator is consulted — so the request cannot be built. (The TypeScript SDK ignores the " +
+          "`type` once it sees a combinator, which is why this is a Python-only failure.) Merging " +
+          "these two is a semantic decision only you can make, so drop whichever one is redundant.",
+          url));
+      }
+      return;
+    }
+
+    var members = [];
+    raw.forEach(function (t) { if (members.indexOf(t) === -1) members.push(t); });
+    var nonNull = members.filter(function (t) { return t !== "null"; });
+    var hasNull = nonNull.length !== members.length;
+    var others = Object.keys(node).filter(function (k) { return k !== "type"; });
+
+    // Did the union actually SKIP a branch that would otherwise have run? That
+    // is the only thing the JS SDK loses here. The Python SDK loses the whole
+    // request whatever the members are, so it always needs the rewrite.
+    var skippedBranch = nonNull.length === 1 &&
+      anthropicTypeBranchKeys(nonNull[0]).some(function (k) { return node[k] !== undefined; });
+    if (!pythonSdk && !skippedBranch) return;
+
+    var before = JSON.stringify(raw);
+    var loudly = pythonSdk
+      ? "The Python `anthropic` SDK REFUSES TO BUILD the request for any array-valued `type` — " +
+        "`transform_schema` types it as a `Literal` of seven scalars and falls through to " +
+        "`assert_never`, raising `AssertionError: Expected code to be unreachable, but got: " +
+        before + "`. Even a one-element list raises. "
+      : "`@anthropic-ai/sdk` dispatches on `type === \"object\"`/`\"string\"`/`\"array\"` — strict " +
+        "equality against a string — so an array-valued `type` matches no branch and the branch " +
+        "that would have copied " +
+        anthropicTypeBranchKeys(nonNull[0]).map(function (k) { return "`" + k + "`"; }).join("/") +
+        " never runs. Those keys are stringified into this node's `description` instead, and the " +
+        "transformer never recurses into them — so the whole subtree stops being schema. It does " +
+        "not throw and it does not warn. ";
+
+    // Several non-null members WITH keywords attached: there is no safe way to
+    // decide which branch each keyword belongs to. Guessing would silently
+    // re-attach a constraint to a type it never applied to, so say so instead.
+    if (nonNull.length > 1 && others.length > 0) {
+      if (pythonSdk) {
+        ledger.push(entry("!", path,
+          loudly + "This node also carries " +
+          others.map(function (k) { return "`" + k + "`"; }).join(", ") +
+          ", and with more than one non-null member there is no way to tell which branch each of " +
+          "those belongs to — re-attaching them to the wrong type would be a silent semantic " +
+          "change, so this is left for you. Rewrite it by hand as `anyOf`, one branch per type, " +
+          "with each keyword on the branch it constrains.",
+          url));
+      }
+      return;
+    }
+
+    var moved = {};
+    others.forEach(function (k) {
+      // Annotations are recognised at any node, including an `anyOf` node, so
+      // they stay where the reader put them.
+      if (k === "description" || k === "title") return;
+      moved[k] = node[k];
+      delete node[k];
+    });
+
+    var shape;
+    if (nonNull.length === 0) {
+      // `["null"]` — the scalar spelling is accepted verbatim by both SDKs.
+      node.type = "null";
+      Object.keys(moved).forEach(function (k) { node[k] = moved[k]; });
+      shape = "`type: \"null\"`";
+    } else if (nonNull.length === 1 && !hasNull) {
+      // `["string"]` — a one-element list means exactly the scalar.
+      node.type = nonNull[0];
+      Object.keys(moved).forEach(function (k) { node[k] = moved[k]; });
+      shape = "`type: " + JSON.stringify(nonNull[0]) + "`";
+    } else if (nonNull.length === 1) {
+      var branch = { type: nonNull[0] };
+      Object.keys(moved).forEach(function (k) { branch[k] = moved[k]; });
+      delete node.type;
+      node.anyOf = [branch, { type: "null" }];
+      shape = "`anyOf: [{type: " + JSON.stringify(nonNull[0]) + ", …}, {type: \"null\"}]`";
+    } else {
+      delete node.type;
+      node.anyOf = members.map(function (t) { return { type: t }; });
+      shape = "`anyOf` with one branch per type";
+    }
+
+    ledger.push(entry("~", path,
+      "Rewrote `type: " + before + "` to " + shape + ". " + loudly +
+      "`anyOf` is the form BOTH SDKs handle: the TypeScript transformer maps itself over the " +
+      "variants, so the subtree survives and is processed properly, and the Python transformer " +
+      "passes `anyOf` through verbatim. Lossless — every keyword moves onto the branch it already " +
+      "constrained (`properties` never applied to `null` in the first place), and `description`/" +
+      "`title` stay where they are because they are recognised at any node.",
+      url));
+  }
+
   // A node with no `type` (and no anyOf/oneOf/allOf/$ref) throws on Path O.
   // When the node carries an `enum` or `const` the intended type is recoverable
   // losslessly, so add it rather than making the user do it.
@@ -1110,6 +1259,16 @@
         url, true));
       return { schema: s, ledger: ledger };
     }
+
+    // Pre-pass, deliberately BEFORE the main walk: an array-valued `type` makes
+    // the transformer skip its per-type branch, so the demotion pass below would
+    // otherwise report a gutted subtree as an ordinary unenforced keyword. The
+    // root is left out on purpose — a union root is a genuine blocker (both
+    // paths require `type === "object"`) and is already reported as one above.
+    walk(s, "root", function (node, path) {
+      if (path === "root") return;
+      normalizeAnthropicUnionType(node, path, ledger, url, pythonSdk);
+    });
 
     var demoted = [];
     walk(s, "root", function (node, path) {

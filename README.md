@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 262 engine + 102 CLI + 31 ESM/library assertions = **395** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 285 engine + 110 CLI + 31 ESM/library assertions = **426** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -106,14 +106,27 @@ Each provider accepts a different schema dialect, so a schema that works with on
 - **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`). Because nothing in the schema tells you which one you are on, each is its own target:
   - **`--to anthropic` → `tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. Tuples, `maxLength`, `format`, a draft-07 `definitions` bag and a non-exclusive `oneOf` all survive untouched, so this target reports them as fine rather than "fixing" them. `strict: true` goes on the **tool**, not the schema — the SDK documents it as *"guarantees schema validation on tool names and inputs"*; without it the schema is guidance the model can violate.
   - **`--to anthropic-json` → the structured-output path** (`output_format` / `output_config`: `{ type: "json_schema" }`) — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
-  - **`--to anthropic-json-python`** — the same path, as implemented by the **Python** `anthropic` SDK, which is not the same program. This split is by **SDK language, not version**: `anthropic==0.116.0` and `@anthropic-ai/sdk@0.116.0` carry the same version string and disagree, so it is not a skew you can upgrade past. Across 43 schema shapes run through both transformers they agree on 41; the two exceptions are below.
+  - **`--to anthropic-json-python`** — the same path, as implemented by the **Python** `anthropic` SDK, which is not the same program. This split is by **SDK language, not version**: `anthropic==0.116.0` and `@anthropic-ai/sdk@0.116.0` carry the same version string and disagree, so it is not a skew you can upgrade past.
 
-  **The two Anthropic SDKs disagree about exactly two things** (measured on `anthropic` 0.110.0 / 0.116.0 / 0.121.0 against `@anthropic-ai/sdk@0.116.0`):
+  **The two Anthropic SDKs disagree about three things** (measured on `anthropic` 0.110.0 / 0.116.0 / 0.121.0 against `@anthropic-ai/sdk@0.116.0`; the first two over a 43-shape battery where they otherwise agree on 41, the third over a separate 16-shape union-`type` battery):
 
   | | Python `anthropic` | `@anthropic-ai/sdk` |
   |---|---|---|
   | `enum` | **preserved** — actually enforced | demoted into `description` prose |
   | root `{$ref, $defs}` | **accepted**, `$defs` kept, pointer resolves | **rejected**: `JSON schema must be an object, but got undefined` |
+  | array-valued `type` (e.g. `["string","null"]`) | **raises** `AssertionError: Expected code to be unreachable` — no request is built, even for a one-element list | accepted, but the per-type branch is **skipped** and any `properties`/`items` are stringified into `description` |
+
+  That last row is the worst failure on this path, and the two SDKs fail in **opposite** directions. The TypeScript transformer dispatches on `type === "object"` — strict equality against a *string* — so an array-valued `type` matches no branch:
+
+  ```js
+  // in:  {type: ["object","null"], properties: {a: {type: "string"}}, required: ["a"]}
+  // out: {type: ["object","null"],
+  //       description: '{properties: {"a":{"type":"string"}}, required: ["a"]}'}
+  ```
+
+  The whole subtree stops being schema, the transformer never recurses into it, and nothing errors or warns. Python raises instead, on *any* list. `anyOf` is the one form both handle — the TypeScript transformer maps itself over the variants (so the subtree survives and is processed properly) and the Python one passes it through verbatim — so that is what this tool rewrites to. It is lossless: `properties` never applied to `null` in the first place.
+
+  Worth knowing if you use this tool for more than one provider: **`--to openai` output contains exactly this shape.** Strict mode has no optional fields, so an optional object property becomes `{type: ["object","null"], properties: …}` — valid for OpenAI, and the input that guts the Anthropic structured-output path. `--to anthropic` (tools) accepts it as-is, because that path applies no transform at all.
 
   The Python transformer pops `$defs` *before* its `$ref` early-return, with a source comment naming that exact case, and `messages.py` calls it with no root-type guard. The TypeScript failure is **loud, not silent** — both public helpers (`jsonSchemaOutputFormat`, `betaJSONSchemaOutputFormat`) throw, because a `$ref` root has no `type`. Only the internal `transformJSONSchema`, called directly, loses `$defs` quietly. Note the draft-07 spelling `{$ref, definitions}` is lost by **both**, so the `definitions` → `$defs` rename this tool performs is unconditional.
 

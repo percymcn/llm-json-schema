@@ -671,5 +671,54 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   ok("the converted output then passes its own gate", twice.status === 0, "status=" + twice.status);
 })();
 
+// --- Anthropic: a union `type` is a dispatch miss, and WE create the input --
+//
+// Cycle #327. The fixture is not hand-written: it is byte-for-byte what our own
+// `--to openai` emits for a schema with an optional object property (the
+// forced-required rewrite from #311). So the multi-provider user who converts
+// for OpenAI and then targets Anthropic hits exactly this. Measured against
+// `@anthropic-ai/sdk@0.116.0` (guts the subtree into prose, silently) and
+// `anthropic==0.121.0` (raises `AssertionError`, no request built).
+(function () {
+  var WITH_OPTIONAL_OBJECT = JSON.stringify({
+    type: "object",
+    properties: {
+      o: { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false },
+      s: { type: "string" }
+    },
+    required: ["s"],
+    additionalProperties: false
+  });
+
+  var oai = run(["--to", "openai"], WITH_OPTIONAL_OBJECT);
+  var oaiOut = JSON.parse(oai.stdout);
+  ok("our own --to openai output contains a union `type` with a live subtree",
+    Array.isArray(oaiOut.properties.o.type) && !!oaiOut.properties.o.properties,
+    oai.stdout);
+
+  var jsChk = run(["--to", "anthropic-json", "--check"], oai.stdout);
+  ok("that output fails --check on anthropic-json", jsChk.status === 1, "status=" + jsChk.status);
+  ok("...and the diagnosis says the subtree stops being schema",
+    /never recurses|stringified into this node/.test(jsChk.stderr), jsChk.stderr.slice(0, 300));
+
+  var pyChk = run(["--to", "anthropic-json-python", "--check"], oai.stdout);
+  ok("the same output fails --check on anthropic-json-python",
+    pyChk.status === 1, "status=" + pyChk.status);
+  ok("...and cites the Python assert rather than a demotion",
+    /assert_never|unreachable/.test(pyChk.stderr), pyChk.stderr.slice(0, 300));
+
+  var toolsChk = run(["--to", "anthropic", "--check"], oai.stdout);
+  ok("but it PASSES on the tools path, which applies no transform",
+    toolsChk.status === 0, "status=" + toolsChk.status);
+
+  var fixed = run(["--to", "anthropic-json"], oai.stdout);
+  var f = JSON.parse(fixed.stdout).properties.o;
+  ok("the fix turns the union into anyOf and keeps the subtree",
+    Array.isArray(f.anyOf) && !!f.anyOf[0].properties && f.anyOf[0].properties.a.type === "string",
+    fixed.stdout);
+  var twice = run(["--to", "anthropic-json", "--check"], fixed.stdout);
+  ok("the converted output then passes its own gate", twice.status === 0, "status=" + twice.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

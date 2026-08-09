@@ -1686,5 +1686,144 @@ var PY_SDK_OK = {"properties":{"title":{"maxLength":80,"minLength":2,"pattern":"
     Array.isArray(js.schema.properties.a.type) && js.schema.properties.a.type.length === 2);
 })();
 
+// --- Anthropic: an array-valued `type` is a DISPATCH MISS (Cycle #327) ------
+//
+// Rule 0-bis: #326 fixed union `type` for Gemini's narrow path only, and every
+// provider sharing the code path owes a re-probe. Measured against
+// `@anthropic-ai/sdk@0.116.0` and `anthropic==0.121.0`, the two SDKs fail in
+// OPPOSITE directions:
+//   * JS `_transformJSONSchema` dispatches on `type === "object"` (strict string
+//     equality), so a union `type` skips every branch and `properties`/`items`
+//     are stringified into `description` — the whole subtree stops being schema,
+//     silently, and the transformer never recurses into it.
+//   * Python `transform_schema` types `type` as a `Literal` of seven scalars and
+//     ends in `assert_never`, so ANY list raises `AssertionError` — including
+//     `["string"]` and the canonical `["string","null"]`. No request is built.
+// `anyOf` is the form both accept, verified through both transformers.
+//
+// The input is not hypothetical: it is what OUR OWN `--to openai` emits for an
+// optional object property (the forced-required rewrite from #311).
+(function () {
+  function ant(schema, target) {
+    return E.convert(JSON.parse(JSON.stringify(schema)), target || "anthropic-json");
+  }
+  var OPTIONAL_OBJECT = {
+    type: "object",
+    properties: {
+      o: {
+        type: ["object", "null"],
+        properties: { a: { type: "string" } },
+        required: ["a"],
+        additionalProperties: false
+      },
+      s: { type: "string" }
+    },
+    required: ["o", "s"],
+    additionalProperties: false
+  };
+
+  var js = ant(OPTIONAL_OBJECT);
+  var o = (js && js.schema && js.schema.properties && js.schema.properties.o) || {};
+  ok("anthropic-json rewrites a union `type` that hides an object subtree",
+    Array.isArray(o.anyOf) && o.type === undefined);
+  ok("the object branch keeps `properties`, `required` and `additionalProperties`",
+    Array.isArray(o.anyOf) && !!o.anyOf[0].properties && !!o.anyOf[0].properties.a &&
+    JSON.stringify(o.anyOf[0].required) === '["a"]' &&
+    o.anyOf[0].additionalProperties === false);
+  ok("the null member survives as its own branch",
+    Array.isArray(o.anyOf) && o.anyOf.some(function (b) { return b.type === "null"; }));
+  ok("the rewrite is a real change, not an advisory",
+    !!js && js.ledger.some(function (l) { return l.op === "~" && l.advisory !== true; }));
+  ok("the ledger says the subtree was being stringified, not merely unenforced",
+    has(js.ledger, "never recurses"));
+
+  // Idempotence: an already-`anyOf` schema must not be touched again.
+  var again = ant(js.schema);
+  ok("anthropic-json union rewrite is idempotent",
+    JSON.stringify(again.schema) === JSON.stringify(js.schema));
+
+  // An `array` union hides `items` the same way.
+  var arr = ant({ type: "object", properties: { l: { type: ["array", "null"], items: { type: "string" } } } });
+  var l = arr.schema.properties.l;
+  ok("anthropic-json rewrites a union `type` that hides an array's `items`",
+    Array.isArray(l.anyOf) && !!l.anyOf[0].items && l.anyOf[0].items.type === "string");
+
+  // A `string` union hides `format`, which the string branch WOULD have kept.
+  var fmt = ant({ type: "object", properties: { e: { type: ["string", "null"], format: "email" } } });
+  ok("anthropic-json recovers a `format` the string branch would have kept",
+    Array.isArray(fmt.schema.properties.e.anyOf) &&
+    fmt.schema.properties.e.anyOf[0].format === "email");
+
+  // ...but a union with nothing for the skipped branch to carry loses NOTHING
+  // in JS, so rewriting it would be churn. Being merely stricter than the
+  // vendor is this project's most repeated bug (#312/#314/#317/#322).
+  var bare = ant({ type: "object", properties: { s: { type: ["string", "null"] } } });
+  ok("anthropic-json leaves a bare union `type` alone (JS loses nothing there)",
+    Array.isArray(bare.schema.properties.s.type) &&
+    bare.schema.properties.s.anyOf === undefined);
+  ok("a bare union `type` is not a gate failure on the JS target",
+    blockers(bare).length === 0);
+
+  // The Python target is different in kind: EVERY list throws, so every list
+  // must be rewritten, including the bare one the JS target leaves alone.
+  var pyBare = ant({ type: "object", properties: { s: { type: ["string", "null"] } } }, "anthropic-json-python");
+  ok("anthropic-json-python rewrites even a bare union `type`",
+    Array.isArray(pyBare.schema.properties.s.anyOf));
+  ok("the two anthropic-json targets disagree about the same bare union `type`",
+    JSON.stringify(bare.schema) !== JSON.stringify(pyBare.schema));
+  ok("the Python ledger cites the assert, not the demotion",
+    has(pyBare.ledger, "assert_never"));
+
+  // A one-element list is still a list, so Python still raises on it.
+  var single = ant({ type: "object", properties: { s: { type: ["string"] } } }, "anthropic-json-python");
+  ok("anthropic-json-python unwraps a one-element `type` list",
+    single.schema.properties.s.type === "string");
+
+  // `["null"]` -> the scalar spelling, which both SDKs accept verbatim.
+  var nullOnly = ant({ type: "object", properties: { n: { type: ["null"] } } }, "anthropic-json-python");
+  ok("anthropic-json-python rewrites a null-only list to the scalar `\"null\"`",
+    nullOnly.schema.properties.n.type === "null");
+
+  // Several non-null members WITH keywords: there is no safe way to decide
+  // which branch a keyword belongs to, so this is a human-fix blocker rather
+  // than a guess that silently re-attaches a constraint to the wrong type.
+  var multi = ant({ type: "object", properties: { v: { type: ["string", "integer"], minLength: 2 } } }, "anthropic-json-python");
+  ok("a multi-type union carrying keywords is a blocker, not a guessed split",
+    blockers(multi).length > 0);
+  ok("the multi-type blocker leaves the keyword visible",
+    Array.isArray(multi.schema.properties.v.type));
+
+  // ...but with NO keywords attached the split is exact.
+  var multiBare = ant({ type: "object", properties: { v: { type: ["string", "integer"] } } }, "anthropic-json-python");
+  ok("a multi-type union with no keywords splits exactly",
+    Array.isArray(multiBare.schema.properties.v.anyOf) &&
+    multiBare.schema.properties.v.anyOf.length === 2);
+
+  // `type` beside a combinator: the JS SDK ignores the `type` once it sees
+  // `anyOf`, but Python asserts on the LIST before consulting the combinator.
+  // Bailing silently would be a false pass on a schema that cannot be built.
+  var conflictPy = ant({ type: "object", properties: { v: { type: ["string", "null"], anyOf: [{ type: "string" }] } } }, "anthropic-json-python");
+  ok("a union `type` beside `anyOf` is a blocker on the Python target",
+    blockers(conflictPy).length > 0);
+  var conflictJs = ant({ type: "object", properties: { v: { type: ["string", "null"], anyOf: [{ type: "string" }] } } });
+  ok("...and not a gate failure on the JS target, which ignores the `type`",
+    blockers(conflictJs).length === 0);
+
+  // The tools path applies NO transform, so a union `type` goes on the wire
+  // verbatim and needs no edit there. Verified against `betaTool()`.
+  var tools = ant(OPTIONAL_OBJECT, "anthropic");
+  ok("`--to anthropic` (tools) leaves a union `type` untouched",
+    Array.isArray(tools.schema.properties.o.type) &&
+    !!tools.schema.properties.o.properties);
+  ok("`--to anthropic` reports no blocker for a union `type`",
+    blockers(tools).length === 0);
+
+  // The root is deliberately excluded: a union root is a genuine blocker on
+  // both paths (each helper requires `type === "object"`), already reported.
+  var unionRoot = ant({ type: ["object", "null"], properties: { a: { type: "string" } } });
+  ok("a union `type` at the ROOT stays a blocker rather than being rewritten",
+    blockers(unionRoot).length > 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
