@@ -942,5 +942,29 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     !/declares no element type/.test(run(["--to", "gemini-json", "--check"], LOOSE).stderr));
 })();
 
+// Cycle #337 — the false CI failure this fixes, at the exit-code level.
+// `{"anyOf":[{"type":"string"},{"type":"null"}]}` is verbatim `pydantic
+// 2.13.4` output for `Optional[str] = None` and is ACCEPTED by the live v1beta
+// proto as written. --check used to exit 1 on it and propose an edit.
+(function () {
+  var PYDANTIC_OPTIONAL = JSON.stringify({
+    type: "object", title: "OptionalStr",
+    properties: {
+      title: { type: "string", title: "Title" },
+      note: { anyOf: [{ type: "string" }, { type: "null" }], default: null, title: "Note" }
+    },
+    required: ["title"]
+  });
+  ["gemini", "gemini-client"].forEach(function (t) {
+    var r = run(["--to", t, "--check"], PYDANTIC_OPTIONAL);
+    ok("pydantic `Optional[str]` passes --check --to " + t, r.status === 0);
+    ok("...and no null rewrite is proposed on " + t, !/Rewrote `type: "null"`/.test(r.stderr));
+  });
+  // The standalone form is a genuinely different input and must still be fixed.
+  var STANDALONE_NULL = JSON.stringify({ type: "object", properties: { n: { type: "null" } }, required: ["n"] });
+  ok("a standalone null-only type still needs a change",
+    run(["--to", "gemini", "--check"], STANDALONE_NULL).status === 1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

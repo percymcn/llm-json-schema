@@ -2148,10 +2148,29 @@
   //     the union form is converted to `nullable` correctly.
   // No single document carries nullability to both. That is why this is a target
   // the caller picks and never something inferred from the schema.
-  function normalizeUnionType(node, path, ledger, clientConverts) {
+  function normalizeUnionType(node, path, ledger, clientConverts, inCombinator) {
     var raw = node.type;
     var isList = Array.isArray(raw);
     if (!isList && raw !== "null") return;
+
+    // A scalar `"null"` that is one branch of a union needs NOTHING done to it,
+    // and the rewrite below actively weakens it. Measured 2026-08-09:
+    //   * live v1beta pre-auth proto parse ACCEPTS
+    //     `anyOf:[{type:"string"},{type:"null"}]` (control `{"type":"frobnicate"}`
+    //     in the same slot is rejected, so the oracle was discriminating);
+    //   * `google-genai` 2.17.0 validates it into `types.Schema` without raising
+    //     — `Type` has a `NULL` member;
+    //   * `@google/genai` 2.16.0 reaches the network with it, and throws only for
+    //     the STANDALONE form ("type: null can not be the only possible type for
+    //     the field"), which is what the rewrite below exists for.
+    // Rewriting it produced `{"nullable": true}` — a branch with no `type` at
+    // all, i.e. TYPE_UNSPECIFIED rather than NULL — and made `--check` exit 1 on
+    // a document the proto accepts verbatim. That shape is the canonical
+    // pydantic v2 rendering of `Optional[x]`, so the false failure fired on
+    // essentially every Python schema with an optional field. It is also #329's
+    // tell exactly: the node consists of NOTHING BUT the keyword the rule
+    // rewrites, so the "fix" empties it.
+    if (!isList && inCombinator) return;
 
     var list = isList ? raw : ["null"];
     var hasNull = false;
@@ -2408,11 +2427,11 @@
       }
     });
 
-    walk(s, "root", function (node, path) {
+    walk(s, "root", function (node, path, inCombinator) {
       // Union `type`. Runs before the allowlist strip below so the `nullable` /
       // `anyOf` it produces are already in place when the allowlist sees them
       // (both are fields of `Schema`).
-      normalizeUnionType(node, path, ledger, clientConverts);
+      normalizeUnionType(node, path, ledger, clientConverts, inCombinator);
 
       // An array that declares no element type. The proto ACCEPTS it — measured
       // against the live v1beta endpoint, `{"type":"ARRAY"}` gets past payload
@@ -2617,9 +2636,15 @@
 
   // ---- generic recursive walk ----------------------------------------------
   // Applies fn(node, path) to every schema node, depth-first.
-  function walk(node, path, fn) {
+  // `inCombinator` is true only for a node that is a DIRECT member of an
+  // `anyOf`/`oneOf`/`allOf` array. Some rules are positional: `{"type":"null"}`
+  // standing alone is refused by @google/genai ("type: null can not be the only
+  // possible type for the field") but is ACCEPTED by both clients and by the
+  // live proto when it is one branch of a union. A node deep inside a branch is
+  // not itself a member, so the flag is not inherited.
+  function walk(node, path, fn, inCombinator) {
     if (!isPlainObject(node)) return;
-    fn(node, path);
+    fn(node, path, !!inCombinator);
     if (isPlainObject(node.properties)) {
       Object.keys(node.properties).forEach(function (k) {
         walk(node.properties[k], path + "." + k, fn);
@@ -2637,7 +2662,9 @@
     }
     ["anyOf", "oneOf", "allOf"].forEach(function (kw) {
       if (Array.isArray(node[kw])) {
-        node[kw].forEach(function (sub, i) { walk(sub, path + "/" + kw + "[" + i + "]", fn); });
+        node[kw].forEach(function (sub, i) {
+          walk(sub, path + "/" + kw + "[" + i + "]", fn, true);
+        });
       }
     });
     ["$defs", "definitions"].forEach(function (bag) {

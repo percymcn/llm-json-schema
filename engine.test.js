@@ -2740,5 +2740,118 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     (prop(cc, "mix").anyOf || []).length === 2);
 })();
 
+// ---------------------------------------------------------------------------
+// Cycle #337 — a null BRANCH is not a null-only TYPE.
+//
+// `{"anyOf":[{"type":"string"},{"type":"null"}]}` is the canonical pydantic v2
+// rendering of `Optional[str]`, i.e. the most common shape in Python structured
+// output. We were rewriting the `{"type":"null"}` member to `{"nullable":true}`,
+// which deletes the branch's only content (#329's tell) and made `--check --to
+// gemini` exit 1 on a document the live v1beta proto accepts VERBATIM.
+//
+// Measured 2026-08-09 against the live pre-auth proto parse (control:
+// `{"type":"frobnicate"}` in the same slot is REJECTED, so the oracle was live
+// and discriminating), against `google-genai==2.17.0` and `@google/genai@2.16.0`:
+//   anyOf[string, null]        ACCEPTED by the proto, both clients build it
+//   anyOf[string, {nullable}]  ACCEPTED too — so this is not about acceptance,
+//                              it is about proposing a needless, weakening edit
+//   bare {type:"null"}         ACCEPTED by the proto and by google-genai, but
+//                              @google/genai THROWS "type: null can not be the
+//                              only possible type for the field" -> the rewrite
+//                              is still right for the STANDALONE form.
+// So the rule is POSITIONAL, like `$id` in #318: fine as a branch, fatal alone.
+(function () {
+  // Same guarded helpers as the #336 block: a missing converter must REPORT,
+  // not crash the file, or the revert check proves nothing (#322).
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function prop(r, k) {
+    return (r.schema && r.schema.properties && r.schema.properties[k]) || {};
+  }
+
+  var OPTIONAL_STR = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      note: { anyOf: [{ type: "string" }, { type: "null" }], default: null }
+    },
+    required: ["title"]
+  };
+
+  ["gemini", "gemini-client"].forEach(function (target) {
+    var r = conv(OPTIONAL_STR, target);
+    var note = prop(r, "note");
+    var branches = note.anyOf || [];
+    ok(target + ": a `{type:null}` anyOf branch keeps its type",
+      branches.length === 2 && branches[1].type === "null");
+    ok(target + ": the null branch is not replaced by a typeless `nullable`",
+      branches.every(function (b) { return b.nullable === undefined; }));
+    ok(target + ": no edit is proposed for a schema the proto accepts verbatim",
+      !has(r.ledger, "Rewrote `type: \"null\"`"));
+  });
+
+  // The standalone form must still be rewritten — @google/genai refuses it.
+  var alone = conv({ type: "object", properties: { n: { type: "null" } }, required: ["n"] }, "gemini");
+  ok("a STANDALONE null-only type is still rewritten to `nullable`",
+    prop(alone, "n").nullable === true && prop(alone, "n").type === undefined);
+
+  // A one-element LIST is a different input: `types.Schema.type` is single
+  // valued, so google-genai refuses `["null"]` even inside a union branch.
+  var listInBranch = conv({
+    type: "object",
+    properties: { n: { anyOf: [{ type: "string" }, { type: ["null"] }] } },
+    required: ["n"]
+  }, "gemini");
+  ok("a one-element LIST `[\"null\"]` in a branch is still normalized",
+    (prop(listInBranch, "n").anyOf || [])[1].nullable === true);
+
+  // The flag must not be inherited: a null-only type nested INSIDE a branch is
+  // standalone at its own position and still needs the rewrite.
+  var nested = conv({
+    type: "object",
+    properties: {
+      n: { anyOf: [{ type: "object", properties: { deep: { type: "null" } }, required: ["deep"] }, { type: "null" }] }
+    },
+    required: ["n"]
+  }, "gemini");
+  var deep = ((prop(nested, "n").anyOf || [])[0] || {}).properties || {};
+  ok("the combinator flag is not inherited by nodes inside a branch",
+    deep.deep && deep.deep.nullable === true && deep.deep.type === undefined);
+
+  // Verbatim agno 2.8.7 / pydantic 2.13.4 payloads (#311: fixtures must be real
+  // generator output). `needs_conversion()` is agno's switch into its own Gemini
+  // converter, and it is blind to `$defs`/`$ref` and `anyOf`, so an identical
+  // `Dict[str,str]` field is treated three different ways depending on where it
+  // sits. All three of these are ours to blocker, and measured that way.
+  var AGNO_NESTED_DICT = {
+    $defs: { Inner: { type: "object", title: "Inner",
+      properties: { tags: { type: "object", additionalProperties: { type: "string" }, title: "Tags" } },
+      required: ["tags"] } },
+    type: "object", title: "NestedWithDict",
+    properties: { title: { type: "string", title: "Title" }, inner: { $ref: "#/$defs/Inner" } },
+    required: ["title", "inner"]
+  };
+  var AGNO_OPTIONAL_DICT = {
+    type: "object", title: "OptionalDict",
+    properties: {
+      title: { type: "string", title: "Title" },
+      tags: { anyOf: [{ type: "object", additionalProperties: { type: "string" } }, { type: "null" }],
+        default: null, title: "Tags" }
+    },
+    required: ["title"]
+  };
+  ok("agno: a Dict hidden behind a `$ref` is still an open map to us",
+    has(conv(AGNO_NESTED_DICT, "gemini").ledger, "open map"));
+  ok("agno: a Dict hidden inside `anyOf` is still an open map to us",
+    has(conv(AGNO_OPTIONAL_DICT, "gemini").ledger, "open map"));
+  // ...and the null branch of that same optional dict is left alone.
+  ok("agno: fixing the null branch did not disturb the open-map blocker",
+    !has(conv(AGNO_OPTIONAL_DICT, "gemini").ledger, "Rewrote `type: \"null\"`"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
