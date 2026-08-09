@@ -3221,5 +3221,149 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(conv(CW_TUPLE_RF, "openai").ledger, "Collapsed a 4-element tuple"));
 })();
 
+// --- #341 llama-index-core: a five-key top-level KEEP-list, and the classifier
+// --- that decides whether the input is a schema at all -----------------------
+//
+// `ToolMetadata.get_parameters_dict()` (llama-index-core==0.14.23) filters the
+// pydantic schema down to exactly {type, properties, required, definitions,
+// $defs}. VERBATIM outputs of that filter, captured 2026-08-09 against
+// pydantic==2.13.4, with the top-level `additionalProperties = False` that
+// llama-index-llms-openai then bolts on (base.py:997 unconditionally,
+// responses.py:901 only under strict).
+(function () {
+  // RootModel[Inner]: pydantic emits {$ref, $defs, title}; the filter keeps the
+  // BAG and drops the POINTER, so the tool arrives describing nothing at all.
+  var LI_ROOT_REF = {
+    "$defs": { "Inner": { "properties": { "x": { "title": "X", "type": "integer" } },
+                          "required": ["x"], "title": "Inner", "type": "object" } },
+    "additionalProperties": false
+  };
+  // RootModel[Union[A,B]]: the same, via a dropped root `anyOf`.
+  var LI_ROOT_UNION = {
+    "$defs": { "A": { "properties": { "kind": { "const": "a", "title": "Kind", "type": "string" } },
+                      "required": ["kind"], "title": "A", "type": "object" },
+               "B": { "properties": { "kind": { "const": "b", "title": "Kind", "type": "string" } },
+                      "required": ["kind"], "title": "B", "type": "object" } },
+    "additionalProperties": false
+  };
+
+  // (1) THE CLASSIFIER. `looksLikeSchema()` was an eight-key allowlist, so this
+  // document -- which has none of those eight -- was classified as DATA and fed
+  // to inferSchema(), producing a schema OF THE SCHEMA that the vendor accepts
+  // verbatim. `inferred` is the observable.
+  ok("li: a $defs-only root is classified as a schema, not data",
+    E.convert(LI_ROOT_REF, "openai").inferred === false);
+  ok("li: a dropped root anyOf is classified as a schema, not data",
+    E.convert(LI_ROOT_UNION, "openai").inferred === false);
+
+  // Every root-keyword-only shape measured this cycle. Annotation-only keys and
+  // `{}` are DELIBERATELY left ambiguous (a book record has `title` and
+  // `description` too), so they are asserted the other way, below.
+  var KEYWORD_ROOTS = [
+    ["definitions bag", { definitions: { I: { type: "object" } } }],
+    ["open map, no type", { additionalProperties: { type: "string" } }],
+    ["items, no type", { items: { type: "string" } }],
+    ["prefixItems, no type", { prefixItems: [{ type: "integer" }] }],
+    ["const only", { "const": "x" }],
+    ["not only", { "not": { type: "string" } }],
+    ["required only", { required: ["a"] }],
+    ["patternProperties", { patternProperties: { "^a": { type: "string" } } }],
+    ["format only", { format: "email" }],
+    ["minimum only", { minimum: 0 }],
+    ["if/then", { "if": { type: "string" }, "then": { minLength: 1 } }],
+    ["contains", { contains: { type: "integer" } }],
+    ["propertyNames", { propertyNames: { pattern: "^a" } }],
+    ["unevaluatedProperties", { unevaluatedProperties: false }],
+    ["dependentRequired", { dependentRequired: { a: ["b"] } }]
+  ];
+  var misread = KEYWORD_ROOTS.filter(function (c) {
+    return E.convert(c[1], "openai").inferred !== false;
+  });
+  ok("li: no root-keyword-only schema is misread as data (" +
+     KEYWORD_ROOTS.length + " shapes)", KEYWORD_ROOTS.length > 0 && misread.length === 0);
+
+  // The other direction, and it is why the rule is not "any key is a keyword":
+  // ordinary data objects carry keys that happen to be keywords.
+  var DATA = [
+    ["invoice: items + total", { items: [{ sku: "a" }], total: 12.5 }],
+    ["items holding numbers", { items: [1, 2, 3] }],
+    ["book: title + description", { title: "Dune", description: "a novel" }],
+    ["plain record", { name: "ada", age: 36 }],
+    ["format as a data key", { format: "pdf", url: "x" }],
+    ["required as a boolean", { required: true }],
+    ["pattern as a fabric", { pattern: "stripes", color: "red" }],
+    ["default alone", { "default": 5 }],
+    ["empty object", {}]
+  ];
+  var flipped = DATA.filter(function (c) { return E.convert(c[1], "openai").inferred !== true; });
+  ok("li: ordinary data objects are still inferred from (" + DATA.length + " controls)",
+    DATA.length > 0 && flipped.length === 0);
+
+  // (2) THE ROOT RULE. Measured on openai@7.4.0's toStrictJsonSchema(): the root
+  // test is a literal `type === "object"` comparison, so EVERY typeless root
+  // throws -- including one that declares `properties`.
+  var ro = E.convert(LI_ROOT_REF, "openai");
+  var roBlockers = ro.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
+  ok("openai: a root with no type and no properties is a blocker", roBlockers.length >= 1);
+  ok("openai: the blocker names the surviving bag and the dropped pointer",
+    has(ro.ledger, "definitions survived and the pointer"));
+  ok("openai: the blocker names llama-index as a measured producer",
+    has(ro.ledger, "get_parameters_dict"));
+  ok("openai: the blocker refuses the type: object repair by name",
+    has(ro.ledger, "only legal value is `{}`"));
+  ok("openai: and does NOT add type: object to a rootless schema",
+    ro.schema.type === undefined);
+
+  // The other arm: a typeless root that DOES describe an object is repaired
+  // losslessly, because supplying the `type` leaves the properties intact.
+  var tp = E.convert({ properties: { a: { type: "string" } }, required: ["a"] }, "openai");
+  ok("openai: a typeless root WITH properties gets type: object added",
+    tp.schema.type === "object" &&
+    tp.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+  ok("openai: and says why declaring properties was not enough",
+    has(tp.ledger, "declaring `properties` is not enough"));
+
+  // ORDERING GUARD. A single-member object `allOf` is ACCEPT-repaired by the
+  // vendor because it flattens first. The root check therefore has to run after
+  // the walk; running it earlier blocked a schema the vendor accepts.
+  var ao = E.convert({ allOf: [{ type: "object", properties: { a: { type: "string" } },
+                                 required: ["a"], additionalProperties: false }] }, "openai");
+  ok("openai: a single-member object allOf root is NOT blocked",
+    ao.schema.type === "object" &&
+    ao.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+
+  // (3) ANTHROPIC. Measured on @anthropic-ai/sdk@0.116.0: betaTool() AND
+  // betaJSONSchemaOutputFormat() each throw `JSON schema ... must be an object,
+  // but got undefined`. The tools target had two arms (typeless-but-object,
+  // typed-as-something-else) and this fell through both, exiting 0.
+  ["anthropic", "anthropic-json"].forEach(function (tgt) {
+    var r = E.convert(LI_ROOT_REF, tgt);
+    ok(tgt + ": a rootless schema is a blocker",
+      r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length >= 1);
+  });
+  ok("anthropic: the blocker quotes both helpers",
+    has(E.convert(LI_ROOT_REF, "anthropic").ledger, "must be an object, but got undefined"));
+
+  // GUARD: the Python target deliberately keeps a root `$ref` (the Python SDK
+  // passes it verbatim). A `$ref` root is typeless but is NOT rootless, so the
+  // new arm must not fire on it.
+  var REF_ROOT = { "$ref": "#/$defs/I",
+                   "$defs": { I: { type: "object", properties: { x: { type: "integer" } } } } };
+  ok("anthropic-json-python: a root $ref is still not a rootless blocker",
+    !has(E.convert(REF_ROOT, "anthropic-json-python").ledger, "declares no object shape at all"));
+
+  // (4) GEMINI IS DELIBERATELY UNCHANGED, and it was measured rather than
+  // assumed (#314's no-porting rule): google-genai==2.17.0's `types.Schema`
+  // ACCEPTS a typeless root with properties and accepts a bare `{}`. There is no
+  // root-must-be-object rule in that proto, so adding one would be the
+  // over-strictness class this project has shipped five times.
+  ["gemini", "gemini-json", "gemini-client"].forEach(function (tgt) {
+    ok(tgt + ": a typeless root with properties is not blocked",
+      E.convert({ properties: { a: { type: "string" } }, required: ["a"] }, tgt)
+        .ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+  });
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

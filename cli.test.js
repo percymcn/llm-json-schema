@@ -966,5 +966,47 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     run(["--to", "gemini", "--check"], STANDALONE_NULL).status === 1);
 })();
 
+// --- #341: llama-index RootModel tool params reach the CLI as a rootless schema
+(function () {
+  // Verbatim `ToolMetadata.get_parameters_dict()` output for a RootModel tool,
+  // plus the top-level additionalProperties llama-index-llms-openai adds.
+  var LI_ROOT_REF = JSON.stringify({
+    "$defs": { "Inner": { "properties": { "x": { "title": "X", "type": "integer" } },
+                          "required": ["x"], "title": "Inner", "type": "object" } },
+    "additionalProperties": false
+  });
+
+  var o = run(["--to", "openai", "--check"], LI_ROOT_REF);
+  ok("li rootless: --to openai exits 3, not 0", o.status === 3, "status=" + o.status);
+  ok("li rootless: it is NOT reported as an inferred example",
+    o.stderr.indexOf("inferred a schema from it") === -1, o.stderr);
+  ok("li rootless: the diagnosis names the dropped pointer",
+    o.stderr.indexOf("the pointer") !== -1, o.stderr);
+
+  var a = run(["--to", "anthropic", "--check"], LI_ROOT_REF);
+  ok("li rootless: --to anthropic exits 3, not 0", a.status === 3, "status=" + a.status);
+
+  // Gemini's proto has no root-must-be-object rule (measured on
+  // google-genai==2.17.0), so this must NOT become a blocker there.
+  var g = run(["--to", "gemini-json", "--check"], LI_ROOT_REF);
+  ok("li rootless: --to gemini-json is not blocked", g.status !== 3, "status=" + g.status);
+
+  // A typeless root that DOES declare properties is a fixable 1, not a 3 --
+  // the whole point of separating the two arms.
+  var tp = run(["--to", "openai", "--check"],
+    JSON.stringify({ properties: { a: { type: "string" } }, required: ["a"] }));
+  ok("typeless root WITH properties is fixable (1), not a blocker (3)",
+    tp.status === 1, "status=" + tp.status);
+  var fixed = JSON.parse(run(["--to", "openai"],
+    JSON.stringify({ properties: { a: { type: "string" } }, required: ["a"] })).stdout);
+  ok("and the fix supplies type: object", fixed.type === "object", JSON.stringify(fixed));
+
+  // The example-inference feature still works, and still says so.
+  var ex = run(["--to", "openai"], JSON.stringify({ items: [{ sku: "a" }], total: 12.5 }));
+  ok("an invoice example is still treated as an example",
+    ex.stderr.indexOf("inferred a schema from it") !== -1, ex.stderr);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

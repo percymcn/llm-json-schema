@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 494 engine + 158 CLI + 33 ESM/library assertions = **685** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 513 engine + 166 CLI + 33 ESM/library assertions = **712** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -441,7 +441,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 685 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 712 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -510,6 +510,71 @@ The same file through all three, verified end-to-end:
 | raw | kept | **string (invented)** | **1 of 2** | rejected |
 | `--to gemini` | **lost** | integer | both | **accepted** |
 | `--to gemini-client` | kept | integer | both | rejected *(by design)* |
+
+
+## A root with no `type` is rejected, and one framework produces it by accident
+
+OpenAI strict mode tests the **root** with a literal `type === "object"`
+comparison — not the properties-presence test its *nested* object rules use.
+Measured on `openai@7.4.0`'s `toStrictJsonSchema()`, every typeless root throws
+`Root schema must have type: 'object' but got type: undefined`, **including**
+`{"properties": {...}, "required": [...]}`, which is an object in every sense but
+the declared one. Anthropic agrees on both of its paths: `betaTool()` and
+`betaJSONSchemaOutputFormat()` (`@anthropic-ai/sdk@0.116.0`) each throw
+`JSON schema ... must be an object, but got undefined`. Gemini does **not** —
+`google-genai==2.17.0`'s `types.Schema` accepts a typeless root and even a bare
+`{}` — so this is a blocker on OpenAI and Anthropic and deliberately nothing on
+the three Gemini targets.
+
+The two cases are treated differently, because what matters is what the root has
+*left* once the missing `type` is supplied:
+
+| root | verdict |
+|---|---|
+| declares `properties` | **fixed** — `type: "object"` added; lossless |
+| declares nothing | **blocked** — adding `type: "object"` is *also* accepted, and leaves an object whose only legal value is `{}` |
+
+A rootless root is not hypothetical. `llama-index-core==0.14.23`'s
+`ToolMetadata.get_parameters_dict()` filters a Pydantic schema down to exactly
+five top-level keys — `type`, `properties`, `required`, `definitions`, `$defs` —
+so for a `RootModel` tool it **keeps the definition bag and drops the pointer
+into it**:
+
+```python
+class Inner(BaseModel):
+    x: int
+class RootRef(RootModel[Inner]):
+    pass
+# pydantic  -> {"$ref": "#/$defs/Inner", "$defs": {...}, "title": "RootRef"}
+# llama-index -> {"$defs": {...}}          # the $ref is gone
+```
+
+Measured end to end: the *raw* Pydantic schema is `ACCEPT`ed by
+`toStrictJsonSchema()` (it inlines the root `$ref`), and the schema llama-index
+actually sends `THROW`s. The same filter drops a root `anyOf` (so
+`RootModel[Union[A, B]]` loses the whole union), a root `items` (so
+`RootModel[List[int]]` becomes `{"type": "array"}` with no element type), and any
+top-level `additionalProperties: false` you set with `ConfigDict(extra="forbid")`.
+
+### The classifier that hid it
+
+`llm-json-schema` accepts either a schema or an example JSON object and infers a
+schema from the latter. That decision used to be an eight-key test — `type`,
+`properties`, `$schema`, `$ref`, `anyOf`, `oneOf`, `allOf`, `enum`. JSON Schema
+has roughly forty root-legal keywords, so `{"$defs": {...}}` matched none of
+them, was classified as **data**, and came back as a schema describing the
+document's own syntax — which `toStrictJsonSchema()` accepts verbatim, because it
+is a perfectly valid schema. It is just about the wrong thing. Nineteen of
+nineteen root-keyword-only schemas were misclassified.
+
+The rule is now: every root key must be a JSON Schema keyword, **each keyword's
+value must have the shape that keyword requires**, and at least one must be an
+applicator or validator rather than an annotation. That keeps ordinary data out —
+`{"items": [...], "total": 12.5}` has a non-keyword key, `{"items": [1, 2, 3]}`
+holds numbers where subschemas belong — and leaves the two genuinely ambiguous
+cases (`{"title": ..., "description": ...}` alone, and `{}`) classified as data,
+unchanged. The CLI still prints `note: input looked like an example object` when
+it infers, and `--mode schema` still forces the other reading.
 
 
 ## License

@@ -269,19 +269,110 @@
     return {};
   }
 
+  // ---- schema-vs-example classification ------------------------------------
+  // This decides which of two COMPLETELY DIFFERENT operations runs, so getting
+  // it wrong is not a wrong answer, it is an answer about a different document.
+  //
+  // The original test was an eight-key allowlist (`type`, `properties`,
+  // `$schema`, `$ref`, `anyOf`, `oneOf`, `allOf`, `enum`). JSON Schema has
+  // roughly forty root-legal keywords, so a schema whose root happens to use
+  // none of those eight was classified as DATA and fed to `inferSchema()`,
+  // which then described the schema's own syntax as if it were a payload. The
+  // output is a perfectly valid strict schema — `toStrictJsonSchema()` accepts
+  // it verbatim — that asks the model to emit JSON Schema instead of the
+  // caller's data. Measured producer (#341): `llama-index-core==0.14.23`'s
+  // `ToolMetadata.get_parameters_dict()` keeps only five top-level keys, so a
+  // `RootModel` tool schema arrives as `{"$defs": {...}}` — no `type`, no
+  // `properties`, no `$ref`, because the filter drops the pointer and keeps the
+  // bag. Nineteen of nineteen root-keyword-only schemas were misclassified.
+  //
+  // Widening to "any key is a keyword" would break the other direction: an
+  // ordinary invoice example `{"items": [...], "total": 12.5}` has a key named
+  // `items`. So the rule is stricter on both counts —
+  //   (a) EVERY root key must be a JSON Schema keyword (a data object almost
+  //       always carries at least one key that is not), and
+  //   (b) each keyword's VALUE must have the shape that keyword requires
+  //       (`{"items": [1,2,3]}` is data: array-form `items` holds subschemas,
+  //       not numbers), and
+  //   (c) at least one must be an APPLICATOR or VALIDATOR, not merely an
+  //       annotation — `{"title": "Dune", "description": "..."}` is a book
+  //       record as readily as an annotation-only schema, and that ambiguity is
+  //       genuine, so it is deliberately left classified as data (unchanged).
+
+  // Annotations only: legal in a schema, equally legal as data keys.
+  var ANNOTATION_KEYWORDS = {
+    title: 1, description: 1, "default": 1, examples: 1,
+    deprecated: 1, readOnly: 1, writeOnly: 1, $comment: 1
+  };
+
+  // Keyword -> predicate on its value. Being wrong about the SHAPE is how a
+  // data key sneaks in, so every keyword states what it must hold.
+  function isSubschema(v) { return isPlainObject(v) || typeof v === "boolean"; }
+  function isSubschemaArray(v) { return Array.isArray(v) && v.length > 0 && v.every(isSubschema); }
+  function isSubschemaMap(v) {
+    if (!isPlainObject(v)) return false;
+    var ks = Object.keys(v);
+    return ks.length > 0 && ks.every(function (k) { return isSubschema(v[k]); });
+  }
+  function isStringArray(v) {
+    return Array.isArray(v) && v.every(function (x) { return typeof x === "string"; });
+  }
+  var isNum = function (v) { return typeof v === "number" && isFinite(v); };
+  var isStr = function (v) { return typeof v === "string"; };
+  var isBool = function (v) { return typeof v === "boolean"; };
+  var anyValue = function () { return true; };
+
+  var SCHEMA_KEYWORD_SHAPE = {
+    // applicators taking a single subschema
+    items: function (v) { return isSubschema(v) || isSubschemaArray(v); },
+    additionalItems: isSubschema, contains: isSubschema, "not": isSubschema,
+    "if": isSubschema, then: isSubschema, "else": isSubschema,
+    propertyNames: isSubschema, additionalProperties: isSubschema,
+    unevaluatedProperties: isSubschema, unevaluatedItems: isSubschema,
+    // applicators taking a map of subschemas
+    $defs: isSubschemaMap, definitions: isSubschemaMap, properties: isSubschemaMap,
+    patternProperties: isSubschemaMap, dependentSchemas: isSubschemaMap,
+    // applicators taking an array of subschemas
+    anyOf: isSubschemaArray, oneOf: isSubschemaArray, allOf: isSubschemaArray,
+    prefixItems: isSubschemaArray,
+    // references and identity
+    $ref: isStr, $schema: isStr, $id: isStr, $anchor: isStr, $dynamicRef: isStr,
+    // validators
+    type: function (v) { return isStr(v) || isStringArray(v); },
+    "enum": function (v) { return Array.isArray(v); },
+    "const": anyValue,
+    required: isStringArray,
+    dependentRequired: isPlainObject,
+    minimum: isNum, maximum: isNum, exclusiveMinimum: isNum, exclusiveMaximum: isNum,
+    multipleOf: isNum,
+    minLength: isNum, maxLength: isNum, pattern: isStr, format: isStr,
+    contentEncoding: isStr, contentMediaType: isStr,
+    minItems: isNum, maxItems: isNum, uniqueItems: isBool,
+    minContains: isNum, maxContains: isNum,
+    minProperties: isNum, maxProperties: isNum,
+    nullable: isBool, discriminator: isPlainObject, propertyOrdering: isStringArray
+  };
+
   // Detect whether pasted JSON is a schema or an example.
   function looksLikeSchema(obj) {
     if (!isPlainObject(obj)) return false;
-    return (
-      "type" in obj ||
-      "properties" in obj ||
-      "$schema" in obj ||
-      "$ref" in obj ||
-      "anyOf" in obj ||
-      "oneOf" in obj ||
-      "allOf" in obj ||
-      "enum" in obj
-    );
+    // Fast path, unchanged: these eight are decisive on their own.
+    if ("type" in obj || "properties" in obj || "$schema" in obj || "$ref" in obj ||
+        "anyOf" in obj || "oneOf" in obj || "allOf" in obj || "enum" in obj) return true;
+
+    var keys = Object.keys(obj);
+    if (!keys.length) return false;           // `{}` is genuinely ambiguous — unchanged.
+    var sawSubstantive = false;
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (ANNOTATION_KEYWORDS[k]) continue;   // legal, but proves nothing.
+      var shape = Object.prototype.hasOwnProperty.call(SCHEMA_KEYWORD_SHAPE, k)
+        ? SCHEMA_KEYWORD_SHAPE[k] : null;
+      if (!shape || !shape(obj[k])) return false;  // a non-keyword, or a keyword
+                                                   // holding data -> it is data.
+      sawSubstantive = true;
+    }
+    return sawSubstantive;
   }
 
   // ---- OpenAI Structured Outputs (strict) ----------------------------------
@@ -822,6 +913,14 @@
     var s = clone(schema);
     var ledger = [];
 
+    // Captured BEFORE anything runs: the rootless-root diagnostic below depends
+    // on whether a definition bag arrived, and the orphan-`$defs` pruner deletes
+    // exactly that bag on its way past (nothing references it, precisely
+    // because the pointer is what went missing). Reading it at the end reads it
+    // after the evidence has been cleaned up.
+    var bagAtEntry = isPlainObject(schema.$defs) ? "$defs"
+      : (isPlainObject(schema.definitions) ? "definitions" : null);
+
     s = normalizeRefSpelling(s, ledger);
     s = normalizeDefs(s, ledger);
     s = inlineRootRef(s, ledger);
@@ -1073,6 +1172,55 @@
         }
       }
     });
+
+    // The ROOT `type` check runs LAST, because the walk above can supply the
+    // `type` itself — a single-member object `allOf` is flattened there, and the
+    // vendor accepts that exact input for the same reason. Running this earlier
+    // blocked a schema the vendor repairs, which is the over-strictness class
+    // this project has shipped five times (#312/#314/#317/#322/#337).
+    //
+    // MEASURED against openai@7.4.0's toStrictJsonSchema(): the root test is a
+    // literal `type === "object"` comparison, NOT the properties-presence test
+    // its nested object rules use (#329). Every typeless root throws `Root
+    // schema must have type: 'object' but got type: undefined` — including
+    // `{"properties": {...}, "required": [...]}`, which is an object in every
+    // sense but the declared one.
+    if (!s.type && !s.anyOf) {
+      // Two situations, and per #329 what separates them is what the root has
+      // LEFT once the missing `type` is supplied.
+      if (isPlainObject(s.properties) && Object.keys(s.properties).length) {
+        // Lossless: it already describes an object, it just never said so.
+        s.type = "object";
+        ledger.push(entry("+", "root",
+          "Added `type: \"object\"` at the root. OpenAI strict mode tests the root with a " +
+          "literal `type === \"object\"` check — unlike its nested object rules, declaring " +
+          "`properties` is not enough — so this root was rejected even though it plainly " +
+          "describes an object.",
+          DOCS.openai));
+      } else {
+        // Adding `type: "object"` here would ALSO be accepted, and that is the
+        // problem: the result is an object with no properties, whose only legal
+        // value is `{}`. A rejection you can see beats a schema that is valid
+        // and dead, so this is a blocker and the `type` is deliberately not
+        // supplied (#329's rule, #340's shape).
+        var bag = bagAtEntry;
+        ledger.push(entry("!", "root",
+          "The root declares no object shape at all — no `type`, no `properties`, and " +
+          "nothing left to inline. OpenAI strict mode rejects it (`Root schema must have " +
+          "type: 'object' but got type: undefined`)." +
+          (bag
+            ? " A `" + bag + "` bag is still here, so the definitions survived and the pointer " +
+              "into them — a root `$ref` or `anyOf` — did not. One measured producer: " +
+              "`llama-index-core`'s `ToolMetadata.get_parameters_dict()` keeps only `type`, " +
+              "`properties`, `required`, `definitions` and `$defs`, so a `RootModel` tool " +
+              "schema arrives as its own definition bag with no way in. Restore the root " +
+              "`$ref`, or inline the definition you meant."
+            : " Declare the properties you expect.") +
+          " Do NOT just add `type: \"object\"`: the API accepts that, and the result is an " +
+          "object whose only legal value is `{}` — a parameter that can never be populated.",
+          DOCS.openai));
+      }
+    }
 
     // Every edit above is justified by strict mode, and `strict` is optional at four
     // declaration sites in openai@7.4.0 — so a caller who never set it is being shown
@@ -1630,6 +1778,35 @@
       ledger.push(entry("!", "root",
         "The root must be an object on BOTH Anthropic paths — `betaTool()` and " +
         "`jsonSchemaOutputFormat()` each throw on a non-object root. Wrap this schema in an object.",
+        url));
+    } else if (!s.type && !s.$ref && !s.anyOf && !s.oneOf && !s.allOf) {
+      // The third arm, and it was missing: a root with NO `type` and nothing to
+      // read a type from. The two arms above cover "typeless but plainly an
+      // object" and "typed as something else"; a root that declares neither fell
+      // through both and `--to anthropic` exited 0 on it. MEASURED on
+      // @anthropic-ai/sdk@0.116.0: `betaTool()` throws `JSON schema for tool "t"
+      // must be an object, but got undefined` and `jsonSchemaOutputFormat()`
+      // throws the same, so this is a rejection on BOTH paths, not just the
+      // transformed one.
+      //
+      // No repair, for the reason #329 gives: supplying `type: "object"` here
+      // would be accepted and would leave an object with no properties, whose
+      // only legal value is `{}`.
+      var abag = isPlainObject(s.$defs) ? "$defs"
+        : (isPlainObject(s.definitions) ? "definitions" : null);
+      ledger.push(entry("!", "root",
+        "The root declares no object shape at all — no `type`, no `properties`, and nothing left " +
+        "to inline. Both Anthropic paths reject it: `betaTool()` and `jsonSchemaOutputFormat()` " +
+        "each throw \"JSON schema ... must be an object, but got undefined\"." +
+        (abag
+          ? " A `" + abag + "` bag is still here, so the definitions survived and the pointer into " +
+            "them — a root `$ref` or `anyOf` — did not. One measured producer: `llama-index-core`'s " +
+            "`ToolMetadata.get_parameters_dict()` keeps only `type`, `properties`, `required`, " +
+            "`definitions` and `$defs`, so a `RootModel` tool schema arrives as its own definition " +
+            "bag with no way in. Restore the root `$ref`, or inline the definition you meant."
+          : " Declare the properties you expect.") +
+        " Do NOT just add `type: \"object\"`: that is accepted, and it leaves an object whose only " +
+        "legal value is `{}` — a tool input that can never be populated.",
         url));
     }
 
