@@ -1263,19 +1263,73 @@
             "silently remove every constraint inside it.",
             DOCS.openai));
         } else if (members.length === 1) {
-          var only = members[0];
-          if (isPlainObject(only)) {
-            Object.keys(only).forEach(function (k) {
-              if (!(k in node)) node[k] = clone(only[k]);
+          // A single-member `allOf` is NOT a special case. Measured on
+          // openai@7.4.0: the vendor applies the SAME merge it applies to N
+          // members — `{properties:{kind},required:["kind"],allOf:[{properties:
+          // {a},required:["a"]}]}` comes back carrying BOTH `kind` and `a` with
+          // a union `required`. The old code copied a member key only
+          // `if (!(k in node))`, i.e. PARENT WINS, so a parent that already had
+          // `properties` silently DISCARDED the member's `properties` and
+          // `required` — and the ledger line said "Nothing is lost."
+          // That reading is right for ANNOTATIONS (title/description belong to
+          // the wrapper) and is a deletion for anything that carries
+          // constraints. The N-member branch below has always merged correctly;
+          // the special case was the broken one.
+          var only = isPlainObject(members[0]) ? members[0] : null;
+          var onlyProps = only && isPlainObject(only.properties) ? only.properties : null;
+          // The vendor throws when the same property name is declared on both
+          // sides with DIFFERENT subschemas ("cannot be merged without changing
+          // Draft 7 validation"), and accepts when they are identical — so the
+          // test is conflict, not duplication. canonical() so key order does
+          // not manufacture a conflict.
+          var clash = null;
+          if (onlyProps && isPlainObject(node.properties)) {
+            Object.keys(onlyProps).forEach(function (k) {
+              if (clash === null && k in node.properties &&
+                  canonical(node.properties[k]) !== canonical(onlyProps[k])) clash = k;
             });
           }
-          delete node.allOf;
-          ledger.push(entry("~", path,
-            "Flattened a single-member `allOf` into this node — OpenAI's own transformer does exactly " +
-            "this, keeping the wrapper's annotations. Nothing is lost. (A `$ref` wrapped in `allOf` " +
-            "beside a `description` is the standard Pydantic output for a referenced model with a " +
-            "field description.)",
-            DOCS.openai));
+          if (clash !== null) {
+            allOfBlocked = true;
+            ledger.push(entry("!", path,
+              "This node and its single-member `allOf` both declare a property `" + clash + "`, with " +
+              "different schemas. OpenAI's transformer refuses exactly this (\"Object allOf ... cannot " +
+              "be merged without changing Draft 7 validation\") and so do we: picking either side would " +
+              "silently change what the schema accepts. Declare `" + clash + "` once, with the shape " +
+              "you actually mean.",
+              DOCS.openai));
+          } else {
+            if (onlyProps) {
+              // Merge, do not overwrite. Union of `properties` and of `required`.
+              if (!node.properties) node.properties = {};
+              Object.keys(onlyProps).forEach(function (k) {
+                if (!(k in node.properties)) node.properties[k] = clone(onlyProps[k]);
+              });
+              var oneReq = Array.isArray(only.required) ? only.required : [];
+              var baseReq = Array.isArray(node.required) ? node.required : [];
+              oneReq.forEach(function (k) { if (baseReq.indexOf(k) === -1) baseReq.push(k); });
+              if (baseReq.length) node.required = baseReq;
+              if (node.type === undefined) node.type = "object";
+            }
+            if (only) {
+              // Everything else (annotations, `$ref`, `type`, …) keeps the
+              // wrapper-wins rule, which is what makes the standard Pydantic v1
+              // shape — `{title, description, allOf:[{$ref}]}` — come out as a
+              // `$ref` beside metadata, the form the vendor accepts.
+              Object.keys(only).forEach(function (k) {
+                if (k === "properties" || k === "required") return;
+                if (!(k in node)) node[k] = clone(only[k]);
+              });
+            }
+            delete node.allOf;
+            ledger.push(entry("~", path,
+              "Flattened a single-member `allOf` into this node, merging its `properties` and " +
+              "`required` with this node's rather than letting either side win — OpenAI's own " +
+              "transformer performs the same merge. (A `$ref` wrapped in `allOf` beside a " +
+              "`description` is the standard Pydantic v1 output for a referenced model with a field " +
+              "description; that shape has nothing to merge and is unchanged.)",
+              DOCS.openai));
+          }
         } else {
           var mergedProps = {}, mergedReq = [];
           members.forEach(function (m) {

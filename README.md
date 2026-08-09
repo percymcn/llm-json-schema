@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 677 engine + 197 CLI + 34 ESM/library assertions = **908** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 687 engine + 197 CLI + 34 ESM/library assertions = **918** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -102,7 +102,7 @@ Each provider accepts a different schema dialect, so a schema that works with on
 
   Three rules here are *conditional*, and a flat "is this keyword allowed?" list gets all three wrong:
   - **`oneOf`** is rewritten to `anyOf` **only when the branches are provably mutually exclusive**. `oneOf` means exactly one branch matches and `anyOf` means at least one, so rewriting an overlapping union silently widens it. `openai@7.4.0`'s `helpers/standard-schema.js` proves exclusivity first and otherwise throws: *"OpenAI strict schemas do not support `oneOf`; use `anyOf` or add a discriminator with distinct literal values."* We follow that rule and flag the unprovable case instead of guessing. (Note the vendor's own two helper families disagree: the five `helpers/zod.js` builders run `toStrictJsonSchema()` alone, which passes a non-exclusive `oneOf` straight through to the API.)
-  - **`allOf`** is **not** flatly unsupported. A single-member `allOf` is flattened (annotations kept) and an `allOf` of *open* object schemas is merged; only closed-object members (*"cannot be merged without changing Draft 7 validation"*) and multi-member non-object `allOf` throw. `{"allOf": [{"$ref": …}], "description": …}` — the standard Pydantic output for a referenced model with a field description — is therefore perfectly valid, and stripping it would delete the whole subschema.
+  - **`allOf`** is **not** flatly unsupported. An `allOf` of *open* object schemas is merged — the union of their `properties` and of their `required` — and **a single member is not a special case: it takes the same merge.** Measured on `openai@7.4.0`, `{"properties":{"kind":…},"required":["kind"],"allOf":[{"properties":{"a":…},"required":["a"]}]}` comes back carrying **both** `kind` and `a`. (This tool used to read "flatten a single member" as "keep the wrapper's annotations and let the parent win", which silently *deleted* the member's `properties` and `required` whenever the parent had its own — see the note below.) Only closed-object members (*"cannot be merged without changing Draft 7 validation"*), a property name declared on both sides with **different** schemas, and multi-member non-object `allOf` throw; a name declared on both sides with an **identical** schema merges fine. `{"allOf": [{"$ref": …}], "description": …}` — the standard Pydantic output for a referenced model with a field description — is therefore perfectly valid, and stripping it would delete the whole subschema.
   - **`$id`** is legal at the **root** and fatal **anywhere else** (*"Nested $id … establishes a separate JSON Schema resource scope"*). Likewise `"type": "array"` is legal but fatal without `items`.
 
   **All of that is conditional on `strict: true`, which is optional and off by default** — so `--to openai` is the right target only if you actually set it. In `openai@7.4.0` the flag is optional at four declaration sites (`FunctionDefinition`, `ResponseFormatJSONSchema.JSONSchema`, and both Responses equivalents), each documented *"Only a subset of JSON Schema is supported when `strict` is `true`."*
@@ -485,7 +485,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 908 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 918 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -673,6 +673,56 @@ The broken behaviour scored as a win and the correct one does not. Acceptance
 bought by changing what the schema *means* is not a repair, so for this shape the
 honest answer is a blocker: strict mode cannot express an impossible field, and
 pretending otherwise hands back a schema that accepts anything.
+
+
+## The special case was the broken one
+
+`allOf` is handled in two branches: one for a single member, one for N. The
+N-member branch merges — the union of every member's `properties` and
+`required` — and has always been right. The single-member branch copied the
+member's keys with `if (!(k in node))`: **parent wins**.
+
+For annotations that is correct; `title` and `description` on the wrapper are
+the wrapper's. For anything carrying constraints it is a deletion. Given
+
+```json
+{"type":"object","properties":{"kind":{"type":"string"}},"required":["kind"],
+ "allOf":[{"properties":{"a":{"type":"string"}},"required":["a"]}]}
+```
+
+the parent already has `properties`, so the member's `properties` and
+`required` were dropped and the ledger reported `~ Flattened a single-member
+allOf … Nothing is lost.` What was actually lost was the whole point of the
+node. The accept set did not merely shrink, it **inverted**: `{"kind":"k","a":"x"}`
+was legal and became illegal, `{"kind":"k"}` was illegal (the `allOf` required
+`a`) and became legal.
+
+The severity is not that this bought bad acceptance — it is that it bought
+*nothing*. `toStrictJsonSchema()` **accepts this input as written** and returns
+`{"properties":{"kind":…,"a":…},"required":["kind","a"],"additionalProperties":false}`,
+merging `a` in. So the tool took a schema the destination already accepted and
+silently deleted a constraint from it. There was no 400 to avoid.
+
+The fix is to stop treating one member as a special case. Measured verdicts,
+each pinned as a test:
+
+| shape | vendor | this tool |
+|---|---|---|
+| member declares `properties`, parent has its own | merges both | merges both |
+| same property name, **identical** subschema | accepts | merges, no blocker |
+| same property name, **different** subschema | throws | blocker |
+| member is a bare `$ref`, parent has only annotations | accepts, `$ref` beside metadata | unchanged |
+| member is annotation-only | keeps the annotation | keeps the annotation |
+
+That fourth row is the guard that matters most in practice: it is the standard
+`pydantic==1.10.22` output for a referenced model with a field description —
+`{"title":…,"description":…,"allOf":[{"$ref":"#/definitions/Inner"}]}` — which
+has nothing to merge and must come out untouched. Note that current Pydantic
+(2.13.4) emits `$ref` with a sibling `description` instead and never produces
+this shape at all, and neither zod 3 + `zod-to-json-schema` nor zod 4's native
+`z.toJSONSchema()` emit a single-member `allOf`. So the deleting shape is a
+hand-authored / OpenAPI-composition idiom rather than something the common
+generators hand you — which is most likely why it survived this long.
 
 
 ## License

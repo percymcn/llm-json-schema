@@ -4154,5 +4154,110 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     m(gem).additionalProperties === undefined);
 })();
 
+// ---------------------------------------------------------------------------
+// #349 — a single-member `allOf` is not a special case.
+//
+// The flatten copied a member key only `if (!(k in node))`, i.e. PARENT WINS.
+// For annotations that is right; for `properties`/`required` it is a DELETION,
+// and the ledger said "Nothing is lost." Measured on openai@7.4.0, the vendor
+// applies the SAME merge it applies to N members:
+//   {properties:{kind},required:["kind"],allOf:[{properties:{a},required:["a"]}]}
+//   -> {properties:{kind,a},required:["kind","a"],additionalProperties:false}
+// So the old output INVERTED the node: `{kind:"k",a:"x"}` was legal and became
+// illegal, `{kind:"k"}` was illegal and became legal — on a schema the vendor
+// had ACCEPTED as written, so there was no acceptance bought by the loss.
+(function () {
+  // Root-level conversion: these rules are about the node that carries the
+  // `allOf`, so wrapping it in a property would move the test off the target.
+  function conv(p, sch) { return E.convert(JSON.parse(JSON.stringify(sch)), p); }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function blocks(r) {
+    return led(r).filter(function (e) { return e.op === "!" && !e.advisory; });
+  }
+  function m(r) { return (r && r.schema) || {}; }
+
+  var withProps = {
+    type: "object", properties: { kind: { type: "string" } }, required: ["kind"],
+    allOf: [{ properties: { a: { type: "string" } }, required: ["a"] }]
+  };
+  var r = conv("openai", withProps);
+  var out = m(r);
+  ok("#349 single-member allOf MERGES the member's properties, not drops them",
+    out.properties && out.properties.a && out.properties.a.type === "string" &&
+    out.properties.kind && out.allOf === undefined);
+  ok("#349 single-member allOf unions `required`",
+    out.required.indexOf("kind") !== -1 && out.required.indexOf("a") !== -1);
+  ok("#349 the merged shape is not blocked (the vendor accepts this input)",
+    blocks(r).length === 0);
+  ok("#349 the ledger no longer claims nothing is lost",
+    JSON.stringify(r.ledger || []).indexOf("Nothing is lost") === -1);
+
+  // The vendor THROWS when both sides declare the same name with DIFFERENT
+  // schemas ("cannot be merged without changing Draft 7 validation") and
+  // ACCEPTS when they are identical — so the test is conflict, not duplication.
+  var clash = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    allOf: [{ properties: { a: { type: "number" } }, required: ["a"] }]
+  };
+  ok("#349 a conflicting property name is a blocker, matching the vendor",
+    blocks(conv("openai", clash)).length === 1);
+
+  // OVER-BLOCK GUARDS. Being stricter than the vendor is this project's most
+  // repeated bug (#312/#314/#317/#322/#329/#337/#343/#344/#348).
+  var dup = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    allOf: [{ properties: { a: { type: "string" } }, required: ["a"] }]
+  };
+  var dupOut = conv("openai", dup);
+  ok("#349 GUARD an IDENTICAL duplicate is merged, not blocked (vendor accepts)",
+    blocks(dupOut).length === 0 && m(dupOut).properties.a.type === "string");
+
+  // The standard pydantic==1.10.22 output for a referenced model with a field
+  // description. Verbatim, per [[test-against-real-generator-input]]. The
+  // member is a bare `$ref` with nothing to merge, so it must be untouched.
+  var pydv1 = {
+    title: "M", type: "object",
+    properties: {
+      kind: { title: "Kind", type: "string" },
+      inner: { title: "Inner", description: "the nested one", allOf: [{ $ref: "#/definitions/Inner" }] }
+    },
+    required: ["kind", "inner"],
+    definitions: {
+      Inner: { title: "Inner", type: "object", properties: { a: { title: "A", type: "string" } }, required: ["a"] }
+    }
+  };
+  var pv = conv("openai", pydv1);
+  ok("#349 GUARD the pydantic v1 $ref-in-allOf shape still flattens to a $ref",
+    blocks(pv).length === 0 && m(pv).properties.inner.$ref === "#/$defs/Inner" &&
+    m(pv).properties.inner.description === "the nested one" &&
+    m(pv).properties.inner.allOf === undefined);
+
+  var annOnly = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    allOf: [{ description: "note" }]
+  };
+  var ao = conv("openai", annOnly);
+  ok("#349 GUARD an annotation-only member still contributes its description",
+    blocks(ao).length === 0 && m(ao).description === "note" &&
+    m(ao).properties.a && m(ao).allOf === undefined);
+
+  var twoMember = {
+    type: "object",
+    allOf: [{ type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+            { type: "object", properties: { b: { type: "number" } }, required: ["b"] }]
+  };
+  var tm = conv("openai", twoMember);
+  ok("#349 GUARD the two-member merge is undisturbed",
+    blocks(tm).length === 0 && m(tm).properties.a && m(tm).properties.b &&
+    m(tm).required.length === 2);
+
+  // A member with no `properties` and a parent with none either: the old
+  // parent-wins copy was accidentally correct here, which is exactly why the
+  // deletion stayed invisible on the simple case.
+  var noParentProps = { type: "object", allOf: [{ properties: { a: { type: "string" } }, required: ["a"] }] };
+  ok("#349 GUARD member props still land when the parent declares none",
+    m(conv("openai", noParentProps)).properties.a !== undefined);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
