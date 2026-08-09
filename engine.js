@@ -327,6 +327,185 @@
     return JSON.stringify(v);
   }
 
+  // ---- oneOf exclusivity (OpenAI strict) -----------------------------------
+  //
+  // `oneOf` means EXACTLY ONE branch matches; `anyOf` means AT LEAST ONE. So
+  // rewriting one to the other is only lossless when the branches cannot both
+  // match. Rewriting unconditionally silently WIDENS the schema, which is the
+  // same class of harm as silently stripping it.
+  //
+  // This is not our judgement call — it is openai@7.4.0's. The five builders in
+  // `helpers/zod.js` run only `toStrictJsonSchema()`, which passes `oneOf`
+  // through untouched. But `helpers/standard-schema.js` (four MORE builders,
+  // uncounted until now) runs `normalizeStructuredOutputSchema()` first, and
+  // that function rewrites `oneOf` to `anyOf` ONLY when it can prove the
+  // branches mutually exclusive. When it cannot, it throws:
+  //
+  //   "Standard JSON Schema generated a `oneOf` whose branches are not provably
+  //    mutually exclusive. OpenAI strict schemas do not support `oneOf`; use
+  //    `anyOf` or add a discriminator with distinct literal values."
+  //
+  // The proof below mirrors the vendor's, deliberately clause for clause. It
+  // must not be MORE conservative than theirs: a schema they accept and we
+  // block is a false CI failure, which is the bug this project keeps shipping
+  // (#312, #314, #317). The test suite pins our verdict against theirs.
+  var ANNOTATION_KW = {
+    $comment: 1, "default": 1, description: 1, examples: 1,
+    readOnly: 1, title: 1, writeOnly: 1
+  };
+  var JSON_SCHEMA_TYPES = {
+    string: 1, number: 1, integer: 1, boolean: 1, object: 1, array: 1, "null": 1
+  };
+
+  function isJSONPrimitive(v) {
+    return v === null || typeof v === "string" || typeof v === "boolean" ||
+      (typeof v === "number" && isFinite(v));
+  }
+
+  // `const`, else a fully-primitive `enum`. Anything else: not a literal node.
+  function literalValues(node) {
+    if (!isPlainObject(node)) return null;
+    if ("const" in node && isJSONPrimitive(node["const"])) return [node["const"]];
+    var e = node.enum;
+    if (Array.isArray(e) && e.length && e.every(isJSONPrimitive)) return e;
+    return null;
+  }
+
+  function schemaTypes(node) {
+    if (!isPlainObject(node)) return null;
+    if (node.type === undefined) {
+      var lits = literalValues(node);
+      if (!lits) return null;
+      return lits.map(function (v) { return v === null ? "null" : typeof v; });
+    }
+    var types = Array.isArray(node.type) ? node.type : [node.type];
+    if (!types.length) return null;
+    if (!types.every(function (t) { return typeof t === "string" && JSON_SCHEMA_TYPES[t]; })) return null;
+    return types;
+  }
+
+  // `integer` is a subset of `number`, so those two overlap.
+  function typesOverlap(a, b) {
+    return a === b ||
+      (a === "integer" && b === "number") ||
+      (a === "number" && b === "integer");
+  }
+
+  function disjointLiterals(l, r) {
+    var lv = literalValues(l), rv = literalValues(r);
+    if (!lv || !rv) return false;
+    return lv.every(function (a) {
+      return !rv.some(function (b) { return a === b; });
+    });
+  }
+
+  function objectOnly(node) {
+    var t = schemaTypes(node);
+    return !!t && t.length === 1 && t[0] === "object";
+  }
+
+  // Two closed objects that each require a property the other does not declare
+  // can never both validate: the extra key is rejected as an additional
+  // property by whichever branch omits it.
+  function closedPropertySet(node) {
+    if (!objectOnly(node)) return null;
+    var props = node.properties, req = node.required;
+    if (node.additionalProperties !== false) return null;
+    if (!isPlainObject(props) || !Array.isArray(req)) return null;
+    if (!req.every(function (p) { return typeof p === "string"; })) return null;
+    var declared = Object.keys(props);
+    // A required-but-undeclared property makes the branch unsatisfiable; leave
+    // that to normal validation rather than treating it as a proof.
+    if (req.some(function (p) { return declared.indexOf(p) === -1; })) return null;
+    return { declared: declared, required: req };
+  }
+
+  function disjointClosedObjects(l, r) {
+    var ls = closedPropertySet(l), rs = closedPropertySet(r);
+    if (!ls || !rs) return false;
+    return ls.required.some(function (p) { return rs.declared.indexOf(p) === -1; }) ||
+      rs.required.some(function (p) { return ls.declared.indexOf(p) === -1; });
+  }
+
+  // A shared required property whose literal values are disjoint = a
+  // discriminated union, the shape the vendor's error message recommends.
+  function disjointDiscriminator(l, r, root) {
+    if (!objectOnly(l) || !objectOnly(r)) return false;
+    var lp = l.properties, rp = r.properties, lr = l.required, rr = r.required;
+    if (!isPlainObject(lp) || !isPlainObject(rp)) return false;
+    if (!Array.isArray(lr) || !Array.isArray(rr)) return false;
+    return lr.some(function (p) {
+      if (typeof p !== "string" || rr.indexOf(p) === -1) return false;
+      return disjointLiterals(exclResolve(lp[p], root), exclResolve(rp[p], root));
+    });
+  }
+
+  function hasOnlyRefAndAnnotations(node) {
+    return Object.keys(node).every(function (k) {
+      return k === "$ref" || k === "$defs" || k === "definitions" || ANNOTATION_KW[k];
+    });
+  }
+
+  // Follow a local `$ref` only when it carries no sibling CONSTRAINTS — a
+  // sibling `minLength` beside a `$ref` changes what the branch accepts, so the
+  // target alone would not prove anything. Returns undefined = unprovable.
+  function exclResolve(node, root, seen) {
+    if (!isPlainObject(node)) return node;
+    seen = seen || {};
+    if (node.$ref !== undefined) {
+      if (typeof node.$ref !== "string" || !hasOnlyRefAndAnnotations(node)) return undefined;
+      if (seen[node.$ref]) return undefined;
+      var target = derefLocal(root, node.$ref);
+      if (target === undefined) return undefined;
+      var next = {};
+      Object.keys(seen).forEach(function (k) { next[k] = 1; });
+      next[node.$ref] = 1;
+      return exclResolve(target, root, next);
+    }
+    return node;
+  }
+
+  // "#/$defs/A" style pointers only; anything else is not locally resolvable.
+  function derefLocal(root, ref) {
+    if (ref.charAt(0) !== "#") return undefined;
+    var body = ref.slice(1);
+    if (body === "" || body === "/") return root;
+    if (body.charAt(0) !== "/") return undefined;
+    var parts = body.slice(1).split("/");
+    var cur = root;
+    for (var i = 0; i < parts.length; i++) {
+      var key = decodeURIComponent(parts[i]).replace(/~1/g, "/").replace(/~0/g, "~");
+      if (!isPlainObject(cur) && !Array.isArray(cur)) return undefined;
+      if (!(key in cur)) return undefined;
+      cur = cur[key];
+    }
+    return cur;
+  }
+
+  function mutuallyExclusive(l, r, root) {
+    var lt = schemaTypes(l), rt = schemaTypes(r);
+    if (lt && rt && lt.every(function (a) {
+      return rt.every(function (b) { return !typesOverlap(a, b); });
+    })) return true;
+    return disjointLiterals(l, r) ||
+      disjointDiscriminator(l, r, root) ||
+      disjointClosedObjects(l, r);
+  }
+
+  function oneOfProvablyExclusive(branches, root) {
+    if (!Array.isArray(branches)) return false;
+    // `false` can never validate, so it cannot overlap anything.
+    var live = branches.filter(function (b) { return b !== false; });
+    for (var i = 0; i < live.length; i++) {
+      for (var j = i + 1; j < live.length; j++) {
+        var l = exclResolve(live[i], root), r = exclResolve(live[j], root);
+        if (l === undefined || r === undefined) return false;
+        if (!mutuallyExclusive(l, r, root)) return false;
+      }
+    }
+    return true;
+  }
+
   // OpenAI strict mode has NO tuple form. openai@7.4.0's toStrictJsonSchema
   // throws on `prefixItems` ("uses unsupported keyword `prefixItems`") and on
   // array-form `items` ("uses tuple-form `items`"). A fixed-length tuple whose
@@ -395,17 +574,73 @@
     }
 
     walk(s, "root", function (node, path) {
-      // `anyOf` is the union OpenAI supports; `oneOf` is never named in the doc.
-      // Rewrite rather than strip — dropping it would silently widen the schema.
-      if (Array.isArray(node.oneOf) && !node.anyOf) {
-        node.anyOf = node.oneOf;
-        delete node.oneOf;
-        ledger.push(entry("~", path,
-          "Rewrote `oneOf` as `anyOf` — `anyOf` is the only union keyword in OpenAI's supported set.",
+      // `anyOf` is the union OpenAI supports; `oneOf` is not representable.
+      // Rewriting is only lossless when the branches are provably disjoint —
+      // see oneOfProvablyExclusive above for why, and whose rule this is.
+      var oneOfBlocked = false;
+      if (Array.isArray(node.oneOf)) {
+        if (node.anyOf !== undefined) {
+          oneOfBlocked = true;
+          ledger.push(entry("!", path,
+            "This node has both `anyOf` and `oneOf`. OpenAI's own transformer refuses this outright " +
+            "(\"Standard JSON Schema generated both `anyOf` and `oneOf`, which cannot be represented " +
+            "in an OpenAI strict schema\"). Merge them into a single `anyOf` yourself — we will not " +
+            "guess which one you meant, because either guess changes what the schema accepts.",
+            DOCS.openai));
+        } else if (oneOfProvablyExclusive(node.oneOf, s)) {
+          node.anyOf = node.oneOf;
+          delete node.oneOf;
+          ledger.push(entry("~", path,
+            "Rewrote `oneOf` as `anyOf` — `anyOf` is the only union keyword OpenAI strict mode can " +
+            "represent, and these branches are provably mutually exclusive, so \"exactly one\" and " +
+            "\"at least one\" mean the same thing here. Nothing is widened.",
+            DOCS.openai));
+        } else {
+          oneOfBlocked = true;
+          ledger.push(entry("!", path,
+            "`oneOf` here is NOT provably mutually exclusive, so it cannot be rewritten as `anyOf` " +
+            "without widening the schema — `oneOf` means exactly one branch matches, `anyOf` means at " +
+            "least one. OpenAI strict mode has no `oneOf`, and its own transformer throws on this case " +
+            "rather than widening. Fix it the way OpenAI recommends: use `anyOf` if overlap is " +
+            "acceptable, or add a discriminator property with distinct literal values to each branch.",
+            DOCS.openai));
+        }
+      }
+
+      // `$id` is retained at the ROOT (it is in the SDK's own rootMetadata set),
+      // but a NESTED `$id` opens a separate resource scope and is fatal:
+      // "Nested $id at ... cannot be represented in strict Structured Outputs."
+      // Deleting it is not safe — refs may resolve against that scope — so this
+      // is a human fix, like a heterogeneous tuple.
+      if (path !== "root" && node.$id !== undefined) {
+        ledger.push(entry("!", path,
+          "Nested `$id` — OpenAI's transformer throws here (\"Nested $id at \\\"" + path + "\\\" " +
+          "establishes a separate JSON Schema resource scope and cannot be represented in strict " +
+          "Structured Outputs\"). Note `$id` is fine on the ROOT; only nested ones are fatal. " +
+          "Remove it, and if any `$ref` resolved against it, rewrite that ref as a plain " +
+          "`#/$defs/...` pointer.",
           DOCS.openai));
       }
 
       var tupleBlocked = normalizeTuple(node, path, ledger);
+
+      // An array MUST declare `items`. This is not a keyword the allowlist can
+      // express — it is a structural OBLIGATION, so a presence/absence
+      // allowlist is blind to it, exactly as it was blind to nested `$id`
+      // being fatal while root `$id` is fine. Verified: toStrictJsonSchema
+      // throws "declares an array without `items`, which cannot be represented
+      // in strict Structured Outputs". We cannot invent the element type, so
+      // this is a human fix.
+      if (!tupleBlocked && node.items === undefined) {
+        var t = schemaTypes(node);
+        if (t && t.indexOf("array") !== -1) {
+          ledger.push(entry("!", path,
+            "This is an array with no `items`. OpenAI strict mode throws on it (\"declares an array " +
+            "without `items`\") because a constrained decoder has no element type to emit. Give it an " +
+            "`items` schema — even `{\"type\": \"string\"}` — or drop the field.",
+            DOCS.openai));
+        }
+      }
 
       // strip every keyword outside the supported set (unsupported => API error)
       Object.keys(node).forEach(function (k) {
@@ -413,6 +648,10 @@
         // A blocked tuple stays visible so the reader can see the shape they
         // have to remodel; deleting it would hide the very thing to fix.
         if (k === "prefixItems" && tupleBlocked) return;
+        // Same reasoning for a blocked `oneOf`: stripping it would delete the
+        // "exactly one" constraint entirely — a silent widening on top of an
+        // unreported one — and hide the keyword the reader has to remodel.
+        if (k === "oneOf" && oneOfBlocked) return;
         var why = OPENAI_STRIP_REASON[k] ||
           "not in OpenAI's supported keyword set, and strict mode errors on unsupported keywords.";
         delete node[k];
@@ -634,6 +873,29 @@
           "goes on the wire. Note the semantics differ: `oneOf` means exactly one branch matches, " +
           "`anyOf` means at least one.",
           DOCS.anthropic));
+        // Anthropic and OpenAI diverge here, so the rule is NOT ported between
+        // them (#314). `transformJSONSchema` maps oneOf -> anyOf with NO
+        // exclusivity proof, so when branches can both match the constraint is
+        // genuinely weakened on the wire — by the vendor, not by us. OpenAI's
+        // transformer throws in that case; Anthropic's does not, so this is a
+        // warning, never a gate failure.
+        if (!oneOfProvablyExclusive(node.anyOf, s)) {
+          ledger.push(entry("!", path,
+            "These `oneOf` branches are not provably mutually exclusive, so \"exactly one\" becomes " +
+            "\"at least one\" on the wire. Anthropic's own transformer performs this rewrite " +
+            "unconditionally, so the widening happens with or without this tool — but nothing warns " +
+            "you. If exclusivity matters, add a discriminator property with distinct literal values.",
+            DOCS.anthropic, true));
+        }
+      } else if (Array.isArray(node.oneOf) && Array.isArray(node.anyOf)) {
+        // `_transformJSONSchema` pops both and takes `anyOf` first, so a
+        // co-existing `oneOf` is discarded outright — silently, like every
+        // other Anthropic loss on this path.
+        ledger.push(entry("!", path,
+          "This node has both `anyOf` and `oneOf`. Anthropic's transformer reads `anyOf` first and " +
+          "DISCARDS `oneOf` entirely — no error, no warning, the constraint is simply gone. Merge " +
+          "them into one `anyOf` so what you send is what you meant.",
+          DOCS.anthropic, true));
       }
 
       // No `type` and nothing to stand in for it -> throws on Path O.

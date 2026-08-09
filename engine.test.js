@@ -334,6 +334,138 @@ var ZOD_V3 = {
   ok("openai rewrites oneOf to anyOf", Array.isArray(v.anyOf) && v.anyOf.length === 2 && v.oneOf === undefined);
 })();
 
+// --- oneOf -> anyOf is CONDITIONAL on provable exclusivity ------------------
+// `oneOf` = exactly one branch matches; `anyOf` = at least one. Rewriting when
+// the branches can BOTH match silently widens the schema. openai@7.4.0's
+// `helpers/standard-schema.js` proves exclusivity first and THROWS when it
+// cannot. The old unconditional rewrite happened to survive its own test only
+// because that test used `string|integer`, which is disjoint by luck.
+function blockers(r) {
+  return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
+}
+(function () {
+  var overlapping = E.toOpenAI({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }, { type: "string", minLength: 2 }] } }
+  });
+  var v = overlapping.schema.properties.v;
+  ok("openai does NOT rewrite a non-exclusive oneOf", Array.isArray(v.oneOf) && v.anyOf === undefined);
+  ok("openai blocks a non-exclusive oneOf", blockers(overlapping).length > 0);
+  ok("openai leaves the blocked oneOf visible to fix", Array.isArray(v.oneOf) && v.oneOf.length === 2);
+  ok("openai names the vendor's own remedy",
+    has(overlapping.ledger, "discriminator"));
+
+  // integer is a subset of number, so these two overlap.
+  var subset = E.toOpenAI({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "integer" }, { type: "number" }] } }
+  });
+  ok("openai treats integer|number as overlapping", blockers(subset).length > 0);
+
+  // A discriminated union IS provable — but only when the discriminant is
+  // REQUIRED on both branches. An optional discriminant proves nothing, since
+  // an instance can omit it and satisfy both. Verified against the vendor:
+  // dropping `required` here flips its verdict to "not provably mutually
+  // exclusive", so this fixture must carry it.
+  var disc = E.toOpenAI({
+    type: "object",
+    properties: {
+      v: {
+        oneOf: [
+          { type: "object", properties: { kind: { const: "a" }, a: { type: "string" } }, required: ["kind", "a"] },
+          { type: "object", properties: { kind: { const: "b" }, b: { type: "string" } }, required: ["kind", "b"] }
+        ]
+      }
+    }
+  });
+  ok("openai still rewrites a discriminated oneOf",
+    Array.isArray(disc.schema.properties.v.anyOf) && blockers(disc).length === 0);
+
+  var optionalDiscriminant = E.toOpenAI({
+    type: "object",
+    properties: {
+      v: {
+        oneOf: [
+          { type: "object", properties: { kind: { const: "a" }, a: { type: "string" } } },
+          { type: "object", properties: { kind: { const: "b" }, b: { type: "string" } } }
+        ]
+      }
+    }
+  });
+  ok("openai does not accept an OPTIONAL discriminant as proof",
+    blockers(optionalDiscriminant).length > 0);
+})();
+
+// --- anyOf + oneOf siblings are a blocker, never a silent strip -------------
+(function () {
+  var r = E.toOpenAI({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }], anyOf: [{ type: "number" }] } }
+  });
+  ok("openai blocks anyOf+oneOf siblings", blockers(r).length > 0);
+  ok("openai does not silently drop the sibling oneOf",
+    Array.isArray(r.schema.properties.v.oneOf));
+})();
+
+// --- $id is root-only: nested $id is fatal ----------------------------------
+// A flat keyword allowlist cannot express this — `$id` is legal at the root
+// (it is in the SDK's own rootMetadata set) and fatal anywhere else.
+(function () {
+  var nested = E.toOpenAI({
+    type: "object",
+    properties: { v: { $ref: "#/$defs/A" } },
+    $defs: { A: { $id: "https://x/a", type: "string" } }
+  });
+  ok("openai blocks a nested $id", blockers(nested).length > 0);
+  ok("openai explains nested $id vs root $id", has(nested.ledger, "resource scope"));
+
+  var rootOnly = E.toOpenAI({
+    type: "object",
+    $id: "https://x/root",
+    properties: { v: { type: "string" } }
+  });
+  ok("openai keeps a ROOT $id and does not block it",
+    rootOnly.schema.$id === "https://x/root" && blockers(rootOnly).length === 0);
+})();
+
+// --- an array must declare `items` ------------------------------------------
+// Another obligation a presence/absence allowlist is blind to: `type: "array"`
+// is allowed, but it is fatal without `items`.
+(function () {
+  var bare = E.toOpenAI({
+    type: "object",
+    properties: { v: { type: "array" } }
+  });
+  ok("openai blocks an array with no items", blockers(bare).length > 0);
+
+  var withItems = E.toOpenAI({
+    type: "object",
+    properties: { v: { type: "array", items: { type: "string" } } }
+  });
+  ok("openai accepts an array that declares items", blockers(withItems).length === 0);
+})();
+
+// --- Anthropic diverges here, and the rule must NOT be ported ---------------
+// `transformJSONSchema` rewrites oneOf -> anyOf with no exclusivity proof, so
+// the same input that is a hard blocker for OpenAI is only a warning here.
+(function () {
+  var r = E.toAnthropic({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }, { type: "string", minLength: 2 }] } }
+  });
+  ok("anthropic still rewrites a non-exclusive oneOf",
+    Array.isArray(r.schema.properties.v.anyOf));
+  ok("anthropic warns about the widening", has(r.ledger, "at least one"));
+  ok("anthropic does NOT fail the gate for it", blockers(r).length === 0);
+
+  var both = E.toAnthropic({
+    type: "object",
+    properties: { v: { oneOf: [{ type: "string" }], anyOf: [{ type: "number" }] } }
+  });
+  ok("anthropic warns that a co-existing oneOf is discarded", has(both.ledger, "DISCARDS"));
+  ok("anthropic keeps that as advisory too", blockers(both).length === 0);
+})();
+
 // --- Gemini inlines $refs rather than emitting an empty schema --------------
 (function () {
   // ZOD_V3 is verbatim zod-to-json-schema output, so it HAS a top-level
