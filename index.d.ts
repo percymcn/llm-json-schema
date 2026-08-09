@@ -114,6 +114,14 @@ export function looksLikeSchema(obj: unknown): boolean;
 /** Provider documentation URLs the rules are derived from. */
 export const DOCS: Record<Provider, string>;
 
+/**
+ * The keyword subset Gemini's narrow `responseSchema` proto can carry.
+ * Confirmed against three independent vendor artifacts: the JS `Schema`
+ * interface, the Python `types.Schema` model, and the Go `Schema` struct's
+ * json tags — all 22 keys, identical.
+ */
+export const GEMINI_ALLOWED_KEYS: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -122,6 +130,7 @@ declare const api: {
   toAnthropic: typeof toAnthropic;
   toGemini: typeof toGemini;
   DOCS: typeof DOCS;
+  GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
 };
 
 export default api;

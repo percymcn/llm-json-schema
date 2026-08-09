@@ -20,5 +20,6 @@ export const toOpenAI = api.toOpenAI;
 export const toAnthropic = api.toAnthropic;
 export const toGemini = api.toGemini;
 export const DOCS = api.DOCS;
+export const GEMINI_ALLOWED_KEYS = api.GEMINI_ALLOWED_KEYS;
 
 export default api;

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 381 engine + 140 CLI + 31 ESM/library assertions = **552** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 402 engine + 144 CLI + 32 ESM/library assertions = **578** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -183,8 +183,21 @@ Each provider accepts a different schema dialect, so a schema that works with on
   | `@google/genai` (JS) | yes — `maybeMoveToResponseJsonSchema()` moves it when there is a **top-level `$schema`** |
   | `google-genai` (Python) | no — no `$schema` handling exists; you set `response_json_schema=` yourself |
   | `@google/generative-ai` (legacy JS, used by `@langchain/google-genai`) | **no — the field does not exist in that package at all** |
+  | `google.golang.org/genai` (Go) | no — `InternalTJsonSchema` is the identity function and there is no routing code anywhere in the package |
 
   So a top-level `$schema` is *not* a routing switch in general, and this tool will not read it as one. Pick the path with `--to gemini` (narrow proto) or `--to gemini-json` (`responseJsonSchema`). Getting this wrong is not a style question: LangChain emits a top-level `$schema` *and* lands on the narrow path, and the live `v1beta` endpoint answers with `HTTP 400 — Unknown name "$schema" … Cannot find field` / `Unknown name "prefixItems" … Cannot find field`.
+
+  **The narrow path has three clients and three different behaviours for the same unsupported keyword** (measured 2026-08-09 on one verbatim `pydantic==2.13.4` schema — a nested model, a `tuple`, an `Optional[str] = None`):
+
+  | client | what happens to `$ref` / `$defs` / `prefixItems` / `additionalProperties` | what you see |
+  |---|---|---|
+  | `@google/genai` (JS) | forwarded verbatim | `HTTP 400 — Unknown name "$defs" … Cannot find field` |
+  | `google-genai` (Python) | `types.Schema` is `extra="forbid"` | a local exception; the request is never built |
+  | `google.golang.org/genai` (Go) | `Schema` is a plain struct with no `UnmarshalJSON`, so `encoding/json` **drops every key the struct has no field for** | **nothing.** `err == nil`, `HTTP 200`, and the schema you sent no longer describes your data |
+
+  On that one schema Go silently deleted **16 key-paths** — including the whole `Addr` model, which became `{}` (the model may return literally anything there) — and the tuple's four element types, leaving a bare `array`. Go is the only client of any vendor probed by this project where an unsupported keyword produces **no signal at all**: it removes the evidence before the request is built, so the backend cannot object either. That is what `--check --to gemini` is for; in Go it is the only thing in the stack that will tell you.
+
+  Two corollaries worth knowing. An unmarshal *error* does not mean nothing was written — Go's decoder keeps going, so `enum: [1, 2]` on an integer field returns an error **and** leaves `Enum = ["", ""]`, and a draft-07 tuple leaves `items: {}` (array of anything). And `Schema.Default` is `any` with `omitempty`, so an explicit `default: null` — which Pydantic emits for every `Optional[x] = None` field — is dropped even though the proto accepts it; that is the only key of *this tool's own output* a Go caller loses, and `--to gemini` says so as an advisory.
 
   The two accepted subsets are **complementary — neither is a superset**:
 
@@ -409,7 +422,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
 - OpenAI — https://developers.openai.com/api/docs/guides/structured-outputs
 - Anthropic — https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview
-- Gemini — https://ai.google.dev/gemini-api/docs/structured-output plus the vendor SDKs, verified 2026-08-09: `@google/genai@2.16.0` (the `Schema` type, `processJsonSchema()`, `maybeMoveToResponseJsonSchema()`) by capturing the request body the SDK actually builds, and `google-genai@2.17.0` (Python), whose `response_json_schema` field documents the accepted property list for the JSON-Schema path verbatim
+- Gemini — https://ai.google.dev/gemini-api/docs/structured-output plus the vendor SDKs, verified 2026-08-09: `@google/genai@2.16.0` (the `Schema` type, `processJsonSchema()`, `maybeMoveToResponseJsonSchema()`) by capturing the request body the SDK actually builds, and `google-genai@2.17.0` (Python), whose `response_json_schema` field documents the accepted property list for the JSON-Schema path verbatim, and `google.golang.org/genai@v1.67.0` (Go), whose `Schema` struct is a static type and therefore the strongest of the three artifacts — its 22 json tags match this tool's narrow allowlist exactly
 
 Where a vendor ships a client SDK, the SDK outranks the doc: docs describe the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 

@@ -1972,7 +1972,12 @@
         "Inlined " + inlined + " `$ref` reference" + (inlined === 1 ? "" : "s") +
         " and dropped the `$defs`/`definitions` block — `@google/genai`'s `Schema` type has " +
         "no `$ref`, so inlining is the form that works on this path. (Keep a top-level " +
-        "`$schema` instead and you stay on `responseJsonSchema`, where `$ref`/`$defs` are accepted.)",
+        "`$schema` instead and you stay on `responseJsonSchema`, where `$ref`/`$defs` are accepted.) " +
+        "What an un-inlined `$ref` costs depends on your client: JS forwards it and the API " +
+        "answers `Unknown name \"$defs\" … Cannot find field`; Python refuses to build the " +
+        "request; Go DROPS IT SILENTLY — `json.Unmarshal` into `genai.Schema` returns nil " +
+        "error and the referencing property becomes `{}`, so the call succeeds with the " +
+        "referenced model no longer described at all.",
         docUrl));
     }
     recursive.forEach(function (name) {
@@ -2354,7 +2359,10 @@
               "type would be dropped and this node would become a bare object with no " +
               "declared contents. " + OPEN_MAP_REMEDY +
               " (The `responseJsonSchema` path DOES accept `additionalProperties` — if you " +
-              "can use it, run `--to gemini-json` instead.)",
+              "can use it, run `--to gemini-json` instead.) Note that only a JS caller is " +
+              "told about this: the API answers `Unknown name \"additionalProperties\"`, but " +
+              "Go's `genai.Schema` has no such field and drops it during unmarshal with no " +
+              "error, so the request succeeds and the map's element type is simply gone.",
               DOCS.gemini));
           } else if (k === "additionalProperties") {
             ledger.push(entry("x", path,
@@ -2421,6 +2429,26 @@
           "Removed `format: " + node.format + "` — Gemini supports only date-time, date, time for strings.",
           DOCS.gemini));
         delete node.format;
+      }
+
+      // `default: null` survives this path in JS and Python and is DROPPED in Go.
+      // `google.golang.org/genai`'s `Schema.Default` is `any` with `omitempty`,
+      // so an explicit JSON `null` unmarshals to a nil interface and is then
+      // omitted on the way out — indistinguishable from "no default at all".
+      // Measured on v1.67.0, and it is the ONLY key our converted output loses
+      // when a Go caller round-trips it through `genai.Schema`. The proto itself
+      // accepts it (live v1beta pre-auth check passes), so this is a client
+      // limitation, not a schema error — advisory, never a gate failure.
+      // Pydantic emits `"default": null` for every `Optional[x] = None` field,
+      // so Go callers converting Pydantic output hit this constantly.
+      if (Object.prototype.hasOwnProperty.call(node, "default") && node.default === null) {
+        ledger.push(entry("=", path,
+          "`default: null` is kept — the proto accepts it and `@google/genai` (JS) and " +
+          "`google-genai` (Python) both send it. If your client is Go, it will NOT arrive: " +
+          "`google.golang.org/genai`'s `Schema.Default` is `any` with `omitempty`, so an " +
+          "explicit null unmarshals to a nil interface and is dropped with no error. Set the " +
+          "default in your Go struct literal if you need it.",
+          DOCS.gemini, true));
       }
 
       // add propertyOrdering so field order is deterministic (Gemini honors it)
@@ -2664,7 +2692,13 @@
     toOpenAI: toOpenAI,
     toAnthropic: toAnthropic,
     toGemini: toGemini,
-    DOCS: DOCS
+    DOCS: DOCS,
+    // The narrow `responseSchema` subset, exported so it can be diffed against
+    // the vendor artifact it is derived from. It is now confirmed by three
+    // independent ones: the JS `Schema` interface (dist/genai.d.ts), the Python
+    // `types.Schema` model (`extra="forbid"`), and the Go `Schema` struct's
+    // json tags (google.golang.org/genai v1.67.0) — all 22, identical.
+    GEMINI_ALLOWED_KEYS: Object.keys(GEMINI_ALLOWED)
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;

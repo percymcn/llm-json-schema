@@ -2413,5 +2413,146 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
       .filter(function (b) { return /boolean subschema/.test(b.msg || ""); }).length === 0);
 })();
 
+// --- Gemini, THIRD client: google.golang.org/genai (Go) ------------------
+// Cycle #334. The narrow `responseSchema` path now has three clients and three
+// behaviours for the SAME unsupported keyword:
+//   JS     forwards it   -> backend 400, `Unknown name "$defs" … Cannot find field`
+//   Python `extra="forbid"` -> raises locally, request never built
+//   Go     `json.Unmarshal` into `genai.Schema` -> nil error, key silently gone,
+//          request succeeds with a weakened schema
+// Go is the only one that produces NO signal anywhere, which is why `--check`
+// is the only thing in a Go caller's stack that will ever report the loss.
+//
+// The fixtures below are the VERBATIM Pydantic 2.13 output and the VERBATIM
+// key-paths measured lost by `genai@v1.67.0` on this host. `GO_SCHEMA_FIELDS`
+// is the mechanically-extracted json tag list of the Go `Schema` struct — a
+// third, independent vendor artifact for GEMINI_ALLOWED, after the JS `.d.ts`
+// (#314) and the Python `types.Schema` (#314b). It is a static type, so it is
+// the strongest of the three: a field that is not there cannot be carried.
+(function () {
+  var GO_SCHEMA_FIELDS = [
+    "anyOf", "default", "description", "enum", "example", "format", "items",
+    "maxItems", "maxLength", "maxProperties", "maximum", "minItems",
+    "minLength", "minProperties", "minimum", "nullable", "pattern",
+    "properties", "propertyOrdering", "required", "title", "type"
+  ].sort();
+
+  var ours = Object.keys(E.DOCS ? {} : {}); // placeholder, replaced below
+  ours = E.GEMINI_ALLOWED_KEYS ? E.GEMINI_ALLOWED_KEYS.slice().sort() : null;
+  ok("the Go `Schema` struct's json tags are exported for comparison", !!ours);
+  ok("GEMINI_ALLOWED matches the Go `Schema` struct field-for-field",
+    !!ours && ours.join(",") === GO_SCHEMA_FIELDS.join(","));
+
+  // Verbatim `Ticket.model_json_schema()` from pydantic 2.13.4.
+  var PYD = {
+    "$defs": {
+      "Addr": {
+        properties: {
+          city: { minLength: 2, title: "City", type: "string" },
+          zip: { pattern: "^\\d{5}$", title: "Zip", type: "string" }
+        },
+        required: ["city", "zip"], title: "Addr", type: "object"
+      }
+    },
+    properties: {
+      title: { description: "short title", maxLength: 80, title: "Title", type: "string" },
+      priority: { enum: ["low", "high"], title: "Priority", type: "string" },
+      score: { maximum: 10, minimum: 0, title: "Score", type: "integer" },
+      addr: { "$ref": "#/$defs/Addr" },
+      tags: { items: { type: "string" }, title: "Tags", type: "array" },
+      bbox: {
+        maxItems: 4, minItems: 4,
+        prefixItems: [{ type: "integer" }, { type: "integer" }, { type: "integer" }, { type: "integer" }],
+        title: "Bbox", type: "array"
+      },
+      note: { anyOf: [{ type: "string" }, { type: "null" }], default: null, title: "Note" }
+    },
+    required: ["title", "priority", "score", "addr", "tags", "bbox"],
+    title: "Ticket", type: "object"
+  };
+
+  var r = E.convert(JSON.parse(JSON.stringify(PYD)), "gemini");
+  ok("go/pydantic: converts without a blocker", r.ok &&
+    !r.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+
+  // Everything Go silently deleted from the RAW schema is gone from our output
+  // too — because we either inlined it, collapsed it, or rewrote it FIRST.
+  // Measured loss on the raw input: 16 key-paths, unmarshalErr = nil.
+  ok("go/pydantic: the `$ref` property is a real object, not the `{}` Go leaves behind",
+    r.schema.properties.addr.type === "object" &&
+    r.schema.properties.addr.properties.zip.pattern === "^\\d{5}$");
+  ok("go/pydantic: `$defs` is gone (Go drops the bag and the pointer both)",
+    !("$defs" in r.schema) && !("$ref" in r.schema.properties.addr));
+  ok("go/pydantic: the tuple keeps its element type (Go leaves a bare array)",
+    r.schema.properties.bbox.items && r.schema.properties.bbox.items.type === "integer" &&
+    r.schema.properties.bbox.minItems === 4 && r.schema.properties.bbox.maxItems === 4);
+  ok("go/pydantic: `prefixItems` is gone — the one key Go drops with no error",
+    !("prefixItems" in r.schema.properties.bbox));
+
+  // Every key we emit must exist on the Go struct, or a Go caller loses it
+  // silently while we report success.
+  function keysOutsideGoStruct(schema) {
+    var offenders = [];
+    (function walkKeys(node, path) {
+      if (Array.isArray(node)) return node.forEach(function (n, i) { walkKeys(n, path + "/" + i); });
+      if (!node || typeof node !== "object") return;
+      Object.keys(node).forEach(function (k) {
+        // property NAMES are data, not keywords
+        if (/\/properties$/.test(path)) return walkKeys(node[k], path + "/" + k);
+        if (GO_SCHEMA_FIELDS.indexOf(k) === -1) offenders.push(path + "/" + k);
+        walkKeys(node[k], path + "/" + k);
+      });
+    })(schema, "");
+    return offenders;
+  }
+  ok("go/pydantic: every key in our output is a field of the Go `Schema` struct",
+    keysOutsideGoStruct(r.schema).length === 0);
+  // Control: the check above is only worth anything if it can FAIL. A planted
+  // key at a nested position must be caught, and a property literally NAMED
+  // after an unsupported keyword must NOT be.
+  (function () {
+    var planted = JSON.parse(JSON.stringify(r.schema));
+    planted.properties.addr.additionalProperties = false;
+    ok("go: the struct-field check catches a planted out-of-struct key",
+      keysOutsideGoStruct(planted).join(",") === "/properties/addr/additionalProperties");
+    var named = { type: "object", properties: { "$ref": { type: "string" }, allOf: { type: "string" } }, required: ["$ref"] };
+    ok("go: a property NAMED after an unsupported keyword is not a false positive",
+      keysOutsideGoStruct(named).length === 0);
+  })();
+
+  // The single measured exception, and it is an advisory rather than a blocker
+  // because the proto accepts it (verified live) — it is the CLIENT that cannot
+  // carry it. `Schema.Default` is `any` with `omitempty`, so an explicit null
+  // unmarshals to nil and is omitted again on the way out.
+  ok("go: an explicit `default: null` is flagged as a Go-only loss",
+    has(r.ledger, "`Schema.Default` is `any` with `omitempty`"));
+  ok("go: that flag is advisory and never fails the gate",
+    r.ledger.filter(function (l) { return /Schema.Default/.test(l.msg); })
+      .every(function (l) { return l.advisory === true; }));
+  var noDefault = E.convert({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "gemini");
+  ok("go: a schema with no null default gains no such note",
+    !has(noDefault.ledger, "`Schema.Default` is `any` with `omitempty`"));
+  var zeroDefault = E.convert({ type: "object", properties: { a: { type: "integer", "default": 0 } }, required: ["a"] }, "gemini");
+  ok("go: `default: 0` is NOT flagged — only an explicit null is unrepresentable",
+    !has(zeroDefault.ledger, "`Schema.Default` is `any` with `omitempty`"));
+
+  // The consequence text has to name the client, because the consequence
+  // differs by client and only the caller knows which one they are (#319).
+  ok("go: the `$ref` inlining note names Go's silent drop",
+    has(r.ledger, "Go DROPS IT SILENTLY"));
+  var openMap = E.convert({ type: "object", additionalProperties: { type: "string" } }, "gemini");
+  ok("go: the open-map blocker names Go's silent drop",
+    has(openMap.ledger, "drops it during unmarshal with no error"));
+  ok("go: the open-map blocker is still a blocker, not downgraded",
+    openMap.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+
+  // Over-blocking guards: none of this may leak into the other targets.
+  ["gemini-json", "openai", "anthropic", "anthropic-go"].forEach(function (p) {
+    var x = E.convert(JSON.parse(JSON.stringify(PYD)), p);
+    ok(p + " gains no Go `Schema.Default` note",
+      !has(x.ledger, "`Schema.Default` is `any` with `omitempty`"));
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -880,5 +880,26 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     run(["--to", "openai", "--check"], GO_ANY).status === 3);
 })();
 
+// --- Cycle #334: the Go-client note is advisory and must not fail a gate ----
+// A schema that is fully valid for the narrow `responseSchema` path but carries
+// an explicit `default: null` (every Pydantic `Optional[x] = None` field) picks
+// up a Go-only note. An advisory that failed `--check` would be a false CI
+// failure for JS and Python callers, which is the exact bug #317 fixed.
+(function () {
+  var NULL_DEFAULT = JSON.stringify({
+    type: "object",
+    properties: { note: { type: "string", "default": null }, id: { type: "string" } },
+    required: ["id"],
+    propertyOrdering: ["note", "id"]
+  });
+  var o = run(["--to", "gemini", "--check"], NULL_DEFAULT);
+  ok("a `default: null` schema still passes --check for gemini", o.status === 0);
+  ok("...and the Go-only loss is reported anyway", /omitempty/.test(o.stderr));
+  ok("`default: null` is not deleted from the output",
+    JSON.parse(run(["--to", "gemini"], NULL_DEFAULT).stdout).properties.note.default === null);
+  ok("the note does not appear on gemini-json",
+    !/omitempty/.test(run(["--to", "gemini-json", "--check"], NULL_DEFAULT).stderr));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
