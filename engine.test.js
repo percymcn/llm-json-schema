@@ -243,6 +243,88 @@ var PYDANTIC = {
   }));
 })();
 
+// --- tuples: verbatim generator output ------------------------------------
+// Both fixtures below are copied unmodified from real generators:
+//   PYD_TUPLE  = pydantic 2.x  `Tuple[float, float, float, float]` + `Set[str]`
+//   ZOD_TUPLE7 = zod 4.4.3     z.toJSONSchema(schema, { target: "draft-7" })
+// openai@7.4.0's toStrictJsonSchema throws on both shapes; before this, the
+// engine passed them through and reported "Already valid for openai".
+var PYD_TUPLE = {
+  type: "object",
+  properties: {
+    labels: { items: { type: "string" }, title: "Labels", type: "array", uniqueItems: true },
+    bbox: {
+      maxItems: 4, minItems: 4, title: "Bbox", type: "array",
+      prefixItems: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+    }
+  },
+  required: ["labels", "bbox"],
+  title: "Span"
+};
+
+(function () {
+  var r = E.toOpenAI(PYD_TUPLE);
+  var bbox = r.schema.properties.bbox;
+  ok("homogeneous prefixItems collapses into object-form items",
+    !("prefixItems" in bbox) && !Array.isArray(bbox.items) && bbox.items.type === "number");
+  ok("collapsed tuple keeps its fixed length", bbox.minItems === 4 && bbox.maxItems === 4);
+  ok("the collapse is reported, not silent", has(r.ledger, "Collapsed a 4-element tuple"));
+  ok("uniqueItems is still stripped alongside it", !("uniqueItems" in r.schema.properties.labels));
+})();
+
+(function () {
+  // draft-07 tuple form: `items` is an ARRAY. Same rejection, different keyword.
+  var ZOD_TUPLE7 = {
+    type: "object",
+    properties: { bbox: { type: "array", items: [{ type: "number" }, { type: "number" }] } },
+    required: ["bbox"],
+    additionalProperties: false
+  };
+  var r = E.toOpenAI(ZOD_TUPLE7);
+  ok("homogeneous draft-07 tuple-form items collapses too",
+    !Array.isArray(r.schema.properties.bbox.items) &&
+    r.schema.properties.bbox.items.type === "number" &&
+    r.schema.properties.bbox.maxItems === 2);
+})();
+
+(function () {
+  // A heterogeneous tuple genuinely cannot be represented. Claiming a fix here
+  // would be the false pass this whole class of bug is about.
+  var r = E.toOpenAI({
+    type: "object",
+    properties: { pair: { type: "array", prefixItems: [{ type: "string" }, { type: "number" }] } },
+    required: ["pair"]
+  });
+  ok("heterogeneous tuple is a blocker, not a silent rewrite",
+    r.ledger.some(function (l) { return l.op === "!" && l.msg.indexOf("differently-typed") !== -1; }));
+  ok("a blocked tuple is left visible so the shape can be remodelled",
+    Array.isArray(r.schema.properties.pair.prefixItems));
+})();
+
+(function () {
+  // The walker skipped array-form `items` entirely, so nested objects inside a
+  // tuple were never visited and kept their optional fields.
+  var r = E.toOpenAI({
+    type: "object",
+    properties: {
+      pairs: {
+        type: "array",
+        items: [{ type: "object", properties: { a: { type: "string" }, b: { type: "string" } }, required: ["a"] }]
+      }
+    },
+    required: ["pairs"]
+  });
+  ok("objects nested inside a tuple are visited and made strict",
+    r.schema.properties.pairs.items.required.indexOf("b") !== -1);
+})();
+
+["openai", "anthropic", "gemini"].forEach(function (provider) {
+  var once = E.convert(PYD_TUPLE, provider, { mode: "schema" });
+  var twice = E.convert(once.schema, provider, { mode: "schema" });
+  ok(provider + " is idempotent on pydantic tuple output",
+    twice.ledger.filter(function (l) { return l.op !== "="; }).length === 0);
+});
+
 ["openai", "anthropic", "gemini"].forEach(function (provider) {
   var once = E.convert(PYDANTIC, provider, { mode: "schema" });
   var twice = E.convert(once.schema, provider, { mode: "schema" });

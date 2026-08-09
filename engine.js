@@ -109,7 +109,17 @@
   //   THROWS     uniqueItems minProperties maxProperties patternProperties
   //              propertyNames unevaluatedProperties unevaluatedItems
   //              additionalItems contains minContains not allOf
-  //              dependentRequired if then else
+  //              dependentRequired dependencies if then else
+  //              prefixItems maxContains contentEncoding contentMediaType
+  //              contentSchema $anchor $dynamicRef $recursiveRef
+  //
+  // `prefixItems` was originally classified as structural-and-supported here
+  // WITHOUT being probed. It is in the SDK's unsupported set, and array-form
+  // `items` throws separately ("uses tuple-form `items`"). Both are what an
+  // ordinary tuple compiles to — Pydantic `Tuple[float, float, float, float]`
+  // emits `prefixItems`, zod `z.tuple()` emits either depending on target
+  // dialect — so both leaked through and produced a schema the API rejects.
+  // See normalizeTuple.
   //
   // The split is coherent: strict mode errors on keywords whose validation
   // semantics its constrained decoder cannot compile, and accepts (ignores)
@@ -121,7 +131,10 @@
   var OPENAI_SUPPORTED = {
     // structural
     type: 1, properties: 1, required: 1, additionalProperties: 1,
-    items: 1, prefixItems: 1, anyOf: 1, enum: 1, "const": 1, $ref: 1, $defs: 1,
+    // `items` only in its OBJECT form — the draft-07 ARRAY form is a tuple and
+    // is rejected ("uses tuple-form `items`"). normalizeTuple owns that case.
+    // `prefixItems` is NOT here: it is in the SDK's own unsupported set.
+    items: 1, anyOf: 1, enum: 1, "const": 1, $ref: 1, $defs: 1,
     // root metadata — explicitly retained by toStrictJsonSchema as rootMetadata
     $schema: 1, $id: 1,
     // annotations — preserved by the SDK transformer, and they steer the model
@@ -284,6 +297,59 @@
     return result;
   }
 
+  // Key-order-independent structural identity, so two tuple entries that a
+  // generator emitted with the same shape compare equal regardless of key order.
+  function canonical(v) {
+    if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";
+    if (isPlainObject(v)) {
+      return "{" + Object.keys(v).sort().map(function (k) {
+        return JSON.stringify(k) + ":" + canonical(v[k]);
+      }).join(",") + "}";
+    }
+    return JSON.stringify(v);
+  }
+
+  // OpenAI strict mode has NO tuple form. openai@7.4.0's toStrictJsonSchema
+  // throws on `prefixItems` ("uses unsupported keyword `prefixItems`") and on
+  // array-form `items` ("uses tuple-form `items`"). A fixed-length tuple whose
+  // entries are all the same schema is exactly a fixed-length array, so it
+  // converts losslessly to `items` + `minItems`/`maxItems`. A heterogeneous
+  // tuple is genuinely not representable: collapsing it would either widen it
+  // (union of the entries, losing per-position typing) or drop positions
+  // entirely. That is a human fix, so it becomes a blocker rather than a
+  // silent rewrite. Returns true when the tuple keyword must be left in place.
+  function normalizeTuple(node, path, ledger) {
+    var tuple = null, kw = null;
+    if (Array.isArray(node.prefixItems)) { tuple = node.prefixItems; kw = "prefixItems"; }
+    else if (Array.isArray(node.items)) { tuple = node.items; kw = "items"; }
+    if (!tuple || !tuple.length) return false;
+
+    var head = canonical(tuple[0]);
+    var homogeneous = tuple.every(function (t) { return canonical(t) === head; });
+
+    if (!homogeneous) {
+      ledger.push(entry("!", path,
+        "This is a " + tuple.length + "-element tuple with differently-typed positions (`" + kw +
+        "`), which OpenAI strict mode cannot represent — it has no tuple form. Model it as an object " +
+        "with one named property per position instead; that keeps each position's type and is what the " +
+        "model fills in more reliably anyway.",
+        DOCS.openai));
+      return true;
+    }
+
+    var n = tuple.length;
+    node.items = clone(tuple[0]);
+    if (kw === "prefixItems") delete node.prefixItems;
+    if (node.minItems === undefined) node.minItems = n;
+    if (node.maxItems === undefined) node.maxItems = n;
+    ledger.push(entry("~", path,
+      "Collapsed a " + n + "-element tuple (`" + kw + "`) into `items` with `minItems`/`maxItems` of " + n +
+      " — OpenAI strict mode has no tuple form, but every position here has the same schema, so the " +
+      "fixed length survives as a constraint.",
+      DOCS.openai));
+    return false;
+  }
+
   function toOpenAI(schema) {
     var s = clone(schema);
     var ledger = [];
@@ -314,9 +380,14 @@
           DOCS.openai));
       }
 
+      var tupleBlocked = normalizeTuple(node, path, ledger);
+
       // strip every keyword outside the supported set (unsupported => API error)
       Object.keys(node).forEach(function (k) {
         if (OPENAI_SUPPORTED[k]) return;
+        // A blocked tuple stays visible so the reader can see the shape they
+        // have to remodel; deleting it would hide the very thing to fix.
+        if (k === "prefixItems" && tupleBlocked) return;
         var why = OPENAI_STRIP_REASON[k] ||
           "not in OpenAI's supported keyword set, and strict mode errors on unsupported keywords.";
         delete node[k];
@@ -535,6 +606,12 @@
       });
     }
     if (isPlainObject(node.items)) walk(node.items, path + "[]", fn);
+    // draft-07 tuple form: `items` is an ARRAY of schemas. Descending only into
+    // the object form left every sub-schema of a `z.tuple()` unvisited, so a
+    // nested object inside a tuple never got `additionalProperties: false`.
+    if (Array.isArray(node.items)) {
+      node.items.forEach(function (it, i) { walk(it, path + "[" + i + "]", fn); });
+    }
     if (Array.isArray(node.prefixItems)) {
       node.prefixItems.forEach(function (it, i) { walk(it, path + "[" + i + "]", fn); });
     }
