@@ -24,7 +24,8 @@
   var DOCS = {
     openai: "https://developers.openai.com/api/docs/guides/structured-outputs",
     anthropic: "https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview",
-    gemini: "https://ai.google.dev/gemini-api/docs/structured-output"
+    gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
+    "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations"
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -1162,7 +1163,77 @@
     });
   }
 
-  var CONVERTERS = { openai: toOpenAI, anthropic: toAnthropic, gemini: toGemini };
+  // ---- OpenAI, NON-strict surfaces -----------------------------------------
+  //
+  // `openai` above models Structured Outputs / strict mode. That is not the only
+  // OpenAI dialect, and the switch is not in the schema — it is which API you call.
+  //
+  // openai@7.4.0's `helpers/zod.js` exports FIVE schema builders. Four of them
+  // (`zodResponseFormat`, `zodTextFormat`, `zodFunction`, `zodResponsesFunction`)
+  // hardcode `strict: true` and run the schema through `toStrictJsonSchema()`.
+  // The fifth, `zodRealtimeFunction`, calls `zodV3ToNonStrictJsonSchema` /
+  // `zodV4ToNonStrictJsonSchema` — which never call `toStrictJsonSchema()` — and
+  // deliberately omits `strict`, with this docstring:
+  //
+  //   "Unlike zodResponsesFunction, this helper does not add `strict` because
+  //    Realtime function tools do not support that field."
+  //
+  // Corroborated by the request types themselves:
+  //   - `FunctionDefinition` (chat/responses) has `strict?: boolean | null`, documented
+  //     "Only a subset of JSON Schema is supported when `strict` is `true`."
+  //     The subset restriction is CONDITIONAL on strict.
+  //   - `RealtimeFunctionTool` has exactly four fields — description, name,
+  //     `parameters?: unknown`, type. There is NO `strict` field at all, and
+  //     `parameters` is documented as plain "Parameters of the function in JSON Schema"
+  //     with no subset caveat.
+  //
+  // So the strip list in `toOpenAI` is justified by "unsupported schema -> you will
+  // receive an error", which is a claim about STRICT MODE, not about OpenAI. Applying
+  // it here would destroy real constraints to buy nothing — the same cross-policy
+  // strip mistake the Gemini path already had.
+  //
+  // Error policy on this surface: the subset rule does not apply, so nothing is
+  // stripped and nothing is rewritten. Constraints are not grammar-enforced either
+  // (there is no constrained decoder without strict), so they are advisory to the
+  // model — which is worth SAYING, and is the whole value of this target.
+  function toOpenAIRealtime(input) {
+    var schema = clone(input);
+    var ledger = [];
+    var url = DOCS["openai-realtime"];
+
+    ledger.push(entry("=", "root",
+      "No changes needed. This surface has no `strict` field, so the Structured Outputs " +
+      "keyword subset does not apply — your schema is sent as plain JSON Schema.", url));
+
+    // Everything `toOpenAI` would have removed or rewritten is legal here. Name the
+    // specific keywords found so the reader can see the divergence is real and is
+    // about their schema, not a generic disclaimer.
+    var kept = [];
+    walk(schema, "root", function (node, path) {
+      Object.keys(node).forEach(function (k) {
+        if (OPENAI_SUPPORTED[k] || kept.indexOf(k) !== -1) return;
+        if (k === "properties" || k === "$defs" || k === "definitions") return;
+        kept.push(k);
+        ledger.push(entry("=", path,
+          "`" + k + "` is kept. Strict mode cannot represent it, but this surface is not " +
+          "strict, so it is neither an error nor stripped.", url));
+      });
+    });
+
+    ledger.push(entry("!", "root",
+      "Without `strict`, the model is not grammar-constrained: every constraint here is " +
+      "guidance the model can violate, so keep validating the response yourself.",
+      url, true));
+
+    return { schema: schema, ledger: ledger };
+  }
+
+  var CONVERTERS = {
+    openai: toOpenAI,
+    anthropic: toAnthropic,
+    gemini: toGemini,
+    "openai-realtime": toOpenAIRealtime
+  };
 
   // ---- public API ----------------------------------------------------------
 

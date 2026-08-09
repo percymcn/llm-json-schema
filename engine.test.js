@@ -694,5 +694,47 @@ var PYD_TUPLE = {
     twice.ledger.filter(function (l) { return l.op !== "="; }).length === 0);
 });
 
+// --- OpenAI non-strict (Realtime) is a SEPARATE surface, not a second opinion ---
+// openai@7.4.0 helpers/zod.js: zodRealtimeFunction uses zodV3/V4ToNonStrictJsonSchema
+// (never toStrictJsonSchema) and omits `strict`, because RealtimeFunctionTool has no
+// such field. "Only a subset of JSON Schema is supported when `strict` is `true`" is
+// therefore a claim about strict mode, not about OpenAI — so nothing may be stripped.
+(function () {
+  var SRC = {
+    type: "object",
+    properties: {
+      name: { type: "string" },
+      tags: { type: "array", uniqueItems: true, items: { type: "string" } }
+    },
+    required: ["name"]
+  };
+  var rt = E.convert(SRC, "openai-realtime", { mode: "schema" });
+  var strict = E.convert(SRC, "openai", { mode: "schema" });
+
+  ok("openai-realtime leaves the schema byte-identical",
+    JSON.stringify(rt.schema) === JSON.stringify(SRC));
+  ok("openai-realtime keeps uniqueItems, which strict mode strips",
+    JSON.stringify(rt.schema).indexOf("uniqueItems") !== -1 &&
+    JSON.stringify(strict.schema).indexOf("uniqueItems") === -1);
+  ok("openai-realtime does NOT force optional props into required",
+    rt.schema.required.length === 1);
+  ok("openai-realtime does NOT force additionalProperties:false",
+    rt.schema.additionalProperties === undefined);
+  ok("openai-realtime names the kept keyword so the divergence is visible",
+    has(rt.ledger, "`uniqueItems` is kept"));
+  ok("openai-realtime warns constraints are not grammar-enforced",
+    has(rt.ledger, "not grammar-constrained"));
+  ok("openai-realtime reports no substantive change",
+    rt.ledger.filter(function (l) { return !l.advisory && l.op !== "="; }).length === 0);
+  ok("openai-realtime is idempotent",
+    E.convert(rt.schema, "openai-realtime", { mode: "schema" }).ledger
+      .filter(function (l) { return !l.advisory && l.op !== "="; }).length === 0);
+
+  // The gate must not go red on an advisory, whatever op it carries. A `!` that is
+  // also advisory is a contradiction; letting one through red-flags a valid schema.
+  ok("no advisory entry is ever a blocker",
+    rt.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

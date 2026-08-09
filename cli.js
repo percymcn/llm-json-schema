@@ -18,7 +18,7 @@
 var fs = require("fs");
 var E = require("./engine.js");
 
-var PROVIDERS = ["openai", "anthropic", "gemini"];
+var PROVIDERS = ["openai", "anthropic", "gemini", "openai-realtime"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -88,7 +88,10 @@ var LABEL = { "!": "needs a human fix", "x": "removed", "+": "added", "~": "chan
 
 function renderLedger(ledger) {
   return ledger.map(function (l) {
-    return "  " + l.op + " " + l.path + " — " + l.msg + " [" + LABEL[l.op] + "]";
+    // An advisory never fails the gate, so it must not be labelled like something
+    // that does — "needs a human fix" on a passing build sends people hunting.
+    var label = l.advisory ? "optional" : LABEL[l.op];
+    return "  " + l.op + " " + l.path + " — " + l.msg + " [" + label + "]";
   }).join("\n");
 }
 
@@ -105,7 +108,10 @@ function main(argv) {
     if (!res.ok) return fail(res.error);
 
     var changes = res.ledger.filter(function (l) { return l.op !== "="; });
-    var blockers = res.ledger.filter(function (l) { return l.op === "!"; });
+    // An advisory entry must never fail the gate, whatever its op. A `!` that is
+    // also `advisory` is a contradiction, and letting one through is how a note
+    // ("this isn't grammar-enforced") turns into a red CI build on a valid schema.
+    var blockers = res.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
     // Advisory "=" entries record something the caller needs to KNOW but that
     // requires no edit — e.g. a keyword Gemini's `responseJsonSchema` path
     // silently ignores rather than rejects. They are not `changes`, so without
