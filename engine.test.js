@@ -3497,5 +3497,96 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
       properties: { a: { $ref: "#/$defs/T/type" } } }, "openai").ledger).length >= 1);
 })();
 
+// ---------------------------------------------------------------------------
+// Cycle #343: three keywords the BACKEND accepts that no CLIENT declares.
+//
+// GEMINI_ALLOWED was derived from three client artifacts that agreed exactly
+// (JS .d.ts, Python types.Schema, Go struct tags), and that agreement was read
+// as "this is the proto". Measured against the live v1beta endpoint — which
+// validates before auth, so a dummy key still returns a real verdict, and which
+// was control-checked (a bogus `type` IS rejected, eleven other stripped
+// keywords come back `Cannot find field`) — `oneOf`, `allOf` and `not` are
+// accepted at the root and nested. Stripping them deleted a constraint the
+// destination would have taken.
+(function () {
+  var PET = { title: "Pet", oneOf: [
+    { type: "object", properties: { meow: { type: "string" } }, required: ["meow"] },
+    { type: "object", properties: { bark: { type: "string" } }, required: ["bark"] } ] };
+
+  var G = E.convert(PET, "gemini");
+  // The whole point: the union SURVIVES. Before this change the output was
+  // `{"title":"Pet"}` — accepted by the backend, constraining nothing.
+  ok("gemini: `oneOf` is kept, not deleted",
+    Array.isArray(G.schema.oneOf) && G.schema.oneOf.length === 2);
+  // Guarded: with the rule reverted `oneOf` is gone entirely, and an unguarded
+  // dereference here aborts the whole file and hides every assertion after it
+  // (#322). A suite that cannot survive the absence of the thing it tests
+  // cannot tell you how much of it depends on that thing.
+  ok("gemini: and the branches keep their own properties",
+    !!(G.schema.oneOf && G.schema.oneOf[0] && G.schema.oneOf[0].properties &&
+       G.schema.oneOf[0].properties.meow));
+  ok("gemini: keeping it is ADVISORY, never a gate failure",
+    G.ledger.some(function (l) {
+      return l.advisory && l.msg.indexOf("Kept `oneOf`") !== -1;
+    }));
+  // #319: which client you use is a fact only the caller has, so the advisory
+  // must state the outcome per client rather than picking one.
+  ok("gemini: the advisory names the Python raise",
+    has(G.ledger, "raises locally"));
+  ok("gemini: and names the Go silent drop",
+    has(G.ledger, "DROPS it with no error"));
+
+  ok("gemini: `allOf` is kept too",
+    Array.isArray(E.convert({ allOf: [{ type: "object",
+      properties: { a: { type: "string" } } }] }, "gemini").schema.allOf));
+  ok("gemini: `not` is kept too",
+    !!E.convert({ type: "string", not: { type: "string", pattern: "^x" } },
+      "gemini").schema.not);
+
+  // A converting client rebuilds the request from its own Schema type, and no
+  // client declares these — so there the strip is right, and only the reason
+  // changes. The two targets genuinely disagree about the same document.
+  var GC = E.convert(PET, "gemini-client");
+  ok("gemini-client: still strips `oneOf`", !("oneOf" in GC.schema));
+  ok("gemini-client: and no longer claims the PROTO cannot carry it",
+    has(GC.ledger, "the v1beta proto DOES have this field"));
+
+  // OVER-BLOCK GUARDS. The eleven keywords the endpoint really does reject
+  // must still be stripped — widening the allowlist wholesale would be the
+  // false-pass class this project calls worse than no gate.
+  ["$schema", "const", "uniqueItems", "exclusiveMinimum", "patternProperties",
+   "propertyNames", "contains", "dependentRequired", "multipleOf"].forEach(function (k) {
+    var input = { type: "object", properties: { a: { type: "string" } } };
+    input[k] = (k === "const" ? "x" : k === "uniqueItems" ? true :
+      k === "multipleOf" || k === "exclusiveMinimum" ? 2 : { a: { type: "string" } });
+    ok("gemini: still strips `" + k + "` (endpoint: Cannot find field)",
+      !(k in E.convert(input, "gemini").schema));
+  });
+
+  // The walker had no `not` arm — `not` holds a SINGLE subschema, so the
+  // combinator loop never saw it. That was latent while every target stripped
+  // or demoted `not` first; keeping it on gemini makes it load-bearing.
+  var NOT_MAP = { type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    not: { type: "object", properties: { b: { type: "object",
+      additionalProperties: { type: "string" } } } } };
+  ok("walk descends `not`: an open map inside it is still found",
+    E.convert(NOT_MAP, "gemini").ledger.some(function (l) {
+      return l.op === "!" && l.msg.indexOf("open map") !== -1;
+    }));
+  // Control: the same node NOT inside `not` was always found, so the assertion
+  // above is about the container and not about the open-map rule.
+  ok("control: the same open map outside `not` is found too",
+    E.convert({ type: "object", required: ["b"], properties: { b: { type: "object",
+      additionalProperties: { type: "string" } } } }, "gemini")
+      .ledger.some(function (l) { return l.op === "!"; }));
+  ok("walk descends `not`: a boolean subschema inside it is found",
+    E.convert({ type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "string" } },
+      not: { type: "object", properties: { b: true } } }, "openai")
+      .ledger.some(function (l) {
+        return l.op === "!" && l.msg.indexOf("boolean subschema") !== -1;
+      }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

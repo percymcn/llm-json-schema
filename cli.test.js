@@ -1008,5 +1008,35 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
 })();
 
 
+
+// Cycle #343: the three proto-only keywords are an ADVISORY on --to gemini.
+// An advisory that failed CI would be #317s exact mistake: the destination
+// accepts this document, so the gate must pass.
+(function () {
+  var PET = JSON.stringify({ title: "Pet", oneOf: [
+    { type: "object", properties: { meow: { type: "string" } }, required: ["meow"] },
+    { type: "object", properties: { bark: { type: "string" } }, required: ["bark"] } ] });
+
+  var chk = run(["--to", "gemini", "--check"], PET);
+  ok("gemini --check passes a oneOf schema (advisory, not a failure)",
+    chk.status === 0, "status=" + chk.status);
+  var conv = JSON.parse(run(["--to", "gemini"], PET).stdout);
+  ok("and the union survives conversion",
+    Array.isArray(conv.oneOf) && conv.oneOf.length === 2, JSON.stringify(conv));
+  ok("the advisory reaches stderr and names the per-client outcome",
+    run(["--to", "gemini"], PET).stderr.indexOf("depends on YOUR client") !== -1);
+
+  // The two Gemini targets genuinely disagree about this one file.
+  var cc = JSON.parse(run(["--to", "gemini-client"], PET).stdout);
+  ok("gemini-client still strips it", !("oneOf" in cc), JSON.stringify(cc));
+
+  // Guard: a keyword the endpoint really rejects must still fail the gate.
+  var bad = run(["--to", "gemini", "--check"],
+    JSON.stringify({ type: "object", properties: { a: { type: "string" } },
+      patternProperties: { "^a": { type: "string" } } }));
+  ok("a genuinely rejected keyword still fails --check",
+    bad.status !== 0, "status=" + bad.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

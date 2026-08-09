@@ -196,6 +196,8 @@
           node[kw].forEach(function (sub, i) { visit(sub, path + "/" + kw + "[" + i + "]"); });
         }
       });
+      // Single-subschema container — see the matching note in walk().
+      visit(node.not, path + "/not");
       ["$defs", "definitions"].forEach(function (bag) {
         if (isPlainObject(node[bag])) {
           Object.keys(node[bag]).forEach(function (k) { visit(node[bag][k], bag + "." + k); });
@@ -2242,6 +2244,34 @@
   };
   var GEMINI_STRING_FORMATS = { "date-time": 1, "date": 1, "time": 1, "enum": 1 };
 
+  // Keywords the BACKEND accepts but NO client type declares.
+  //
+  // GEMINI_ALLOWED above is a client-derived list — the JS `.d.ts` (#314), the
+  // Python `types.Schema` (#314b) and the Go struct's json tags (#334), which
+  // agreed exactly, and that agreement was read as "this is the proto". It is
+  // not. Measured 2026-08-09 against the live `v1beta` `generateContent`
+  // endpoint, which validates the payload BEFORE auth and so returns a real
+  // verdict with a dummy key: an unknown field comes back as
+  //   Invalid JSON payload received. Unknown name "X" at
+  //   'generation_config.response_schema': Cannot find field.
+  // Eleven keywords we strip do exactly that (`$ref`, `$schema`, `const`,
+  // `uniqueItems`, `exclusiveMinimum`, `patternProperties`, `propertyNames`,
+  // `if`, `contains`, `dependentRequired`, `multipleOf`), and a bogus `type`
+  // control is rejected too, so the oracle is live and discriminating.
+  // These three are NOT rejected, at the root or nested — the proto has the
+  // fields, so the message "the proto cannot carry it" was false for them and
+  // stripping deleted a constraint the destination would have accepted.
+  //
+  // Per client, on the SAME three (measured, not ported):
+  //   @google/genai 2.16.0 (JS) — forwards all three verbatim into
+  //     `responseSchema`; the request builds and the payload validates.
+  //   google-genai 2.17.0 (Python) — `types.Schema` is `extra="forbid"`, so
+  //     `model_validate` raises for each, at the root and nested.
+  //   google.golang.org/genai (Go) — no such struct fields, so `encoding/json`
+  //     drops them with `err == nil`: `{"oneOf":[…]}` unmarshals to `{}`.
+  // So this is #334's three-client split again, and Go is again the silent one.
+  var GEMINI_PROTO_ONLY = { "oneOf": 1, "allOf": 1, "not": 1 };
+
   // The OTHER path. `google-genai` (Python) 2.17.0 documents the backend's
   // accepted set for `response_json_schema` verbatim on the field itself:
   //   "While the full JSON Schema may be sent, not all features are supported.
@@ -2788,7 +2818,47 @@
         // the shape they have to remodel.
         if (tupleBlocked && (k === "prefixItems" || k === "items")) return;
         if (!GEMINI_ALLOWED[k]) {
-          if (k === "$ref") {
+          if (GEMINI_PROTO_ONLY[k]) {
+            // The proto has the field (see GEMINI_PROTO_ONLY). Deleting it
+            // would be the error policy mistake of #314 in its purest form —
+            // stripping something the destination accepts — and for `oneOf` on
+            // a discriminated union the node is often nothing BUT the union, so
+            // the strip did not narrow the schema, it emptied it: a `{"title":
+            // "Pet"}` that constrains nothing, which the backend then accepts.
+            //
+            // A converting client is the one case where it genuinely cannot
+            // survive: that layer rebuilds the request from its own Schema
+            // type, and no client declares these. So `--to gemini-client`
+            // still strips, and only the reason changes.
+            if (clientConverts) {
+              ledger.push(entry("x", path,
+                "Removed `" + k + "` — the v1beta proto DOES have this field, but a " +
+                "converting client rebuilds the request from its own `Schema` type and no " +
+                "client declares it (JS `.d.ts`, Python `types.Schema`, Go struct all lack " +
+                "it), so it cannot survive that layer. If you send the proto directly, or " +
+                "via `@google/genai` (which forwards it verbatim), use `--to gemini` and " +
+                "keep it.",
+                DOCS.gemini));
+              delete node[k];
+            } else {
+              // Advisory, never a gate failure: the destination accepts this,
+              // so failing CI on it would be #317's mistake. Which client you
+              // use is the one fact only the caller has (#319), so state the
+              // outcome per client rather than picking one.
+              ledger.push(entry("=", path,
+                "Kept `" + k + "` — the live v1beta endpoint accepts it in `responseSchema` " +
+                "(no `Cannot find field`), so the proto has this field even though no client " +
+                "type declares it. What happens next depends on YOUR client: " +
+                "`@google/genai` (JS) forwards it verbatim and the call goes through; " +
+                "`google-genai` (Python) raises locally (`types.Schema` is `extra=\"forbid\"`), " +
+                "so the request is never built; the Go client has no such field and " +
+                "`encoding/json` DROPS it with no error — `{\"" + k + "\": …}` unmarshals to " +
+                "`{}`, so the call succeeds against a schema that constrains nothing. " +
+                "If you are on Python or Go, remodel it (a discriminated union is often " +
+                "expressible as `anyOf`, which every client carries) rather than deleting it.",
+                DOCS.gemini, true));
+            }
+          } else if (k === "$ref") {
             ledger.push(entry("!", path,
               "`$ref` is not supported by Gemini (except recursive `#`). Inline the referenced schema.",
               DOCS.gemini));
@@ -2978,6 +3048,15 @@
         });
       }
     });
+    // `not` holds a SINGLE subschema rather than an array, so the combinator
+    // loop above never saw it. That was latent while every target either
+    // stripped `not` (openai, gemini) or demoted it (anthropic-json) before
+    // anything could hide inside it — but `--to gemini` now KEEPS it (the
+    // v1beta proto has the field), and a `$ref` or open map inside an unvisited
+    // `not` would be a false pass. NOT passed as a combinator member: `not`
+    // inverts its subschema rather than being one branch of a union, so the
+    // positional rule #337 added for `anyOf` members does not apply here.
+    if (isPlainObject(node.not)) walk(node.not, path + "/not", fn);
     ["$defs", "definitions"].forEach(function (bag) {
       if (isPlainObject(node[bag])) {
         Object.keys(node[bag]).forEach(function (k) { walk(node[bag][k], bag + "." + k, fn); });

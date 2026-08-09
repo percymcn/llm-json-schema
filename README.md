@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 533 engine + 166 CLI + 33 ESM/library assertions = **732** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 554 engine + 171 CLI + 33 ESM/library assertions = **758** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -198,6 +198,14 @@ Each provider accepts a different schema dialect, so a schema that works with on
   On that one schema Go silently deleted **16 key-paths** — including the whole `Addr` model, which became `{}` (the model may return literally anything there) — and the tuple's four element types, leaving a bare `array`. Go is the only client of any vendor probed by this project where an unsupported keyword produces **no signal at all**: it removes the evidence before the request is built, so the backend cannot object either. That is what `--check --to gemini` is for; in Go it is the only thing in the stack that will tell you.
 
   Two corollaries worth knowing. An unmarshal *error* does not mean nothing was written — Go's decoder keeps going, so `enum: [1, 2]` on an integer field returns an error **and** leaves `Enum = ["", ""]`, and a draft-07 tuple leaves `items: {}` (array of anything). And `Schema.Default` is `any` with `omitempty`, so an explicit `default: null` — which Pydantic emits for every `Optional[x] = None` field — is dropped even though the proto accepts it; that is the only key of *this tool's own output* a Go caller loses, and `--to gemini` says so as an advisory.
+
+- **Three keywords the backend accepts that no client declares — `oneOf`, `allOf`, `not`.**
+
+  The narrow-path allowlist was built from three *client* artifacts — the JS `.d.ts`, the Python `types.Schema`, and the Go struct's json tags — which agreed exactly on 22 keys. That agreement was read as "this is the proto". It is not. Measured 2026-08-09 against the live `v1beta` `generateContent` endpoint, which validates the payload **before** auth and so returns a real verdict with a dummy key: eleven keywords this tool strips come back `Unknown name "…" at 'generation_config.response_schema': Cannot find field` (`$ref`, `$schema`, `const`, `uniqueItems`, `exclusiveMinimum`, `patternProperties`, `propertyNames`, `if`, `contains`, `dependentRequired`, `multipleOf`), and a bogus `type` control is rejected too — so the oracle is live and discriminating. `oneOf`, `allOf` and `not` are **not** rejected, at the root or nested. The proto has those fields.
+
+  So the previous behaviour deleted a constraint the destination would have accepted, and for a discriminated union the node is often *nothing but* the union — `{"title":"Pet","oneOf":[…]}` came out as `{"title":"Pet"}`, which the backend then accepts happily while constraining nothing. `--to gemini` now **keeps** all three and says what happens next, because that depends on your client and not on your schema: `@google/genai` (JS) forwards them verbatim and the call goes through; `google-genai` (Python) raises locally, since `types.Schema` is `extra="forbid"`; the Go client has no such field, so `encoding/json` **drops it with `err == nil`** — `{"oneOf":[…]}` unmarshals to `{}`. It is an advisory, never a gate failure: the destination accepts the document, so failing CI on it would be wrong. `--to gemini-client` still strips them, because a converting client rebuilds the request from its own `Schema` type and no client declares them — the two targets genuinely disagree about the same file.
+
+  The general lesson is a bound on this project's own rule that a vendor SDK outranks a vendor doc. It still does — but an SDK is a statement about **what that client can carry**, never about what the service accepts, and a static type is the strongest form of that statement *and still only that statement*. When several independent clients agree, that is evidence they were generated from one shared subset, not evidence the subset is the whole API. Ask the service.
 
   The two accepted subsets are **complementary — neither is a superset**:
 
@@ -441,7 +449,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 712 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 758 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
