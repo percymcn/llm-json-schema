@@ -2587,16 +2587,32 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("mastra: it names the upstream cause rather than blaming the schema",
     has(wire.ledger, "z.record"));
 
-  // The discriminator, and it is the whole reason this is safe to ship:
-  // measured, a deliberate `z.object({})` emits `properties: {}`, while an
-  // emptied map has NO `properties` key. Empty-but-present must not fire.
+  // #335 asserted here that `properties: {}` proves a DELIBERATE empty object
+  // and must not fire. #340 REVERSED that, on measurement rather than taste:
+  // crewai 1.15.14's `force_additional_properties_false` empties a
+  // `Dict[str, str]` and then adds `properties: {}` + `required: []`, producing
+  // bytes identical to a genuinely empty BaseModel. The premise that
+  // `properties: {}` exonerates a node is simply false, so the advisory now
+  // fires on both and says out loud that it cannot tell them apart. It stays an
+  // advisory, and the statement it makes ("only legal value is `{}`") is true of
+  // a deliberate empty object too -- that field is dead either way.
   var legit = E.convert({
     type: "object",
     properties: { e: { type: "object", properties: {}, additionalProperties: false } },
     required: ["e"], additionalProperties: false
   }, "openai");
-  ok("mastra: a deliberate empty object (`properties: {}`) is NOT flagged",
-    !has(legit.ledger, "compatibility layer"));
+  ok("mastra: `properties: {}` no longer exonerates a node (#340 reversal)",
+    has(legit.ledger, "only legal value is `{}`"));
+  // `.every()` on an empty array is vacuously true, so require a hit first --
+  // otherwise this assertion passes on an engine that reports nothing at all.
+  var legitHits = legit.ledger.filter(function (l) { return /only legal value is/.test(l.msg); });
+  ok("mastra: and that report is advisory, never a gate failure",
+    legitHits.length > 0 && legitHits.every(function (l) { return l.advisory === true; }));
+  ok("mastra: the `properties: {}` form admits it cannot name the cause",
+    has(legit.ledger, "It no longer settles it"));
+  ok("mastra: while the no-`properties` form still names the cause outright",
+    !has(E.convert(JSON.parse(JSON.stringify(MASTRA_WIRE)), "openai").ledger,
+      "It no longer settles it"));
 
   // No double-report: a live open map is a blocker, not a fossil.
   var live = E.convert(JSON.parse(JSON.stringify(MASTRA_RAW)), "openai");
@@ -2955,9 +2971,16 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     var r = E.convert(sch, p);
     return r && r.ledger ? r : { schema: {}, ledger: [] };
   }
+  // Match the advisory on its SEMANTIC core ("its only legal value is `{}`"),
+  // not on an incidental clause. #340 changed "declares no `properties`" to
+  // "declares no usable `properties`" when the rule widened to cover
+  // `properties: {}`, and this helper -- keyed on the old literal -- reported
+  // three failures in code that was working correctly.
   function emptiedMapEntry(r) {
     for (var i = 0; i < r.ledger.length; i++) {
-      if (String(r.ledger[i].msg || "").indexOf("declares no `properties`") !== -1) return r.ledger[i];
+      var l = r.ledger[i];
+      if (l.op === "=" && l.advisory === true &&
+          String(l.msg || "").indexOf("only legal value is `{}`") !== -1) return l;
     }
     return null;
   }
@@ -3046,6 +3069,156 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   };
   ok("semantic-kernel: the array-form tuple is caught, not passed through",
     has(conv(SK_TUPLE, "openai").ledger, "Collapsed a 4-element tuple"));
+})();
+
+// ---------------------------------------------------------------------------
+// Cycle #340 -- crewai 1.15.14, and a repair that forges its own alibi.
+//
+// Every fixture below is the VERBATIM output of crewai's own public functions in
+// `crewai/utilities/pydantic_schema_utils.py`, captured 2026-08-09, and every
+// verdict is `openai@7.4.0`'s `toStrictJsonSchema()`.
+//
+// The module ships TWO pipelines over the same four passes:
+//   `_common_strict_pipeline`   -> `sanitize_tool_params_for_{openai,anthropic,
+//                                   bedrock}_strict`  (tools path)
+//   `generate_model_description` -> 16 call sites, and it stamps `strict: True`
+// and they apply those passes in a DIFFERENT ORDER, which is why one field can
+// come out of the two surfaces in two different broken states.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  // Key on the ledger OP, not on the prose. The open-map BLOCKER explains that
+  // closing the map would leave "an object whose only legal value is `{}`", so
+  // matching that phrase alone cannot tell the blocker from the advisory --
+  // the same trap #339 hit and recorded. A fossil is `=` and always advisory.
+  function fossil(r) {
+    return r.ledger.filter(function (l) {
+      return l.op === "=" && l.advisory === true &&
+        String(l.msg || "").indexOf("only legal value is `{}`") !== -1;
+    });
+  }
+
+  // `Dict[str, str]` through the tool path. `force_additional_properties_false`
+  // overwrites `additionalProperties` with `false` AND adds `properties: {}` +
+  // `required: []`.
+  var CW_MAP_TOOLS = {
+    type: "object", additionalProperties: false, required: ["name", "tags"],
+    properties: {
+      name: { type: "string" },
+      tags: { type: "object", additionalProperties: false, properties: {}, required: [] }
+    }
+  };
+  // A genuinely EMPTY BaseModel through the same path.
+  var CW_EMPTY_TOOLS = {
+    type: "object", additionalProperties: false, required: ["name", "blank"],
+    properties: {
+      name: { type: "string" },
+      blank: { type: "object", additionalProperties: false, properties: {}, required: [] }
+    }
+  };
+
+  // THE FINDING: the two nodes are byte-identical. The repair did not merely
+  // delete the value type, it manufactured the evidence that would have told
+  // the two apart.
+  ok("crewai: an emptied map and a real empty model are byte-identical",
+    JSON.stringify(CW_MAP_TOOLS.properties.tags) ===
+    JSON.stringify(CW_EMPTY_TOOLS.properties.blank));
+
+  // Vendor ACCEPTS both verbatim, so nothing downstream will ever warn. Before
+  // #340 our advisory was silent on both -- the false negative this block fixes.
+  ok("crewai: the emptied map is now reported", fossil(conv(CW_MAP_TOOLS, "openai")).length === 1);
+  ok("crewai: and only as an advisory",
+    fossil(conv(CW_MAP_TOOLS, "openai")).every(function (l) { return l.advisory === true; }));
+  ok("crewai: the advisory does not fail the gate",
+    conv(CW_MAP_TOOLS, "openai").ledger.every(function (l) { return l.advisory === true; }));
+  ok("crewai: the advisory names crewai as the producer that erases the marker",
+    has(conv(CW_MAP_TOOLS, "openai").ledger, "force_additional_properties_false"));
+  ok("crewai: and refuses to claim which cause it was",
+    has(conv(CW_MAP_TOOLS, "openai").ledger, "It no longer settles it"));
+
+  // `type: ["object", "null"]` matches neither `force_additional_properties_false`
+  // nor `ensure_all_properties_required` (both compare `type == "object"` with
+  // strict equality), so the node is neither closed nor required-completed and
+  // the VENDOR THROWS on the sanitizer's own output. We must catch what crewai's
+  // own strict-mode sanitizer does not.
+  var CW_UNIONOBJ_TOOLS = {
+    type: "object", additionalProperties: false, required: ["inner"],
+    properties: { inner: { type: ["object", "null"], properties: { a: { type: "string" } } } }
+  };
+  ok("crewai: a union-typed object skipped by its `== \"object\"` dispatch is caught",
+    conv(CW_UNIONOBJ_TOOLS, "openai").ledger.length > 0);
+  // Guarded: a reverted engine must REPORT these as failures, not crash the file
+  // and hide every assertion after it (#322's trap, hit five times now).
+  function innerOf(r) {
+    return (((r || {}).schema || {}).properties || {}).inner || {};
+  }
+  ok("crewai: and our repair closes it",
+    innerOf(conv(CW_UNIONOBJ_TOOLS, "openai")).additionalProperties === false);
+  ok("crewai: and completes its `required`",
+    JSON.stringify(innerOf(conv(CW_UNIONOBJ_TOOLS, "openai")).required) ===
+    JSON.stringify(["a"]));
+
+  // Same dispatch miss, opposite consequence: the union `type` is what SAVES the
+  // open map from being emptied -- and the vendor then rejects it. A live open
+  // map is a blocker, not a fossil, and our detector must see through the union.
+  var CW_UNIONMAP_TOOLS = {
+    type: "object", additionalProperties: false, required: ["tags"],
+    properties: { tags: { type: ["object", "null"], additionalProperties: { type: "string" } } }
+  };
+  ok("crewai: a union-typed OPEN map is a blocker, not the fossil advisory",
+    conv(CW_UNIONMAP_TOOLS, "openai").ledger.some(function (l) {
+      return l.op === "!" && !l.advisory && /This is an open map/.test(l.msg);
+    }) && fossil(conv(CW_UNIONMAP_TOOLS, "openai")).length === 0);
+
+  // ORDERING: `Optional[Any] = None` out of the two surfaces. The tools path
+  // keeps a closed `anyOf`; the response-format path -- which runs
+  // `force_additional_properties_false` BEFORE `ensure_type_in_schemas`, so the
+  // object that pass invents is never closed -- emits a bare `{"type":"object"}`
+  // that the vendor then repairs. Same field, same version, two shapes.
+  var CW_OPTANY_RF = {
+    type: "object", additionalProperties: false, required: ["name", "payload"], title: "OptAnyField",
+    properties: { name: { type: "string", title: "Name" },
+                  payload: { type: "object", title: "Payload", default: null } }
+  };
+  var CW_OPTANY_TOOLS = {
+    type: "object", additionalProperties: false, required: ["name", "payload"],
+    properties: { name: { type: "string" },
+                  payload: { anyOf: [{ type: "object", additionalProperties: false,
+                                       properties: {}, required: [] }, { type: "null" }] } }
+  };
+  ok("crewai: the response-format surface leaves the invented object OPEN",
+    conv(CW_OPTANY_RF, "openai").ledger.some(function (l) { return !l.advisory; }));
+  ok("crewai: the tools surface does not, and we leave it alone",
+    conv(CW_OPTANY_TOOLS, "openai").ledger.every(function (l) { return l.advisory === true; }));
+
+  // Over-blocking guards. crewai already deleted the undeclared `required` name
+  // upstream (`["a","ghost"]` -> `["a"]`), and the vendor accepts the result --
+  // so there is nothing left for us to report on THIS file.
+  var CW_GHOST_TOOLS = {
+    type: "object", additionalProperties: false, required: ["a"],
+    properties: { a: { type: "string" } }
+  };
+  ok("crewai: a required list crewai already pruned needs no change from us",
+    conv(CW_GHOST_TOOLS, "openai").ledger.length === 0);
+  var CW_PLAIN_TOOLS = {
+    type: "object", additionalProperties: false, required: ["name", "count"],
+    properties: { name: { type: "string" }, count: { type: "integer" } }
+  };
+  ok("crewai: an ordinary sanitized model is left untouched",
+    conv(CW_PLAIN_TOOLS, "openai").ledger.length === 0);
+
+  // `prefixItems` survives BOTH pipelines untouched and the vendor throws on all
+  // four surfaces -- while `generate_model_description` stamps `strict: True`.
+  var CW_TUPLE_RF = {
+    type: "object", additionalProperties: false, required: ["bbox"], title: "Tup",
+    properties: { bbox: { type: "array", title: "Bbox", minItems: 4, maxItems: 4,
+                          prefixItems: [{ type: "integer" }, { type: "integer" },
+                                        { type: "integer" }, { type: "integer" }] } }
+  };
+  ok("crewai: the tuple its sanitizer never touches is caught",
+    has(conv(CW_TUPLE_RF, "openai").ledger, "Collapsed a 4-element tuple"));
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 444 engine + 153 CLI + 33 ESM/library assertions = **630** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 494 engine + 158 CLI + 33 ESM/library assertions = **685** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -278,6 +278,31 @@ SDK then stamps `strict: True` anyway. `openai@7.4.0`'s `toStrictJsonSchema()`
 misses). The three payloads in this repo's tests are the verbatim output of the
 Python SDK, so they are a regression pin on that disagreement.
 
+Once a layer has already made that edit, the value type is gone and no tool can
+recover it — so this tool reports the leftover node as an **advisory**, never a
+gate failure. Every provider accepts it, so nothing else will warn you.
+
+The advisory used to require the `properties` key to be *absent*, on the
+reasoning that a generator writing `properties: {}` must have meant a genuinely
+empty object. **crewai 1.15.14 disproves that.** Its
+`force_additional_properties_false`
+(`crewai/utilities/pydantic_schema_utils.py`) overwrites the value schema with
+`false` **and then adds `properties: {}` and `required: []`**, so on its tool
+path a `Dict[str, str]` field and a genuinely empty `BaseModel` come out
+byte-identical:
+
+```json
+{ "type": "object", "additionalProperties": false, "properties": {}, "required": [] }
+```
+
+A repair that deletes is bad; a repair that deletes *and manufactures the
+evidence that would have exonerated it* leaves nothing to infer from. So the
+rule stopped trying to name the cause and now states the part that is certain
+and identical in both cases — **this node's only legal value is `{}`, so the
+field is dead** — and says explicitly that it cannot tell you which happened.
+Where the `properties` key really is absent, no generator produces that shape
+for a declared empty object, and the advisory still names the cause outright.
+
 ### Boolean subschemas — what Go emits for `any`
 
 JSON Schema defines a schema as *"an object **or a boolean**"*: `true` matches
@@ -416,7 +441,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 120 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 685 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

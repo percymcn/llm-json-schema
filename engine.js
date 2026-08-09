@@ -117,14 +117,43 @@
   // the key to be missing separates a real empty object from an emptied map.
   // Being merely noisier than the vendor is this project's most repeated bug,
   // so this is advisory-only and never fails a gate.
-  function isEmptiedMap(node) {
-    if (!isPlainObject(node)) return false;
-    if (node.additionalProperties !== false) return false;
-    if ("properties" in node) return false;
+  // Two FORMS of the same dead node, and the difference is how much we are
+  // entitled to say about it.
+  //
+  //   "no-properties"    -- `additionalProperties: false` and NO `properties`
+  //                         key at all. No generator emits that for a declared
+  //                         empty object (they all write `properties: {}`), so
+  //                         this shape is only ever what is LEFT of a map.
+  //   "empty-properties" -- `properties: {}` as well. Measured on crewai
+  //                         1.15.14: `force_additional_properties_false`
+  //                         overwrites the value schema AND then adds
+  //                         `properties: {}` + `required: []`, so a
+  //                         `Dict[str, str]` comes out BYTE-IDENTICAL to a
+  //                         genuinely empty BaseModel. The cause is no longer
+  //                         recoverable from the file -- but the CONSEQUENCE is
+  //                         identical either way, and that is the part worth
+  //                         reporting.
+  //
+  // #335 keyed only on the first form, on the reasoning that `properties: {}`
+  // proves someone meant an empty object. crewai disproves the premise: a
+  // repair can DELETE the value type and FABRICATE the marker that would have
+  // exonerated it. So the rule stops trying to infer the cause and states what
+  // is certain — this node's only legal value is `{}`.
+  function emptiedMapForm(node) {
+    if (!isPlainObject(node)) return null;
+    if (node.additionalProperties !== false) return null;
     var t = node.type;
-    if (t === "object") return true;
-    if (Array.isArray(t) && t.indexOf("object") !== -1) return true;
-    return false;
+    var isObj = t === "object" || (Array.isArray(t) && t.indexOf("object") !== -1);
+    if (!isObj) return null;
+    if (!("properties" in node)) return "no-properties";
+    if (isPlainObject(node.properties) && Object.keys(node.properties).length === 0) {
+      return "empty-properties";
+    }
+    return null;
+  }
+
+  function isEmptiedMap(node) {
+    return emptiedMapForm(node) !== null;
   }
 
   // ---- boolean subschemas ---------------------------------------------------
@@ -2883,9 +2912,22 @@
     // Reported on the INPUT, because a converter that legitimately closes an
     // object would otherwise make us report our own edit back to the caller.
     walk(schema, "root", function (node, path) {
-      if (!isEmptiedMap(node)) return;
+      var form = emptiedMapForm(node);
+      if (!form) return;
+      // When `properties: {}` is present we genuinely cannot tell an emptied map
+      // from a declared empty object — crewai produces the same bytes for both —
+      // so the advisory says so instead of asserting a cause it cannot know.
+      var causeNote = form === "empty-properties"
+        ? " NOTE on this one: it also carries `properties: {}`, which USUALLY means someone " +
+          "declared an empty object on purpose. It no longer settles it. Measured on crewai " +
+          "1.15.14, `force_additional_properties_false` " +
+          "(`crewai/utilities/pydantic_schema_utils.py`) overwrites the value schema of a " +
+          "`Dict[str, str]` with `false` and then ADDS `properties: {}` and `required: []`, so " +
+          "an emptied map and a genuinely empty model come out byte-identical on its tool path. " +
+          "Whichever it is, the field is dead: check the source model."
+        : "";
       result.ledger.push(entry("=", path,
-        "This object is closed (`additionalProperties: false`) and declares no `properties`, " +
+        "This object is closed (`additionalProperties: false`) and declares no usable `properties`, " +
         "so its only legal value is `{}` — the model can never put anything in it. Every " +
         "provider accepts this, so nothing will warn you. Most often it is not what anyone " +
         "wrote: it is what is left after something set `additionalProperties: false` on a " +
@@ -2904,7 +2946,8 @@
         "a different code path in that framework — measured: handing semantic-kernel the same " +
         "model as a Pydantic `BaseModel` instead of a plain class keeps the map OPEN, which the " +
         "vendor then rejects loudly instead of accepting a field that can never be filled. " +
-        "If you really did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
+        causeNote +
+        " If you really did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
         DOCS[provider], true));
     });
 
