@@ -115,5 +115,8 @@ const ZOD_OUTPUT = {
   }
 })();
 
+ok("`gemini-client` is a documented provider over ESM",
+  typeof DOCS["gemini-client"] === "string" && DOCS["gemini-client"].length > 0);
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

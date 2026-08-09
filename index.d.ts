@@ -14,6 +14,7 @@ export type Provider =
   | "anthropic-go"
   | "gemini"
   | "gemini-json"
+  | "gemini-client"
   | "openai-realtime";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */

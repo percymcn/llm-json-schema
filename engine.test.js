@@ -2625,5 +2625,120 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     noProps.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
 })();
 
+// ---------------------------------------------------------------------------
+// #336 — google-adk 2.6.3, the first framework probed here whose input dialect
+// is MUTUALLY EXCLUSIVE with the vendor's own request field.
+//
+// Measured, not reasoned (google-adk==2.6.3, google-genai==2.17.0, live v1beta
+// pre-auth proto oracle, control-checked with `{"type":"frobnicate"}`):
+//   * straight to `responseSchema`: `{type:"STRING", nullable:true}` ACCEPTED,
+//     `{type:["string","null"]}` REJECTED (`Unknown name "type"`).
+//   * through ADK: the reverse — `nullable` is dropped (not a field of its
+//     `_ExtendedJSONSchema`), the union form becomes `nullable` correctly.
+// So there is no intersection document, which is why this is its own target.
+(function () {
+  var UNION_NULL = { type: "object", properties: { v: { type: ["string", "null"] } }, required: ["v"] };
+  var MULTI      = { type: "object", properties: { x: { type: ["string", "integer"] } }, required: ["x"] };
+  var LOOSE      = { type: "object", properties: { a: { type: "array" } }, required: ["a"] };
+  var TUPLE      = { type: "object", properties: { b: { type: "array", prefixItems: [{ type: "integer" }, { type: "integer" }] } }, required: ["b"] };
+
+  // A missing converter returns no `schema`, so every dereference below goes
+  // through `at()`. Without this the whole file aborts when the fix is reverted
+  // and the revert check proves nothing (#322, fifth occurrence).
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function prop(r, k) {
+    return (r.schema && r.schema.properties && r.schema.properties[k]) || {};
+  }
+
+  // --- the exclusivity, both directions -----------------------------------
+  var narrow = conv(UNION_NULL, "gemini");
+  var client = conv(UNION_NULL, "gemini-client");
+  ok("adk: --to gemini emits the proto spelling `nullable`",
+    prop(narrow, "v").nullable === true && prop(narrow, "v").type === "string");
+  ok("adk: --to gemini-client KEEPS the JSON Schema union spelling",
+    Array.isArray(prop(client, "v").type) &&
+    prop(client, "v").nullable === undefined);
+  ok("adk: the two targets genuinely disagree about the same file",
+    JSON.stringify(prop(narrow, "v")) !== JSON.stringify(prop(client, "v")));
+
+  // The advisory that tells a `--to gemini` user their output is destination-
+  // specific. Advisory ONLY — an advisory that failed CI would be #317's bug.
+  ok("adk: --to gemini warns that `nullable` is dropped by a converting client",
+    has(narrow.ledger, "silently stop being nullable"));
+  ok("adk: ...and never as a gate failure",
+    narrow.ledger.filter(function (l) { return /silently stop being nullable/.test(l.msg); })
+      .every(function (l) { return l.advisory === true; }));
+  ok("adk: the warning names the target that fixes it",
+    has(narrow.ledger, "--to gemini-client"));
+  ok("adk: no such warning when nothing nullable was emitted",
+    !has(conv({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "gemini").ledger,
+      "silently stop being nullable"));
+
+  // --- multi-member unions: the client keeps exactly ONE member ------------
+  var m = conv(MULTI, "gemini-client");
+  ok("adk: a multi-type union becomes `anyOf` (which survives the conversion)",
+    Array.isArray(prop(m, "x").anyOf) && prop(m, "x").anyOf.length === 2 &&
+    prop(m, "x").type === undefined);
+  ok("adk: ...and carries no sibling `nullable`, which would be dropped",
+    prop(m, "x").nullable === undefined);
+  var mn = conv({ type: "object", properties: { x: { type: ["string", "integer", "null"] } }, required: ["x"] }, "gemini-client");
+  ok("adk: a nullable multi-union puts `null` INSIDE the anyOf",
+    Array.isArray(prop(mn, "x").anyOf) && prop(mn, "x").anyOf.length === 3 &&
+    prop(mn, "x").anyOf.some(function (b) { return b.type === "null"; }) &&
+    prop(mn, "x").nullable === undefined);
+
+  // --- an array with no element type --------------------------------------
+  // The proto accepts it, so this is an advisory on every path, never a blocker.
+  var loose = conv(LOOSE, "gemini");
+  ok("adk: an itemless array is reported", has(loose.ledger, "declares no element type"));
+  ok("adk: ...as an advisory only (the proto accepts it)",
+    loose.ledger.filter(function (l) { return /declares no element type/.test(l.msg); })
+      .every(function (l) { return l.advisory === true; }));
+  ok("adk: itemless array does not fail the gate", loose.ok !== false);
+  ok("adk: an array WITH items is not flagged",
+    !has(conv({ type: "object", properties: { a: { type: "array", items: { type: "integer" } } }, required: ["a"] }, "gemini").ledger,
+      "declares no element type"));
+  ok("adk: a tuple is not flagged as itemless (prefixItems is an element type)",
+    !has(conv(TUPLE, "gemini").ledger, "declares no element type"));
+  // Union spelling of `type` — the trap that has hidden a subtree seven times.
+  ok("adk: an itemless array is found through a UNION `type` too",
+    has(conv({ type: "object", properties: { a: { type: ["array", "null"] } }, required: ["a"] }, "gemini").ledger,
+      "declares no element type"));
+  // ...but a typeless node is NOT an array to the converting layer, so silence.
+  ok("adk: a typeless node is not treated as an array",
+    !has(conv({ type: "object", properties: { a: { minItems: 1 } }, required: ["a"] }, "gemini").ledger,
+      "declares no element type"));
+  ok("adk: the itemless-array note is narrow-path only, not on gemini-json",
+    !has(conv(LOOSE, "gemini-json").ledger, "declares no element type"));
+
+  // --- the proto constraints still apply on the client target -------------
+  // A converting client cannot send what the proto has no field for, so every
+  // narrow rule but the nullability spelling is unchanged.
+  var t = conv(TUPLE, "gemini-client");
+  ok("adk: the tuple is still collapsed on the client target",
+    (prop(t, "b").items || {}).type === "integer" && prop(t, "b").maxItems === 2);
+  var ie = conv({ type: "object", properties: { c: { type: "integer", enum: [101, 102] } }, required: ["c"] }, "gemini-client");
+  ok("adk: the integer-enum encoding is unchanged (it survives ADK *and* the backend)",
+    JSON.stringify(prop(ie, "c").enum) === JSON.stringify(["101", "102"]));
+
+  // --- verbatim ADK-measured payloads as regression fixtures (#311/#331) ---
+  // Left exactly as `_to_gemini_schema` receives them from an MCP tool schema.
+  var ADK_IN = { type: "object", properties: {
+    v: { type: ["string", "null"] },
+    bbox: { type: "array", prefixItems: [{ type: "integer" }, { type: "integer" }] },
+    mix: { type: ["string", "integer"] },
+    loose: { type: "array" } }, required: ["v", "bbox", "mix", "loose"] };
+  var cc = conv(ADK_IN, "gemini-client");
+  ok("adk: the full battery keeps nullability, element type and every union member",
+    Array.isArray(prop(cc, "v").type) &&
+    (prop(cc, "bbox").items || {}).type === "integer" &&
+    (prop(cc, "mix").anyOf || []).length === 2);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

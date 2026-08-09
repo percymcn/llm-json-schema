@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 423 engine + 144 CLI + 32 ESM/library assertions = **599** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 444 engine + 153 CLI + 33 ESM/library assertions = **630** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -81,7 +81,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 | Flag | Meaning |
 |---|---|
-| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `anthropic-json-python` \| `anthropic-go` \| `gemini` \| `gemini-json` (required) |
+| `--to <provider>` | `openai` \| `openai-nonstrict` \| `openai-realtime` \| `anthropic` \| `anthropic-json` \| `anthropic-json-python` \| `anthropic-go` \| `gemini` \| `gemini-json` \| `gemini-client` (required) |
 | `--check` | Emit no schema; exit `1` if it isn't already compliant |
 | `--json` | Emit `{ok, compliant, schema, ledger, docUrl}` for scripting |
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
@@ -428,6 +428,55 @@ Where a vendor ships a client SDK, the SDK outranks the doc: docs describe the *
 
 ## Distribution
 Organic search (targets error-message long-tails first, e.g. *"additionalProperties is required to be false"*, *"gemini responseSchema $ref not supported"*) plus direct `npx github:` install. An npm registry release would add the registry's own discovery surface; that's pending.
+
+
+## Gemini has three targets, and two of them are mutually exclusive
+
+`--to gemini` and `--to gemini-json` split by **which request field** you use.
+`--to gemini-client` splits by something else entirely: **who performs the
+JSON-Schema-to-`Schema` conversion.** If you hand JSON Schema to a library that
+converts it for you — `google-adk` is the case measured here — the proto's
+*constraints* still apply, because that library cannot send what the proto has
+no field for, but its *spellings* are the JSON Schema ones.
+
+Nullability is where that stops being cosmetic. Measured against the live
+`v1beta` endpoint and `google-adk==2.6.3` (control-checked with
+`{"type":"frobnicate"}`, which is rejected, so the oracle discriminates):
+
+| document | assigned to `responseSchema` | through google-adk 2.6.3 |
+|---|---|---|
+| `{"type":"STRING","nullable":true}` | **accepted** | `nullable` **dropped** — field stops being nullable |
+| `{"type":["string","null"]}` | **rejected** — `Unknown name "type"` | converted to `nullable` correctly |
+
+There is no document that satisfies both. `nullable` is not a field of ADK's
+`_ExtendedJSONSchema` — which *does* extend `JSONSchema` with
+`property_ordering`, so this is not a blanket refusal of proto fields — and the
+backend's `type` is a single-valued enum. Every earlier split in this tool had
+an intersection form; this one does not, which is why it is a target you pick
+rather than a rule that could be widened.
+
+Two other measured consequences of that layer, both reported as advisories
+because the proto accepts the input and an advisory that failed CI would be a
+false gate failure:
+
+- **An array with no element type.** `responseSchema` accepts it and leaves the
+  elements unconstrained. ADK runs `schema.setdefault("items", {"type":
+  "string"})`, so a `tuple[int, int, int, int]` arrives as four **strings**, the
+  backend accepts it, and nothing anywhere errors.
+- **A multi-member union.** `["string","integer"]` reaches the model as
+  `STRING`; the integer branch is discarded with no error. `anyOf` survives that
+  conversion intact, so `--to gemini-client` rewrites to `anyOf` — losslessly,
+  with any `null` member kept *inside* the `anyOf` rather than on a sibling
+  `nullable` that would be dropped.
+
+The same file through all three, verified end-to-end:
+
+| input | nullability | element type | union members | direct to `responseSchema` |
+|---|---|---|---|---|
+| raw | kept | **string (invented)** | **1 of 2** | rejected |
+| `--to gemini` | **lost** | integer | both | **accepted** |
+| `--to gemini-client` | kept | integer | both | rejected *(by design)* |
+
 
 ## License
 MIT.

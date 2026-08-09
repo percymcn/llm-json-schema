@@ -29,6 +29,7 @@
     "anthropic-go": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
     gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
     "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
+    "gemini-client": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
     "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations"
   };
@@ -47,6 +48,20 @@
     if (node.type === "object") return true;
     if (node.properties && isPlainObject(node.properties)) return true;
     return false;
+  }
+
+  // Recognised through BOTH spellings of `type` — the scalar and the spec's
+  // second form, an array of strings. Deliberately keyed on `type` alone and
+  // not on `minItems`/`maxItems`: the consequence this guards is a converting
+  // client inserting a made-up `items`, and those clients gate on `type` too
+  // (google-adk: `type == "array" or (isinstance(type, list) and "array" in
+  // type)`), so a typeless node is not an array as far as that layer is
+  // concerned and flagging it would be noise.
+  function isArraySchema(node) {
+    if (!isPlainObject(node)) return false;
+    var t = node.type;
+    if (t === "array") return true;
+    return Array.isArray(t) && t.indexOf("array") !== -1;
   }
 
   // An OPEN MAP is `{"type":"object", "additionalProperties": <schema|true>}`
@@ -2120,7 +2135,20 @@
   // Not exotic: `zod-to-json-schema` emits `type:["string","null"]` for
   // `.nullable()`, and our own `--to openai` output CREATES it (the forced-
   // required rewrite shipped in #311).
-  function normalizeUnionType(node, path, ledger) {
+  // `clientConverts` = the caller hands JSON Schema to a library that performs
+  // the JSON-Schema -> `Schema` proto conversion itself (see `--to gemini-client`).
+  // There the nullability spellings are EXCLUSIVE, not merely different, and the
+  // exclusivity was measured rather than reasoned:
+  //   * straight to `responseSchema`, `{type:"STRING", nullable:true}` is ACCEPTED
+  //     and `{type:["string","null"]}` is REJECTED (`Unknown name "type"`).
+  //   * through google-adk 2.6.3 it is the exact reverse: `nullable` is not a
+  //     field of its `_ExtendedJSONSchema` (which DOES extend JSONSchema with
+  //     `property_ordering`, so this is not a blanket refusal of proto fields),
+  //     so it is silently DROPPED and the property stops being nullable, while
+  //     the union form is converted to `nullable` correctly.
+  // No single document carries nullability to both. That is why this is a target
+  // the caller picks and never something inferred from the schema.
+  function normalizeUnionType(node, path, ledger, clientConverts) {
     var raw = node.type;
     var isList = Array.isArray(raw);
     if (!isList && raw !== "null") return;
@@ -2139,6 +2167,43 @@
 
     var before = JSON.stringify(raw);
     var why;
+
+    if (clientConverts) {
+      // One member (optionally + null): leave the spelling alone. The client
+      // turns `["string","null"]` into `{type:STRING, nullable:true}` itself,
+      // and pre-converting it here is the one edit that makes the output WORSE
+      // than the raw input on this path.
+      if (rest.length <= 1) {
+        if (rest.length === 1 && hasNull) {
+          ledger.push(entry("=", path,
+            "Left `type: " + before + "` as a union. On this target the converting client " +
+            "performs the `nullable` rewrite itself; doing it here would emit `nullable`, " +
+            "which google-adk 2.6.3 drops silently (it is not a field of its " +
+            "`_ExtendedJSONSchema`), and the property would stop being nullable with " +
+            "nothing reporting it. Assigning this document straight to `responseSchema` " +
+            "instead would be REJECTED — use `--to gemini` for that.",
+            DOCS.gemini, true));
+        }
+        return;
+      }
+      // Two or more real members. Left alone, a converting client keeps exactly
+      // ONE: measured on google-adk 2.6.3, `["string","integer"]` -> `STRING`,
+      // the integer branch discarded with no error. `anyOf` survives that layer
+      // intact (its `any_of` branch recurses), so this is the lossless form —
+      // and the null member goes INSIDE the `anyOf` rather than onto a sibling
+      // `nullable`, for the same drop reason as above.
+      delete node.type;
+      node.anyOf = rest.map(function (t) { return { type: t }; });
+      if (hasNull) node.anyOf.push({ type: "null" });
+      ledger.push(entry("~", path,
+        "Rewrote `type: " + before + "` to `anyOf`. A client that converts JSON Schema to " +
+        "the `Schema` proto keeps only ONE member of a multi-type union — measured on " +
+        "google-adk 2.6.3, `[\"string\",\"integer\"]` arrives as `STRING` and the integer " +
+        "branch is discarded with no error. `anyOf` is carried through that conversion " +
+        "intact, so every branch survives. Lossless.",
+        DOCS.gemini));
+      return;
+    }
 
     if (rest.length === 0) {
       delete node.type;
@@ -2173,7 +2238,7 @@
       DOCS.gemini));
   }
 
-  function toGemini(schema, jsonPath) {
+  function toGemini(schema, jsonPath, clientConverts) {
     var s = clone(schema);
     var ledger = [];
 
@@ -2346,7 +2411,27 @@
       // Union `type`. Runs before the allowlist strip below so the `nullable` /
       // `anyOf` it produces are already in place when the allowlist sees them
       // (both are fields of `Schema`).
-      normalizeUnionType(node, path, ledger);
+      normalizeUnionType(node, path, ledger, clientConverts);
+
+      // An array that declares no element type. The proto ACCEPTS it — measured
+      // against the live v1beta endpoint, `{"type":"ARRAY"}` gets past payload
+      // validation, and `types.Schema` preserves it — so this is never a gate
+      // failure. It is worth a note because nothing downstream leaves it alone:
+      // google-adk 2.6.3 does `schema.setdefault("items", {"type": "string"})`,
+      // so the elements are declared STRING and the backend then accepts the
+      // result. A 4-integer bounding box arrives as four strings, with no error
+      // anywhere. Unlike the emptied map of #335 this IS recoverable, because
+      // the real element type is still in the caller's own schema at this point.
+      if (!jsonPath && isArraySchema(node) && node.items === undefined &&
+          node.prefixItems === undefined) {
+        ledger.push(entry("=", path,
+          "This array declares no element type. The `responseSchema` proto accepts that " +
+          "(verified against the live v1beta endpoint) and simply leaves the elements " +
+          "unconstrained — but a converting client will not: google-adk 2.6.3 inserts " +
+          "`items: {\"type\": \"string\"}`, the backend accepts the result, and the model " +
+          "is told the elements are strings. Declare the real element type in `items`.",
+          DOCS.gemini, true));
+      }
 
       // Tuples. `items` is in GEMINI_ALLOWED, so an ARRAY sitting in `items`
       // used to sail straight through the allowlist untouched — the third time
@@ -2489,6 +2574,32 @@
         }
       }
     });
+
+    // If the output carries `nullable` — whether this run produced it or the
+    // caller wrote it — the document is now correct for exactly one destination
+    // and quietly wrong for the other. Advisory, never a gate
+    // failure (#317): assigned to `responseSchema` — the stated target — it is
+    // right, and the caller is the only one who knows where it is going.
+    if (!jsonPath && !clientConverts) {
+      var emittedNullable = false;
+      walk(s, "root", function (n) {
+        if (isPlainObject(n) && n.nullable === true) emittedNullable = true;
+      });
+      if (emittedNullable) {
+        ledger.push(entry("=", "root",
+          "This output now carries `nullable`, which is correct ONLY if you assign it " +
+          "straight to `responseSchema`. If you instead hand it to a library that does " +
+          "its own JSON-Schema-to-`Schema` conversion, `nullable` is dropped and those " +
+          "fields silently stop being nullable — measured on google-adk 2.6.3, where " +
+          "`nullable` is not a field of its `_ExtendedJSONSchema` (which does extend " +
+          "JSONSchema with `property_ordering`, so proto fields are not refused across " +
+          "the board). The two spellings are exclusive, not merely different: the " +
+          "backend REJECTS `type: [\"string\",\"null\"]` and that layer drops `nullable`, " +
+          "so no single document satisfies both. For that pipeline use " +
+          "`--to gemini-client`.",
+          DOCS.gemini, true));
+      }
+    }
 
     if (ledger.length === 0) {
       ledger.push(entry("=", "root",
@@ -2662,6 +2773,15 @@
     // Gemini, so guessing it produces a false pass for everyone else.
     gemini: function (s) { return toGemini(s, false); },
     "gemini-json": function (s) { return toGemini(s, true); },
+    // Third Gemini target, and the condition that selects it is neither a
+    // request field nor an SDK but WHO PERFORMS THE CONVERSION. The proto's
+    // constraints all apply (a converting client cannot send what the proto has
+    // no field for), but the nullability spellings are EXCLUSIVE — `nullable`
+    // reaches `responseSchema` and is dropped by the converting layer, while a
+    // union `type` is dropped by `responseSchema` and converted correctly by
+    // that layer. There is no intersection form here, which is why this is a
+    // separate target rather than a wider rule on `gemini`.
+    "gemini-client": function (s) { return toGemini(s, false, true); },
     // Non-strict is a property of the `strict` flag, not of one API surface, so the
     // primary name is the CONDITION. `openai-realtime` stays as the surface where
     // that condition is forced rather than chosen (and so nobody's script breaks).

@@ -901,5 +901,46 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     !/omitempty/.test(run(["--to", "gemini-json", "--check"], NULL_DEFAULT).stderr));
 })();
 
+// #336 — `gemini-client` is a real, selectable target and the CLI says what
+// selects it. Picking the wrong one of the three Gemini targets is silent, so
+// the condition has to be visible at the point the reader chooses (#322).
+(function () {
+  var UNION = JSON.stringify({ type: "object", properties: { v: { type: ["string", "null"] } }, required: ["v"] });
+  var LOOSE = JSON.stringify({ type: "object", properties: { a: { type: "array" } }, required: ["a"] });
+
+  ok("gemini-client is an accepted provider", run(["--to", "gemini-client"], UNION).status !== 2);
+  ok("--help lists gemini-client beside its condition",
+    /gemini-client[\s\S]{0,160}converts it for you/.test(run(["--help"], "").stdout));
+
+  // The same file, two targets, two different documents — the point of the split.
+  // Parse defensively: with the converter absent the CLI writes nothing to
+  // stdout, and a bare JSON.parse would abort the whole file instead of
+  // reporting a failure (#322).
+  function propOf(args) {
+    try { return (JSON.parse(run(args, UNION).stdout).properties || {}).v || {}; }
+    catch (e) { return {}; }
+  }
+  var narrow = propOf(["--to", "gemini"]);
+  var client = propOf(["--to", "gemini-client"]);
+  ok("the same file yields different output for gemini vs gemini-client",
+    narrow.nullable === true && client.nullable === undefined && Array.isArray(client.type));
+
+  // Advisories must never fail a gate (#317). Isolate the note: UNION itself
+  // legitimately needs the rewrite, so it exits 1 on its own merits. A schema
+  // that ALREADY carries `nullable` needs no edit, so only the advisory is left
+  // and --check has to stay green.
+  var ALREADY = JSON.stringify({ type: "object", properties: { v: { type: "string", nullable: true } },
+    required: ["v"], propertyOrdering: ["v"] });
+  ok("the nullable-exclusivity note does not fail --check",
+    run(["--to", "gemini", "--check"], ALREADY).status === 0);
+  ok("...and it is printed", /silently stop being nullable/.test(run(["--to", "gemini", "--check"], ALREADY).stderr));
+  ok("a schema needing the union rewrite still fails --check on its own merits",
+    run(["--to", "gemini", "--check"], UNION).status === 1);
+  ok("an itemless array does not fail --check", run(["--to", "gemini", "--check"], LOOSE).status === 0);
+  ok("...and it is printed", /declares no element type/.test(run(["--to", "gemini", "--check"], LOOSE).stderr));
+  ok("the itemless-array note is absent on gemini-json",
+    !/declares no element type/.test(run(["--to", "gemini-json", "--check"], LOOSE).stderr));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
