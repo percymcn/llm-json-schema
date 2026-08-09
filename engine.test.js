@@ -642,6 +642,44 @@ var PYD_TUPLE = {
     j.schema.properties.bbox.items === undefined);
 })();
 
+// --- Gemini numeric enum: the second false pass ------------------------------
+// `Schema.enum` is declared `list[str]`, so {type:number, enum:[15]} is
+// REJECTED by the oracle ("enum.0: Input should be a valid string") — the live
+// 400 is `enum: only allowed for STRING type`. We used to wave it through.
+// This is exactly what `z.literal(15)` emits through the Vercel AI SDK.
+(function () {
+  var r = E.toGemini({
+    type: "object",
+    properties: { sceneCount: { type: "number", enum: [15] } },
+    required: ["sceneCount"]
+  });
+  var n = r.schema.properties.sceneCount;
+  ok("gemini stringifies a numeric enum", n.enum.length === 1 && n.enum[0] === "15");
+  ok("gemini sets format:enum, the documented carrier", n.format === "enum");
+  ok("gemini keeps the numeric type", n.type === "number");
+  ok("gemini numeric enum is not a silent pass",
+    r.ledger.some(function (l) { return l.op !== "=" && !l.advisory; }));
+
+  // A plain string enum is already accepted and must be left alone.
+  var s = E.toGemini({
+    type: "object",
+    properties: { v: { type: "string", enum: ["foo", "bar"] } },
+    required: ["v"]
+  });
+  ok("gemini leaves a string enum untouched",
+    s.schema.properties.v.enum[0] === "foo" && s.schema.properties.v.format === undefined);
+
+  // The JSON-Schema path accepts "enum (for strings and numbers)" verbatim.
+  var j = E.toGemini({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: { n: { type: "number", enum: [15] } },
+    required: ["n"]
+  });
+  ok("gemini JSON path leaves a numeric enum numeric",
+    j.schema.properties.n.enum[0] === 15);
+})();
+
 ["openai", "anthropic", "gemini"].forEach(function (provider) {
   var once = E.convert(PYD_TUPLE, provider, { mode: "schema" });
   var twice = E.convert(once.schema, provider, { mode: "schema" });

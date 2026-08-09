@@ -1067,6 +1067,33 @@
         }
       });
 
+      // Non-string `enum` values. `Schema.enum` is declared `list[str]` — a
+      // NUMERIC enum is rejected by the oracle ("enum.0: Input should be a
+      // valid string"), which is the live 400 people actually see:
+      //   response_schema.properties[x].enum: only allowed for STRING type
+      // The field's own doc gives the accepted form and it is not "drop it":
+      //   "To mark a field as an enum, set `format` to `enum` and provide the
+      //    list of possible values in `enum`. ... To define apartment numbers:
+      //    {type:INTEGER, format:enum, enum:["101", "201", ...]}"
+      // So the values are stringified and `format: "enum"` is set, while `type`
+      // stays INTEGER/NUMBER/BOOLEAN — verified ACCEPTED for all three. The
+      // constraint survives intact; only its encoding changes.
+      // Narrow path only: `responseJsonSchema` accepts "enum (for strings and
+      // numbers)" verbatim, so nothing needs rewriting there.
+      if (Array.isArray(node.enum) && node.enum.some(function (v) { return typeof v !== "string"; })) {
+        var before = JSON.stringify(node.enum);
+        node.enum = node.enum.map(function (v) { return v === null ? "null" : String(v); });
+        node.format = "enum";
+        ledger.push(entry("~", path,
+          "Rewrote `enum` " + before + " to " + JSON.stringify(node.enum) + " and set " +
+          "`format: \"enum\"`. `Schema.enum` is declared `list[str]`, so a non-string enum is " +
+          "rejected — this is the live `enum: only allowed for STRING type` 400. The vendor " +
+          "field doc gives this exact form (`{type:INTEGER, format:enum, enum:[\"101\"]}`), so " +
+          "`type` is left as-is and the allowed set is fully preserved; only its encoding " +
+          "changes. `z.literal(15)` and any numeric enum land here.",
+          DOCS.gemini));
+      }
+
       // string `format` limited to date-time / date / time.
       // NOTE: doc-sourced, not SDK-verified — the SDK types `format` as a bare
       // `string` and gives no verdict. Kept as a strip because the asymmetry
