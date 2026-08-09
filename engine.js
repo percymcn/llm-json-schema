@@ -290,14 +290,24 @@
 
   // ---- public API ----------------------------------------------------------
 
-  // convert(rawText, provider, opts) -> {ok, schema, ledger, inferred, error}
-  function convert(rawText, provider, opts) {
+  // convert(input, provider, opts) -> {ok, schema, ledger, inferred, error}
+  // `input` may be a JSON string (browser textarea, CLI file read) OR an
+  // already-parsed object — library callers hand us the object that
+  // zod-to-json-schema / Pydantic .model_json_schema() just produced, and
+  // making them JSON.stringify it first was pointless friction.
+  function convert(input, provider, opts) {
     opts = opts || {};
     var parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (e) {
-      return { ok: false, error: "That isn't valid JSON: " + e.message };
+    if (typeof input === "string") {
+      try {
+        parsed = JSON.parse(input);
+      } catch (e) {
+        return { ok: false, error: "That isn't valid JSON: " + e.message };
+      }
+    } else if (input && typeof input === "object") {
+      parsed = input;
+    } else {
+      return { ok: false, error: "Expected a JSON string or an object, got " + (input === null ? "null" : typeof input) };
     }
     var conv = CONVERTERS[provider];
     if (!conv) return { ok: false, error: "Unknown provider: " + provider };

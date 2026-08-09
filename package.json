@@ -25,17 +25,30 @@
   },
   "license": "MIT",
   "main": "engine.js",
+  "module": "engine.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./engine.mjs",
+      "require": "./engine.js",
+      "default": "./engine.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "llm-schema": "cli.js"
   },
   "files": [
     "engine.js",
+    "engine.mjs",
+    "index.d.ts",
     "cli.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node engine.test.js && node cli.test.js"
+    "test": "node engine.test.js && node cli.test.js && node esm.test.mjs"
   },
   "engines": {
     "node": ">=14"

@@ -7,10 +7,10 @@ Available three ways, all running the same dependency-free engine:
 | | |
 |---|---|
 | **CLI / CI gate** | `npx github:percymcn/llm-json-schema --to openai schema.json` |
-| **Library** | `require("llm-json-schema").toOpenAI(schema)` |
+| **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1 — CLI + library added** (Cycle #309). Unit-tested: 21 engine assertions + 31 CLI assertions (`npm test`). Provider rules verified against official docs on 2026-07-30.
+> Status: **v0.1 — ESM + TypeScript types added** (Cycle #310). Unit-tested: 21 engine + 31 CLI + 31 ESM/library assertions = 83 (`npm test`). Provider rules verified against official docs on 2026-07-30.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -81,8 +81,14 @@ This tool applies each provider's rules for you and shows a **change ledger** �
 
 ## Library use
 
+Ships ESM, CommonJS, and TypeScript types from one package.
+
 ```js
-const { toOpenAI, toAnthropic, toGemini, convert } = require("llm-json-schema");
+// ESM / TypeScript
+import { toOpenAI, convert } from "llm-json-schema";
+
+// CommonJS
+const { toOpenAI, convert } = require("llm-json-schema");
 
 const { schema, ledger } = toOpenAI(mySchema);
 // ledger: [{ op: "+" | "~" | "x" | "!" | "=", path, msg, ruleUrl }]
@@ -90,10 +96,37 @@ const { schema, ledger } = toOpenAI(mySchema);
 
 `op` is `+` added · `~` changed · `x` removed · `!` needs a human fix · `=` already valid.
 
+### With Zod (Vercel AI SDK, LangChain, Mastra…)
+
+If you got `Invalid schema … 'required' is required to be supplied and to be an
+array including every key in properties`, the cause is usually that
+`.optional()` in Zod emits a schema OpenAI strict mode does not allow — strict
+mode has **no optional fields**. Feed the generated schema straight in; no
+`JSON.stringify` needed:
+
+```ts
+import { z } from "zod";
+import { zodToJsonSchema } from "zod-to-json-schema";
+import { convert } from "llm-json-schema";
+
+const Result = z.object({ title: z.string(), notes: z.string().optional() });
+
+const { schema, ledger } = convert(zodToJsonSchema(Result), "openai");
+// notes -> type: ["string", "null"] and added to `required`, with the rule cited.
+```
+
+Your input object is never mutated, so you can convert the same schema for more
+than one provider.
+
+With **Pydantic**, `Model.model_json_schema()` gives you the same object — pipe
+it through the CLI (`--to openai --check`) in your test suite.
+
 ## How it's built
-- `engine.js` — dependency-free transform + lint logic (the product's value). Every rule cites its source doc URL.
+- `engine.js` — dependency-free transform + lint logic (the product's value). Every rule cites its source doc URL. UMD, so the same bytes run in the browser.
+- `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
+- `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` — 52 assertions total. Run: `npm test`. The CLI fixtures are the actual schemas from real reported failures, so a regression means the tool stopped fixing a bug people genuinely hit.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 83 assertions total. Run: `npm test`. The CLI fixtures are the actual schemas from real reported failures, so a regression means the tool stopped fixing a bug people genuinely hit.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30)
