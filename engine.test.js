@@ -66,7 +66,14 @@ function has(ledger, substr) {
   // payload the SDK builds: both arrive at `responseSchema` untouched.
   ok("gemini KEEPS `pattern` (in the SDK Schema type)", r.schema.properties.email.pattern === "^.+@.+$");
   ok("gemini KEEPS `minLength` (in the SDK Schema type)", r.schema.properties.email.minLength === 3);
-  ok("gemini drops unsupported string format `email`", !("format" in r.schema.properties.email));
+  // This assertion used to read "gemini drops unsupported string format
+  // `email`". It encoded a premise the vendor contradicts: `email` is the FIRST
+  // value named in `Schema.format`'s own field description. Nothing is stripped
+  // now, and a named format draws no advisory either.
+  ok("gemini KEEPS `format: email` (first value the vendor names)",
+    r.schema.properties.email.format === "email");
+  ok("...and a vendor-named format is not flagged",
+    !has(r.ledger, "Kept `format: email`"));
 })();
 
 // --- Gemini: keywords the vendor Schema type does NOT have ------------------
@@ -325,11 +332,18 @@ var ZOD_V3 = {
 })();
 
 // --- idempotence: the gate must not flag its own output ----------------------
+// Idempotence is a property of the SCHEMA, and this test used to check it via
+// an empty ledger, which conflates the two. An advisory is a statement about
+// the input that stays true however many times you look at it, so it MUST
+// repeat — the thing that must not repeat is an EDIT. Both halves are asserted
+// now, and the schema half is stricter than the old proxy was.
 ["openai", "anthropic", "gemini"].forEach(function (provider) {
   var once = E.convert(ZOD_V3, provider, { mode: "schema" });
   var twice = E.convert(once.schema, provider, { mode: "schema" });
-  var changes = twice.ledger.filter(function (l) { return l.op !== "="; });
-  ok(provider + " conversion is idempotent", changes.length === 0);
+  var edits = twice.ledger.filter(function (l) { return l.op !== "=" && !l.advisory; });
+  ok(provider + " conversion is idempotent", edits.length === 0);
+  ok(provider + " second pass returns a byte-identical schema",
+    JSON.stringify(twice.schema) === JSON.stringify(once.schema));
 });
 
 // --- oneOf is rewritten, not dropped ----------------------------------------
@@ -3586,6 +3600,100 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
       .ledger.some(function (l) {
         return l.op === "!" && l.msg.indexOf("boolean subschema") !== -1;
       }));
+})();
+
+// --- #344: `format` is carried, and the keyword sweep's genuine negative -----
+//
+// Fixture is the VERBATIM `model_json_schema()` output of an ordinary
+// pydantic 2.13.4 model (EmailStr / AnyUrl / UUID / max_length), per #311 —
+// not a shape written by hand to suit the rule.
+(function () {
+  var PYDANTIC_CONTACT = {
+    properties: {
+      email:   { format: "email", title: "Email", type: "string" },
+      website: { format: "uri", minLength: 1, title: "Website", type: "string" },
+      ref:     { format: "uuid", title: "Ref", type: "string" },
+      name:    { maxLength: 40, title: "Name", type: "string" }
+    },
+    required: ["email", "website", "ref", "name"],
+    title: "Contact", type: "object"
+  };
+  var r = E.toGemini(JSON.parse(JSON.stringify(PYDANTIC_CONTACT)));
+  var p = r.schema.properties;
+
+  // The defect: three constraints were deleted from a schema the live endpoint
+  // ALREADY accepts, on a justification the vendor's own field description
+  // contradicts.
+  ok("gemini keeps pydantic's `format: email`", p.email.format === "email");
+  ok("gemini keeps pydantic's `format: uri`", p.website.format === "uri");
+  ok("gemini keeps pydantic's `format: uuid`", p.ref.format === "uuid");
+  ok("no `format` is stripped any more", !has(r.ledger, "Removed `format"));
+
+  // Only the UNNAMED ones are flagged, and only as advisories.
+  var flagged = r.ledger.filter(function (l) {
+    return l.msg.indexOf("Kept `format:") === 0 ||
+           l.msg.indexOf("Kept `format:") !== -1;
+  });
+  ok("`uri` and `uuid` are flagged as undocumented", flagged.length === 2);
+  ok("`email` is NOT flagged (the vendor names it)", !has(r.ledger, "Kept `format: email`"));
+  ok("every format flag is advisory, so none can fail --check",
+    flagged.length > 0 && flagged.every(function (l) { return l.advisory === true; }));
+
+  // Over-block guards. `format: enum` on an integer is the encoding #316 ships
+  // for a non-string enum; flagging our OWN output would be a regression.
+  ok("integer `format: enum` is not flagged (#316's own encoding)",
+    !has(E.toGemini({ type: "object", properties: {
+      n: { type: "integer", format: "enum", enum: ["101"] } } }).ledger, "Kept `format:"));
+  ok("integer `format: int32` is not flagged",
+    !has(E.toGemini({ type: "object", properties: {
+      n: { type: "integer", format: "int32" } } }).ledger, "Kept `format:"));
+  ok("number `format: double` is not flagged",
+    !has(E.toGemini({ type: "object", properties: {
+      n: { type: "number", format: "double" } } }).ledger, "Kept `format:"));
+  ok("an undocumented format on an integer IS flagged",
+    has(E.toGemini({ type: "object", properties: {
+      n: { type: "integer", format: "uuid" } } }).ledger, "Kept `format: uuid`"));
+
+  // The permissive path never had this rule and must stay untouched.
+  var j = E.toGemini(JSON.parse(JSON.stringify(PYDANTIC_CONTACT)), true);
+  ok("gemini-json keeps every format too", j.schema.properties.ref.format === "uuid" &&
+    j.schema.properties.email.format === "email");
+})();
+
+// --- #344: the keyword sweep, banked as regression pins ----------------------
+//
+// #343 probed 14 keywords against the live pre-auth endpoint. This cycle swept
+// the REST of the JSON Schema vocabulary the same way (#313: diff the whole
+// blocklist, don't spot-check it). All 27 never-probed keywords came back
+// `Unknown name "X" ... Cannot find field`, and all 22 keys in GEMINI_ALLOWED
+// came back accepted — so the key-level allowlist is now verified against the
+// SERVICE in both directions, and #343's three combinators were the whole gap.
+// A genuine negative is still a result; these pin it.
+(function () {
+  ["$id", "$defs", "definitions", "$anchor", "$comment", "prefixItems",
+   "additionalItems", "additionalProperties", "unevaluatedProperties",
+   "exclusiveMaximum", "maxContains", "minContains", "dependencies",
+   "dependentSchemas", "then", "else", "deprecated", "readOnly", "writeOnly",
+   "examples", "contentEncoding", "contentMediaType", "contentSchema"
+  ].forEach(function (kw) {
+    var input = { type: "object", properties: { a: { type: "string" } } };
+    input[kw] = kw === "prefixItems" ? [{ type: "string" }] : true;
+    ok("gemini still strips `" + kw + "` (endpoint: Cannot find field)",
+      !(kw in E.toGemini(input).schema));
+  });
+
+  // The other direction: nothing in the verified-accepted 22 may be dropped.
+  var keep = { type: "object",
+    properties: { a: { type: "string", minLength: 1, maxLength: 5, pattern: "^a",
+                       description: "d", title: "T", format: "date-time", default: "a" } },
+    required: ["a"], minProperties: 1, maxProperties: 3, title: "Root" };
+  var kept = E.toGemini(keep).schema;
+  ["title", "required", "minProperties", "maxProperties"].forEach(function (k) {
+    ok("gemini keeps service-accepted `" + k + "`", k in kept);
+  });
+  ["minLength", "maxLength", "pattern", "description", "title", "format", "default"].forEach(function (k) {
+    ok("gemini keeps service-accepted `" + k + "` on a leaf", k in kept.properties.a);
+  });
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");

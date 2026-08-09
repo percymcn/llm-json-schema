@@ -1038,5 +1038,45 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     bad.status !== 0, "status=" + bad.status);
 })();
 
+// --- #344: an ordinary pydantic model must not fail the Gemini gate ----------
+//
+// Verbatim `model_json_schema()` output for EmailStr / AnyUrl / UUID. The live
+// v1beta endpoint ACCEPTS this document as written, and we were exiting 1 and
+// proposing to delete all three formats.
+(function () {
+  var CONTACT = JSON.stringify({
+    properties: {
+      email:   { format: "email", title: "Email", type: "string" },
+      website: { format: "uri", minLength: 1, title: "Website", type: "string" },
+      ref:     { format: "uuid", title: "Ref", type: "string" },
+      name:    { maxLength: 40, title: "Name", type: "string" }
+    },
+    required: ["email", "website", "ref", "name"],
+    title: "Contact", type: "object"
+  });
+
+  var c = run(["--to", "gemini", "--check"], CONTACT);
+  ok("pydantic formats do not fail the gemini gate", c.status === 0,
+    "exit " + c.status);
+
+  var g = run(["--to", "gemini"], CONTACT);
+  var out = JSON.parse(g.stdout);
+  ok("all three formats survive conversion",
+    out.properties.email.format === "email" &&
+    out.properties.website.format === "uri" &&
+    out.properties.ref.format === "uuid");
+  ok("the ledger no longer claims to remove a format",
+    g.stderr.indexOf("Removed `format") === -1);
+  ok("the undocumented ones are surfaced as notes",
+    g.stderr.indexOf("Kept `format: uuid`") !== -1);
+
+  // A genuinely rejected keyword must still fail, so the gate is not simply
+  // more permissive across the board.
+  var bad = run(["--to", "gemini", "--check"],
+    JSON.stringify({ type: "object", properties: { a: { type: "string" } },
+                     patternProperties: { "^x": { type: "string" } } }));
+  ok("a service-rejected keyword still fails the gemini gate", bad.status !== 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

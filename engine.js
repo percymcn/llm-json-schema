@@ -2242,7 +2242,27 @@
     "minimum": 1, "nullable": 1, "pattern": 1, "properties": 1,
     "propertyOrdering": 1, "required": 1, "title": 1, "type": 1
   };
-  var GEMINI_STRING_FORMATS = { "date-time": 1, "date": 1, "time": 1, "enum": 1 };
+  // `format` values the vendor NAMES, per type. Source: the `format` field
+  // description on `types.Schema` in `google-genai` 2.17.0 — the same class of
+  // vendor-authored enumeration that gave us the `response_json_schema`
+  // accepted-property list (#314), and the strongest one available here:
+  //   "Optional. The format of the data. For `NUMBER` type, format can be
+  //    `float` or `double`. For `INTEGER` type, format can be `int32` or
+  //    `int64`. For `STRING` type, format can be `email`, `byte`, `date`,
+  //    `date-time`, `password`, AND OTHER FORMATS to further refine the data
+  //    type."
+  //
+  // Note the last clause: this is an OPEN list, not an allowlist. That is why
+  // nothing is stripped on the strength of it — see the `format` rule below.
+  // `enum` is documented separately, by the two worked examples in the same
+  // docstring (`{type:STRING, format:enum, enum:[…]}` and `{type:INTEGER,
+  // format:enum, enum:["101"]}`), and is the encoding #316 emits for a
+  // non-string enum, so it must stay documented for both types.
+  var GEMINI_NAMED_FORMATS = {
+    "string":  { "email": 1, "byte": 1, "date": 1, "date-time": 1, "password": 1, "enum": 1 },
+    "integer": { "int32": 1, "int64": 1, "enum": 1 },
+    "number":  { "float": 1, "double": 1 }
+  };
 
   // Keywords the BACKEND accepts but NO client type declares.
   //
@@ -2932,16 +2952,43 @@
           DOCS.gemini));
       }
 
-      // string `format` limited to date-time / date / time.
-      // NOTE: doc-sourced, not SDK-verified — the SDK types `format` as a bare
-      // `string` and gives no verdict. Kept as a strip because the asymmetry
-      // favours it: an unsupported `format` is a hard 400, while `format` is
-      // advisory, so dropping it costs little.
-      if (node.type === "string" && node.format && !GEMINI_STRING_FORMATS[node.format]) {
-        ledger.push(entry("x", path,
-          "Removed `format: " + node.format + "` — Gemini supports only date-time, date, time for strings.",
-          DOCS.gemini));
-        delete node.format;
+      // `format` is CARRIED, never stripped.
+      //
+      // This used to delete every string `format` outside a closed four-value
+      // list, on a justification the code itself flagged as unverified: "an
+      // unsupported `format` is a hard 400, while `format` is advisory, so
+      // dropping it costs little." Both halves are wrong.
+      //
+      // Measured 2026-08-09 against the live `v1beta` pre-auth oracle: `format`
+      // is a plain proto STRING field, so EVERY value validates — including
+      // `frobnicate`, run as a control. The oracle discriminates on field NAMES
+      // (unknown name -> `Cannot find field`) and on proto-ENUM fields (`type`
+      // rejects a bogus value), and gives NO verdict on a free-string field. So
+      // there is no 400 to avoid, and the cost of dropping is not little: an
+      // ordinary `pydantic` contact model loses `email`, `uri` and `uuid`.
+      //
+      // And the vendor NAMES `email`, `byte` and `password` as supported while
+      // this rule deleted all three (see GEMINI_NAMED_FORMATS). The same
+      // description ends "and other formats to further refine the data type",
+      // so the vendor's list is OPEN — a closed allowlist is the wrong shape
+      // for it, and a keep-rule built on an open list must keep by default.
+      // No client objects either: `format` is `Optional[str]` in Python, a bare
+      // `string` in the JS `.d.ts` and a `string` in the Go struct.
+      //
+      // What remains true is that only the named values are DOCUMENTED, so for
+      // anything else we carry it and say enforcement is undocumented. Advisory
+      // only, never a gate failure — the destination accepts the document, and
+      // an advisory that failed CI would be #317's mistake.
+      if (node.format && typeof node.type === "string") {
+        var namedForType = GEMINI_NAMED_FORMATS[node.type];
+        if (namedForType && !namedForType[node.format]) {
+          ledger.push(entry("!", path,
+            "Kept `format: " + node.format + "` — it reaches the backend, but Gemini's `Schema.format` " +
+            "names only " + Object.keys(namedForType).sort().join(", ") + " for `" + node.type + "`. " +
+            "The vendor's list is explicitly open (\"and other formats\"), so this is carried rather than " +
+            "dropped; treat it as a hint to the model, not an enforced constraint.",
+            DOCS.gemini, true));
+        }
       }
 
       // `default: null` survives this path in JS and Python and is DROPPED in Go.
