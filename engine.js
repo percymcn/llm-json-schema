@@ -75,6 +75,74 @@
     return false;
   }
 
+  // ---- boolean subschemas ---------------------------------------------------
+  //
+  // JSON Schema defines a schema as "an object OR a boolean": `true` matches any
+  // value, `false` matches none. Every walker in this file starts with
+  // `if (!isPlainObject(node)) return;`, so a boolean node silently ends that
+  // branch — not skipped-and-reported, skipped-and-SILENT. It is the same shape
+  // as the container-spelling misses (`definitions` vs `$defs`, array-form
+  // `items`, `/$defs/` vs `#/$defs/`, an array-valued `type`), except the
+  // alternate spelling here is the spec's second form of a SCHEMA ITSELF.
+  //
+  // Not exotic. Go's canonical generator emits it for the four idiomatic ways of
+  // saying "arbitrary JSON": `any`, `interface{}`, `json.RawMessage` and the
+  // element type of `[]any` all reflect to a literal `true`.
+  //
+  // NOTE which positions count. `additionalProperties`, `unevaluatedProperties`
+  // and `additionalItems` take a boolean BY DESIGN — flagging those would fire on
+  // every closed object in existence. Only positions that hold a schema proper
+  // are checked.
+  function findBooleanSubschemas(root) {
+    var hits = [];
+    function visit(node, path) {
+      if (node === true || node === false) { hits.push({ path: path, value: node }); return; }
+      if (!isPlainObject(node)) return;
+      if (isPlainObject(node.properties)) {
+        Object.keys(node.properties).forEach(function (k) {
+          visit(node.properties[k], path + "." + k);
+        });
+      }
+      visit(node.items, path + "[]");
+      if (Array.isArray(node.items)) {
+        node.items.forEach(function (it, i) { visit(it, path + "[" + i + "]"); });
+      }
+      if (Array.isArray(node.prefixItems)) {
+        node.prefixItems.forEach(function (it, i) { visit(it, path + "[" + i + "]"); });
+      }
+      ["anyOf", "oneOf", "allOf"].forEach(function (kw) {
+        if (Array.isArray(node[kw])) {
+          node[kw].forEach(function (sub, i) { visit(sub, path + "/" + kw + "[" + i + "]"); });
+        }
+      });
+      ["$defs", "definitions"].forEach(function (bag) {
+        if (isPlainObject(node[bag])) {
+          Object.keys(node[bag]).forEach(function (k) { visit(node[bag][k], bag + "." + k); });
+        }
+      });
+    }
+    visit(root, "root");
+    return hits;
+  }
+
+  // The node is left in place on purpose (#318): the reader has to be able to see
+  // the shape in their own file. There is no repair — an unconstrained value has
+  // no representation in a constrained-decoding dialect — so this names the
+  // remodelling instead of inventing a type.
+  function booleanSubschemaMessage(value, vendorNote) {
+    return value === true
+      ? "This is a boolean subschema (`true`), which matches ANY value. " + vendorNote +
+        " There is no repair: a dialect that constrains decoding has no way to say " +
+        "\"anything goes\", so a type has to be chosen rather than guessed. Declare the " +
+        "shape you actually expect, or — if the value really is arbitrary — type it as " +
+        "`{\"type\": \"string\"}` and have the model emit serialized JSON you parse yourself. " +
+        "In Go this is what `any`, `interface{}`, `json.RawMessage` and the element type of " +
+        "`[]any` reflect to."
+      : "This is a boolean subschema (`false`), which matches NO value — nothing can ever " +
+        "satisfy it, so the field is unsatisfiable as written. " + vendorNote +
+        " Give it a real schema, or remove it (and drop it from `required`).";
+  }
+
   var OPEN_MAP_REMEDY =
     "An open map cannot be expressed here, and closing it would leave an object " +
     "whose only legal value is `{}` — the field could never be populated. Remodel " +
@@ -688,6 +756,18 @@
         "Root schema cannot use anyOf. Move the anyOf under a named property.",
         DOCS.openai));
     }
+
+    // Measured against openai@7.4.0's toStrictJsonSchema(): a boolean at any of
+    // the six sub-schema positions throws `Expected object schema but got
+    // boolean`, and a boolean ROOT throws `Root schema must have type: 'object'`.
+    // Eight positions, eight throws — so this is a blocker, not over-strictness.
+    findBooleanSubschemas(s).forEach(function (h) {
+      ledger.push(entry("!", h.path,
+        booleanSubschemaMessage(h.value,
+          "OpenAI strict mode rejects it: `toStrictJsonSchema()` throws " +
+          "`Expected object schema but got boolean`."),
+        DOCS.openai));
+    });
 
     walk(s, "root", function (node, path) {
       // `allOf` is NOT flatly unsupported, and treating it that way deleted
@@ -1349,7 +1429,39 @@
       : "This path sends the schema verbatim — nothing resolves or validates a `$ref` — so a pointer " +
         "in a spelling that does not resolve locally reaches the model dangling, with no error.");
 
+    // A boolean subschema is the FOURTH thing this vendor's three SDKs disagree
+    // about, and the disagreement is measured, not ported:
+    //   TypeScript `transformJSONSchema`  -> THROWS "JSON schema must have a type
+    //                                        defined if anyOf/oneOf/allOf are not
+    //                                        used" (control: the same schema with
+    //                                        `{"type":"string"}` in that slot is
+    //                                        accepted, so the boolean is the cause)
+    //   Go `BetaJSONSchemaOutputFormat`
+    //      and `BetaToolInputSchema`      -> preserved VERBATIM, both surfaces
+    //   TypeScript `betaTool`             -> preserved verbatim (no transform runs)
+    // The Python client was not probed for this shape, so nothing is claimed for
+    // `--to anthropic-json-python` and its behaviour is left unchanged.
     if (outputFormatPath) {
+      findBooleanSubschemas(s).forEach(function (h) {
+        if (goSdk) {
+          ledger.push(entry("=", h.path,
+            "This is a boolean subschema (`" + h.value + "`), and the Go SDK keeps it — measured " +
+            "verbatim through both `BetaJSONSchemaOutputFormat` and `BetaToolInputSchema` on " +
+            "anthropic-sdk-go@v1.62.0. Nothing to fix. Worth knowing only because the clients " +
+            "differ: the TypeScript `output_format` transformer THROWS on the same bytes, and " +
+            "`--to openai` blocks it outright.",
+            url, true));
+          return;
+        }
+        if (pythonSdk) return;   // not probed for this shape — claim nothing
+        ledger.push(entry("!", h.path,
+          booleanSubschemaMessage(h.value,
+            "The TypeScript `output_format` transformer rejects it: `transformJSONSchema` throws " +
+            "`JSON schema must have a type defined if anyOf/oneOf/allOf are not used`, because a " +
+            "boolean carries no `type` for it to dispatch on." + VERBATIM_ESCAPE),
+          url));
+      });
+
       // `definitions` is draft-07; the transformer only knows `$defs`. Left
       // alone it is not merely ignored — it is stringified into the root
       // `description` and every `#/definitions/...` pointer is left dangling.
@@ -2041,6 +2153,23 @@
     s = normalizeRefSpelling(s, ledger, DOCS.gemini,
       "Gemini resolves `$ref` only on the `responseJsonSchema` path, and only for genuine local " +
       "pointers.");
+
+    // Narrow path only. `types.Schema` is declared `extra="forbid"` and every
+    // sub-schema slot is typed as a `Schema`, never a bool — measured on
+    // google-genai==2.17.0, `model_validate` REJECTS a boolean at
+    // `properties.a`, `properties.a.items` and `properties.a.anyOf.1`. The
+    // `responseJsonSchema` path is ordinary JSON Schema and is left alone.
+    if (!jsonPath) {
+      findBooleanSubschemas(s).forEach(function (h) {
+        ledger.push(entry("!", h.path,
+          booleanSubschemaMessage(h.value,
+            "The narrow `responseSchema` proto has no boolean form: `types.Schema` is " +
+            "`extra=\"forbid\"` and types every sub-schema slot as a `Schema`, so " +
+            "`model_validate()` rejects it. It IS legal on the `responseJsonSchema` path — " +
+            "see `--to gemini-json`."),
+          DOCS.gemini));
+      });
+    }
 
     // ---- Path A: `responseJsonSchema` -> the SDK sends this VERBATIM --------
     // Subsetting here would be actively destructive: it would throw away

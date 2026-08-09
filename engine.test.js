@@ -2268,5 +2268,150 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("anthropic-go does not block an ordinary schema", blockers(rPlain).length === 0);
 })();
 
+// ---------------------------------------------------------------------------
+// 25. BOOLEAN SUBSCHEMAS (Cycle #333)
+//
+// JSON Schema defines a schema as "an object OR a boolean". Every walker in
+// engine.js begins `if (!isPlainObject(node)) return;`, so a boolean node ended
+// its branch SILENTLY and six of eight positions exited 0 as "already valid".
+//
+// The input below is not hypothetical: it is the VERBATIM output of the
+// `GenerateSchema[T]()` recipe printed in openai-go@v3.50.0's own README
+// (invopop/jsonschema v0.14.0, `AllowAdditionalProperties:false,
+// DoNotReference:true`) for ordinary Go structs. `any`, `interface{}`,
+// `json.RawMessage` and the element type of `[]any` all reflect to `true`.
+(function () {
+  var clone = function (o) { return JSON.parse(JSON.stringify(o)); };
+  // --- verbatim openai-go README-recipe output ---
+  var GO_ANY = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "data": true,
+      "name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "data"
+    ],
+    "type": "object"
+  };
+  var GO_RAWMSG = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "raw": true
+    },
+    "required": [
+      "name",
+      "raw"
+    ],
+    "type": "object"
+  };
+  var GO_ANYSLICE = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "items": {
+        "items": true,
+        "type": "array"
+      }
+    },
+    "required": [
+      "items"
+    ],
+    "type": "object"
+  };
+
+  // openai@7.4.0 toStrictJsonSchema() THROWS on all three (measured).
+  [["any", GO_ANY], ["json.RawMessage", GO_RAWMSG], ["[]any", GO_ANYSLICE]].forEach(function (p) {
+    var r = E.convert(clone(p[1]), "openai");
+    ok("openai blocks the boolean subschema Go emits for " + p[0], blockers(r).length === 1);
+    ok("openai names the remodelling for " + p[0], has(r.ledger, "serialized JSON"));
+  });
+
+  // Every schema position, not just `properties`.
+  function propBool(v) {
+    return { type: "object", properties: { a: v }, required: ["a"], additionalProperties: false };
+  }
+  var POSITIONS = {
+    "properties": propBool(true),
+    "items": { type: "object", properties: { a: { type: "array", items: true } }, required: ["a"], additionalProperties: false },
+    "anyOf": { type: "object", properties: { a: { anyOf: [{ type: "string" }, true] } }, required: ["a"], additionalProperties: false },
+    "$defs": { type: "object", properties: { a: { $ref: "#/$defs/T" } }, required: ["a"], additionalProperties: false, $defs: { T: true } },
+    "nested": { type: "object", properties: { o: propBool(true) }, required: ["o"], additionalProperties: false }
+  };
+  Object.keys(POSITIONS).forEach(function (pos) {
+    ok("openai blocks a boolean subschema at " + pos,
+      blockers(E.convert(clone(POSITIONS[pos]), "openai")).length === 1);
+  });
+
+  // `false` is a different defect and gets a different sentence.
+  var rFalse = E.convert(propBool(false), "openai");
+  ok("openai blocks a `false` subschema", blockers(rFalse).length === 1);
+  ok("`false` is described as unsatisfiable, not as match-anything",
+    has(rFalse.ledger, "matches NO value") && !has(rFalse.ledger, "matches ANY value"));
+
+  // The node is left VISIBLE — a blocker must not delete the shape (#318).
+  ok("the boolean is carried through to the output, not stripped",
+    E.convert(propBool(true), "openai").schema.properties.a === true);
+
+  // --- per-provider, MEASURED not ported ---
+  // TS output_format THROWS; Go keeps it verbatim on BOTH surfaces; TS tools
+  // applies no transform at all.
+  ok("anthropic-json blocks a boolean subschema (TS transformer throws)",
+    blockers(E.convert(propBool(true), "anthropic-json")).length === 1);
+  ok("anthropic (tools, verbatim) does NOT block it",
+    blockers(E.convert(propBool(true), "anthropic")).length === 0);
+  ok("anthropic-go does NOT block it — measured verbatim through both Go surfaces",
+    blockers(E.convert(propBool(true), "anthropic-go")).length === 0);
+  ok("anthropic-go says the TypeScript path disagrees",
+    has(E.convert(propBool(true), "anthropic-go").ledger, "the Go SDK keeps it"));
+  // Never probed for this shape -> claim nothing.
+  ok("anthropic-json-python is left unchanged (not probed for this shape)",
+    blockers(E.convert(propBool(true), "anthropic-json-python")).length === 0);
+
+  // Gemini: narrow proto rejects it, JSON-Schema path accepts it.
+  ok("gemini (narrow proto) blocks a boolean subschema",
+    blockers(E.convert(propBool(true), "gemini")).length === 1);
+  ok("gemini-json does NOT block it",
+    blockers(E.convert(propBool(true), "gemini-json")).length === 0);
+
+  // Non-strict OpenAI surfaces have no subset restriction at all.
+  ok("openai-nonstrict does NOT block it",
+    blockers(E.convert(propBool(true), "openai-nonstrict")).length === 0);
+  ok("openai-realtime does NOT block it",
+    blockers(E.convert(propBool(true), "openai-realtime")).length === 0);
+
+  // --- over-blocking guards: booleans that are LEGAL by design ---
+  // `additionalProperties`/`unevaluatedProperties`/`additionalItems` take a
+  // boolean as their normal spelling. Flagging those would fire on every closed
+  // object in existence.
+  var LEGAL = {
+    type: "object",
+    properties: { a: { type: "string" } },
+    required: ["a"],
+    additionalProperties: false,
+    unevaluatedProperties: false
+  };
+  ok("a normal `additionalProperties: false` is not mistaken for a boolean subschema",
+    blockers(E.convert(clone(LEGAL), "openai")).filter(function (b) {
+      return /boolean subschema/.test(b.msg || "");
+    }).length === 0);
+  var OPEN = { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: true };
+  ok("`additionalProperties: true` is still the open-map/extra-keys rule, not this one",
+    blockers(E.convert(clone(OPEN), "openai")).filter(function (b) {
+      return /boolean subschema/.test(b.msg || "");
+    }).length === 0);
+  ok("an ordinary schema gains no boolean blocker",
+    blockers(E.convert({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "openai"))
+      .filter(function (b) { return /boolean subschema/.test(b.msg || ""); }).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

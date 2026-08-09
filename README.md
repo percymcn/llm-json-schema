@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 355 engine + 131 CLI + 31 ESM/library assertions = **517** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 381 engine + 140 CLI + 31 ESM/library assertions = **552** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -264,6 +264,47 @@ SDK then stamps `strict: True` anyway. `openai@7.4.0`'s `toStrictJsonSchema()`
 `type` and a typeless node with `properties`, both of which the base SDK
 misses). The three payloads in this repo's tests are the verbatim output of the
 Python SDK, so they are a regression pin on that disagreement.
+
+### Boolean subschemas — what Go emits for `any`
+
+JSON Schema defines a schema as *"an object **or a boolean**"*: `true` matches
+any value, `false` matches none. It is easy to forget the second form exists,
+and easy to write a walker that only knows the first.
+
+It is also what you get by default in Go. `openai-go`'s README shows a
+`GenerateSchema[T]()` helper built on `invopop/jsonschema`, and that reflector
+emits a literal `true` for `any`, `interface{}`, `json.RawMessage`, and the
+element type of `[]any` — the four idiomatic ways of saying "arbitrary JSON":
+
+```json
+{ "type": "object",
+  "properties": { "name": { "type": "string" }, "data": true },
+  "required": ["name", "data"], "additionalProperties": false }
+```
+
+Measured, one client at a time:
+
+| target | boolean subschema | source |
+|---|---|---|
+| `openai` | **rejected** — `Expected object schema but got boolean` (8/8 positions) | `openai@7.4.0` `toStrictJsonSchema()` |
+| `openai-nonstrict`, `openai-realtime` | legal — no subset restriction without `strict` | — |
+| `anthropic` (tools) | kept verbatim — no transform runs | `betaTool`, `@anthropic-ai/sdk@0.116.0` |
+| `anthropic-json` (TS `output_format`) | **rejected** — *"JSON schema must have a type defined…"* | `transformJSONSchema` |
+| `anthropic-go` | kept verbatim on **both** surfaces | `anthropic-sdk-go@v1.62.0` |
+| `gemini` (narrow `responseSchema`) | **rejected** — `types.Schema` is `extra="forbid"` | `google-genai==2.17.0` |
+| `gemini-json` (`responseJsonSchema`) | legal — ordinary JSON Schema | — |
+
+So this is the fourth thing Anthropic's three SDKs disagree about, and the Go
+one is again the permissive side. `--to anthropic-json-python` is deliberately
+left alone: that client was not probed for this shape, so nothing is claimed.
+
+Where it is rejected, this tool **blocks** rather than repairing. There is no
+repair — a dialect that constrains decoding has no way to express "anything
+goes" — so guessing a type would silently narrow your schema. The blocker names
+the two honest remodellings: declare the shape you actually expect, or, if the
+value really is arbitrary, type it `{"type": "string"}` and have the model emit
+serialized JSON you parse yourself. The boolean is left in your output so you
+can see where it is.
 
 This tool applies each provider's rules for you and shows a **change ledger** — every transform, with the exact official-doc rule it enforces cited inline.
 

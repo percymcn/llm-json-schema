@@ -847,5 +847,38 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     /anthropic-sdk-go/.test(run(["--help"], "").stdout));
 })();
 
+// ---------------------------------------------------------------------------
+// Boolean subschemas (Cycle #333) — exit codes and target divergence.
+(function () {
+  // Verbatim output of openai-go@v3.50.0's README `GenerateSchema[T]()` recipe
+  // for `struct { Name string; Data any }`.
+  var GO_ANY = '{"$schema": "https://json-schema.org/draft/2020-12/schema", "additionalProperties": false, "properties": {"data": true, "name": {"type": "string"}}, "required": ["name", "data"], "type": "object"}';
+
+  var o = run(["--to", "openai", "--check"], GO_ANY);
+  ok("a boolean subschema exits 3 on openai", o.status === 3, "status=" + o.status);
+  ok("...and the diagnosis says it matches any value",
+    /matches ANY value/.test(o.stderr), o.stderr.slice(0, 200));
+  ok("...and names a remedy rather than only refusing",
+    /serialized JSON/.test(o.stderr));
+
+  // The same bytes are legal on the surfaces where they are legal — a blocker
+  // that fired everywhere would just be a false CI failure somewhere else.
+  ok("the same file exits 0 on openai-nonstrict",
+    run(["--to", "openai-nonstrict", "--check"], GO_ANY).status === 0);
+  ok("the same file exits 0 on anthropic (tools, verbatim)",
+    run(["--to", "anthropic", "--check"], GO_ANY).status === 0);
+  ok("the same file exits 0 on anthropic-go (measured verbatim, both surfaces)",
+    run(["--to", "anthropic-go", "--check"], GO_ANY).status === 0);
+  ok("the same file exits 3 on anthropic-json (TS transformer throws)",
+    run(["--to", "anthropic-json", "--check"], GO_ANY).status === 3);
+  ok("the same file exits 0 on gemini-json",
+    run(["--to", "gemini-json", "--check"], GO_ANY).status === 0);
+
+  // A blocker must outrank a fixable change (#330) — this schema also needs an
+  // `additionalProperties` edit on some targets, and 3 must still win.
+  ok("exit 3 outranks the fixable changes in the same file",
+    run(["--to", "openai", "--check"], GO_ANY).status === 3);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
