@@ -4037,5 +4037,122 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     blockers(conv("gemini-json", doc({ "enum": [] }))).length === 0);
 })();
 
+// ---------------------------------------------------------------------------
+// A map has four spellings, and closing an object deletes three of them.
+//
+// `additionalProperties` is not the only keyword that describes keys nobody
+// declared. `patternProperties`, `propertyNames` and `unevaluatedProperties`
+// describe them too, and OpenAI strict mode supports none of the four. Strip
+// one of the last three and then set `additionalProperties: false` -- both
+// individually correct -- and the object's only legal value becomes `{}`.
+//
+// Reachability is not hypothetical. Measured verbatim on pydantic 2.13.4:
+//   Dict[Annotated[str, StringConstraints(pattern=r'^S_')], str]
+//     -> {"type": "object", "patternProperties": {"^S_": {"type": "string"}}}
+// with NO `additionalProperties` key, which is the exact shape that was silent.
+(function () {
+  function conv(p, node) {
+    return E.convert({
+      type: "object", properties: { m: JSON.parse(JSON.stringify(node)) },
+      required: ["m"], additionalProperties: false
+    }, p);
+  }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function blocks(r) {
+    return led(r).filter(function (e) { return e.op === "!" && !e.advisory; });
+  }
+  function advis(r) { return led(r).filter(function (e) { return e.advisory; }); }
+  function m(r) {
+    var s = r && r.schema;
+    return (s && s.properties && s.properties.m) || {};
+  }
+  var PP = { "^S_": { type: "string" } };
+
+  // (1) The four dead-field shapes. Each is an object whose ONLY way of holding
+  //     data is a keyword strict mode cannot represent.
+  var bare = conv("openai", { type: "object", patternProperties: PP });
+  ok("bare `patternProperties` (the pydantic shape) is a blocker",
+    blocks(bare).length === 1);
+  ok("a closed pattern-map is a blocker",
+    blocks(conv("openai", { type: "object", patternProperties: PP, additionalProperties: false })).length === 1);
+  ok("`propertyNames` with nothing else is a blocker",
+    blocks(conv("openai", { type: "object", propertyNames: { pattern: "^[a-z]+$" } })).length === 1);
+  ok("`unevaluatedProperties` with a schema is a blocker",
+    blocks(conv("openai", { type: "object", unevaluatedProperties: { type: "string" } })).length === 1);
+
+  // (2) The keyword stays VISIBLE and the object is NOT closed. Deleting the
+  //     keyword and closing the object IS the defect, so a fix that reported it
+  //     and then did it anyway would be worthless -- and the value schema is
+  //     what makes the remedy actionable.
+  ok("a blocked map keyword is left in the output, not stripped",
+    JSON.stringify(m(bare).patternProperties) === JSON.stringify(PP));
+  ok("a blocked map object is not closed behind the reader's back",
+    m(bare).additionalProperties === undefined);
+
+  // (3) The advisory arm. The node has declared `properties`, so the field
+  //     still works and blocking would be over-strict -- but the pattern keys
+  //     stop being accepted, which is a NARROWING, not the widening a strip
+  //     normally is.
+  var withProps = conv("openai", {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    patternProperties: PP, additionalProperties: false
+  });
+  ok("a pattern-map that also declares properties is not blocked",
+    blocks(withProps).length === 0);
+  ok("...but the keys it can no longer accept are reported",
+    advis(withProps).some(function (e) { return /no longer accepted/.test(e.msg); }));
+  // PLACEMENT PIN: this input ALREADY carries `additionalProperties: false`, so
+  // it never enters the branch that writes the `false`. Keying the advisory to
+  // that write reported the loss only when we happened to be the one writing
+  // it -- and `{patternProperties, additionalProperties: false}` is the
+  // commonest spelling of a closed pattern-map there is.
+  ok("the narrowing is reported even when we did not write the `false` ourselves",
+    advis(withProps).some(function (e) { return /no longer accepted/.test(e.msg); }) &&
+    m(withProps).additionalProperties === false);
+  ok("the narrowing advisory never registers as a gate failure",
+    blocks(withProps).length === 0 && advis(withProps).length > 0);
+
+  // (4) Over-block guards. Being stricter than the vendor is this project's
+  //     most repeated bug, and each of these is a discriminator proving the
+  //     rule is keyed on what the keyword SAYS about the keys, not on its
+  //     presence.
+  //     Measured on openai@7.4.0: a bare {"type":"object"} is ACCEPT-repaired
+  //     -- the vendor closes it exactly the way we do -- so flagging it would
+  //     be noise.
+  var plain = conv("openai", { type: "object" });
+  ok("a bare `{type: object}` is still closed and not blocked",
+    blocks(plain).length === 0 && m(plain).additionalProperties === false);
+  ok("an EMPTY `patternProperties` describes no keys, so it is not a blocker",
+    blocks(conv("openai", { type: "object", patternProperties: {} })).length === 0);
+  ok("`unevaluatedProperties: false` already says closed, so it is not a blocker",
+    blocks(conv("openai", { type: "object", unevaluatedProperties: false })).length === 0);
+  ok("a property literally NAMED `patternProperties` is not a false positive",
+    blocks(conv("openai", {
+      type: "object", properties: { patternProperties: { type: "string" } },
+      required: ["patternProperties"], additionalProperties: false
+    })).length === 0);
+  // An open map is already reported by its own rule; this must not become two.
+  ok("an open map is still reported exactly once, not twice",
+    blocks(conv("openai", {
+      type: "object", propertyNames: { pattern: "^a" }, additionalProperties: { type: "string" }
+    })).length === 1);
+
+  // (5) Per-provider, MEASURED not ported. Only OpenAI both strips these
+  //     keywords AND forces the object closed, so only OpenAI can compose the
+  //     two into a dead field. Anthropic and the JSON-Schema Gemini path carry
+  //     `patternProperties` verbatim; the narrow Gemini proto strips it but has
+  //     no `additionalProperties` field at all, so the object stays OPEN --
+  //     that is a widening, which is the acceptable direction.
+  ["anthropic", "anthropic-json", "gemini-json", "openai-nonstrict"].forEach(function (p) {
+    var r = conv(p, { type: "object", patternProperties: PP });
+    ok(p + " keeps `patternProperties` verbatim and does not block",
+      blocks(r).length === 0 && JSON.stringify(m(r).patternProperties) === JSON.stringify(PP));
+  });
+  var gem = conv("gemini", { type: "object", patternProperties: PP });
+  ok("narrow gemini strips the keyword but leaves the object open, so no blocker",
+    blocks(gem).length === 0 && m(gem).patternProperties === undefined &&
+    m(gem).additionalProperties === undefined);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

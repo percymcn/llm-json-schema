@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 657 engine + 191 CLI + 34 ESM/library assertions = **882** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 677 engine + 197 CLI + 34 ESM/library assertions = **908** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -288,6 +288,27 @@ rebuilding the node as `{"type":"object","properties":{},"additionalProperties":
 with no error, so that target warns; `tools[].input_schema` sends it verbatim
 and needs nothing.
 
+And `additionalProperties` is not the only spelling of that trap, because it is
+not the only keyword that describes keys nobody declared. `patternProperties`,
+`propertyNames` and `unevaluatedProperties` describe them too, strict mode
+supports none of them, and stripping one while closing the object composes two
+individually correct edits into a dead field. This is reachable from an
+ordinary model: pydantic 2.13.4 renders
+`Dict[Annotated[str, StringConstraints(pattern=r'^S_')], str]` as
+`{"type": "object", "patternProperties": {"^S_": {"type": "string"}}}` — with
+no `additionalProperties` key at all, so nothing looks like a map. Those are
+blockers on `--to openai` for the same reason and with the same remedy, and the
+keyword is left visible so the value schema you have to remodel is still in
+front of you. Where the node *also* declares real `properties` the field
+survives, so it is an advisory instead, saying which keys stopped being
+accepted. Deliberately not flagged: an empty `patternProperties` (it describes
+no keys), `unevaluatedProperties: false` (already closed), and a bare
+`{"type": "object"}` — `openai@7.4.0` closes that one itself, so flagging it
+would be noise. Only OpenAI both strips these keywords *and* forces the object
+closed, so only OpenAI can compose the two; the narrow Gemini proto strips them
+and leaves the object open, which is a widening, and every other target carries
+them verbatim.
+
 Worth knowing where the open map comes from, because two of OpenAI's own
 implementations disagree about it. `openai==2.53.0`'s
 `_ensure_strict_json_schema` only inserts `additionalProperties: false` when
@@ -464,7 +485,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 882 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 908 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI.
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

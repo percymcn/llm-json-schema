@@ -1166,5 +1166,47 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     ctl.status === 0 && ctl.stderr.indexOf("No value can satisfy") === -1);
 })();
 
+// A pattern-constrained dict key, end to end. This is the VERBATIM
+// `model_json_schema()` output of pydantic 2.13.4 for
+//   class Doc(BaseModel):
+//       tags: Dict[Annotated[str, StringConstraints(pattern=r'^S_')], str]
+// -- note there is no `additionalProperties` key anywhere in it, which is
+// exactly why nothing in this engine used to see a map.
+(function () {
+  var PYD = JSON.stringify({
+    type: "object", title: "Doc",
+    properties: { tags: { patternProperties: { "^S_": { type: "string" } }, title: "Tags", type: "object" } },
+    required: ["tags"], additionalProperties: false
+  });
+
+  var chk = run(["--to", "openai", "--check"], PYD);
+  ok("a pydantic pattern-map is a blocker, not a silently emptied field",
+    chk.status === 3);
+  ok("...and the blocker names the consequence rather than just the keyword",
+    /only legal value is `\{\}`/.test(chk.stderr));
+
+  // The whole defect was that the OUTPUT was accepted while being dead, so the
+  // output is the thing to assert on: the value schema must survive, and the
+  // object must not come back closed.
+  var out = run(["--to", "openai"], PYD);
+  var tags = JSON.parse(out.stdout).properties.tags;
+  ok("the value schema survives conversion instead of being deleted",
+    JSON.stringify(tags.patternProperties) === JSON.stringify({ "^S_": { type: "string" } }));
+  ok("the dead `{type: object, additionalProperties: false}` is never emitted",
+    tags.additionalProperties === undefined);
+
+  // Same file, a target that genuinely accepts it: the two must disagree, or
+  // the blocker is just noise.
+  ok("the same file passes cleanly on a target that carries the keyword",
+    run(["--to", "anthropic", "--check"], PYD).status === 0);
+
+  // Over-block guard at the CLI: an ordinary closed object must stay silent.
+  ok("an ordinary closed object is not swept up by the new rule",
+    run(["--to", "openai", "--check"], JSON.stringify({
+      type: "object", properties: { a: { type: "string" } },
+      required: ["a"], additionalProperties: false
+    })).status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

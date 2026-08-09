@@ -156,6 +156,68 @@
     return emptiedMapForm(node) !== null;
   }
 
+  // `additionalProperties` is NOT the only keyword that says "this object is a
+  // map". JSON Schema has four ways to describe keys nobody declared, and
+  // isOpenMap above knows exactly one of them:
+  //
+  //   additionalProperties: <schema|true>   -- the one isOpenMap knows
+  //   patternProperties: {"^S_": <schema>}  -- keys matching a regex
+  //   propertyNames: <schema>               -- a constraint on the key strings
+  //   unevaluatedProperties: <schema|true>  -- whatever the branches did not cover
+  //
+  // That gap is not theoretical and it is not hand-written. Measured verbatim on
+  // pydantic 2.13.4, a pattern-constrained dict key
+  //   Dict[Annotated[str, StringConstraints(pattern=r'^S_')], str]
+  // renders as {"type": "object", "patternProperties": {"^S_": {"type":
+  // "string"}}} with NO `additionalProperties` key at all -- so nothing in this
+  // engine saw a map. The OpenAI converter then does two individually correct
+  // things: it strips `patternProperties` (the vendor genuinely throws on it)
+  // and it sets `additionalProperties: false` (strict mode genuinely requires
+  // it). Composed, they leave `{"type": "object", "additionalProperties":
+  // false}` -- an object whose only legal value is `{}`. The field can never be
+  // populated, the vendor ACCEPTS that output verbatim, and re-checking it
+  // exits 0.
+  //
+  // Note which direction that is. A strip on its own WIDENS: dropping
+  // `uniqueItems` merely stops enforcing something. This one NARROWS to the
+  // empty object, because the keyword being stripped was the node's only way of
+  // admitting a key and the keyword being added forbids everything else. Two
+  // correct edits, one inversion.
+  //
+  // Deliberately NOT counted as evidence of a map, and each of these is a
+  // discriminator proving the rule is keyed on what the keyword SAYS about the
+  // keys rather than on its presence:
+  //   patternProperties: {}        -- describes no keys at all, so closing the
+  //                                   object loses nothing (an empty collection
+  //                                   is the inverse of a full one, not less of
+  //                                   it).
+  //   unevaluatedProperties: false -- already says "closed"; closing is a no-op.
+  //   a bare {"type": "object"}    -- carries no claim about undeclared keys,
+  //                                   and openai@7.4.0's own transformer closes
+  //                                   it exactly the same way, so flagging it
+  //                                   would be the over-strictness this project
+  //                                   has shipped repeatedly.
+  function mapKeyEvidence(node) {
+    if (!isPlainObject(node)) return [];
+    var found = [];
+    if (isPlainObject(node.patternProperties) &&
+        Object.keys(node.patternProperties).length) found.push("patternProperties");
+    if (node.propertyNames === true || isPlainObject(node.propertyNames)) {
+      found.push("propertyNames");
+    }
+    var up = node.unevaluatedProperties;
+    if (up === true || isPlainObject(up)) found.push("unevaluatedProperties");
+    return found;
+  }
+
+  // Does this node still have somewhere to put data once undeclared keys are
+  // forbidden? #329's question ("what does the node have LEFT after the
+  // repair?") is what separates a blocker from an advisory here.
+  function hasUsableProperties(node) {
+    return isPlainObject(node) && isPlainObject(node.properties) &&
+      Object.keys(node.properties).length > 0;
+  }
+
   // ---- unsatisfiable nodes --------------------------------------------------
   //
   // For a collection keyword the EMPTY instance usually does not mean "less of
@@ -1341,9 +1403,28 @@
       // them verbatim), so they are advisory rather than a gate failure.
       if (!notBlocked) noteUnsatisfiable(node, path, ledger, DOCS.openai);
 
+      // Read the map evidence BEFORE the strip loop runs, because the strip is
+      // what destroys it: `patternProperties` is gone by the time the close
+      // below happens, and what is left is byte-identical to a bare
+      // `{"type": "object"}` that never claimed to be a map at all. A claim
+      // about what the caller GAVE us has to be captured at entry.
+      var mapEv = mapKeyEvidence(node);
+      // Blocked only when closing the object would leave nowhere to put data.
+      // An open map is already handled by its own arm below, so it is excluded
+      // here rather than reported twice, and a node that is not an object
+      // schema never reaches the close at all.
+      var mapKilled = mapEv.length > 0 && isObjectSchema(node) &&
+        !isOpenMap(node) && !hasUsableProperties(node);
+
       // strip every keyword outside the supported set (unsupported => API error)
       Object.keys(node).forEach(function (k) {
         if (OPENAI_SUPPORTED[k]) return;
+        // A map keyword whose removal would empty the object stays VISIBLE, for
+        // the same reason as the blocked `not`/`prefixItems`/`oneOf` above:
+        // deleting it hides the very thing the reader has to remodel, and here
+        // it would also hide the value schema, which is still right there in
+        // the file and is what makes the remedy actionable.
+        if (mapKilled && mapEv.indexOf(k) !== -1) return;
         // Leave a blocked `not` visible: deleting it is the inversion above.
         if (k === "not" && notBlocked) return;
         // A blocked tuple stays visible so the reader can see the shape they
@@ -1370,6 +1451,28 @@
             "strict mode requires `additionalProperties: false` on every object. " +
             OPEN_MAP_REMEDY,
             DOCS.openai));
+        } else if (mapKilled) {
+          // Same consequence as the open map above — a field that can never be
+          // populated — reached through a different spelling of "this object is
+          // a map". So the object is deliberately NOT closed: doing that is the
+          // deletion, not the fix.
+          //
+          // One thing this can say that the open-map arm cannot: the value
+          // schema is still in the file, because we did not strip it. That is
+          // the difference between a dead field we CREATED and the fossil of
+          // one created upstream (which is advisory, since nothing in that file
+          // can be acted on).
+          ledger.push(entry("!", path,
+            "This object describes its keys with " +
+            mapEv.map(function (k) { return "`" + k + "`"; }).join(" + ") +
+            " and declares no `properties`, so those keywords are the only thing " +
+            "admitting a key. OpenAI strict mode supports none of them and requires " +
+            "`additionalProperties: false` on every object — and doing both would " +
+            "leave `{\"type\": \"object\", \"additionalProperties\": false}`, whose only " +
+            "legal value is `{}`. The vendor ACCEPTS that, so nothing downstream would " +
+            "tell you the field is dead. Left as-is rather than closed. " +
+            OPEN_MAP_REMEDY,
+            DOCS.openai));
         } else if (node.additionalProperties !== false) {
           var was = "additionalProperties" in node;
           var lost = was && node.additionalProperties !== false;
@@ -1379,6 +1482,29 @@
             (lost ? " The extra keys your `additionalProperties` allowed are no longer " +
               "accepted; only the declared `properties` survive." : ""),
             DOCS.openai));
+        }
+
+        // The node still has declared `properties`, so the field survives and
+        // this is not a blocker — but the keys those map keywords admitted are
+        // now forbidden, which is a narrowing rather than the widening a strip
+        // normally is, and it is worth one line.
+        //
+        // Deliberately OUTSIDE the chain above. A schema that already carried
+        // `additionalProperties: false` never enters the closing branch at all,
+        // and that is the commonest spelling of a closed pattern-map
+        // (`{patternProperties, additionalProperties: false}` is how you say
+        // "only these keys, nothing else"). Keying this to the moment we write
+        // the `false` reported the loss only when we happened to be the one
+        // writing it.
+        if (mapEv.length && !mapKilled && !isOpenMap(node)) {
+          ledger.push(entry("!", path,
+            "Keys admitted by " +
+            mapEv.map(function (k) { return "`" + k + "`"; }).join(" + ") +
+            " are no longer accepted. Strict mode supports none of those keywords and " +
+            "requires the object to be closed, so only the declared `properties` " +
+            "survive — the model can no longer emit the keys they described. Declare " +
+            "the ones you actually expect as fixed `properties` if you need them.",
+            DOCS.openai, true));
         }
         // every property must be required; keep optionals optional-in-spirit via nullable
         var props = node.properties ? Object.keys(node.properties) : [];
