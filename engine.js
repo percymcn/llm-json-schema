@@ -186,6 +186,67 @@
     "else": "the doc names `if`/`then`/`else` unsupported."
   };
 
+  // A local pointer is spelled `#/$defs/X`. LiteLLM deliberately emits `/$defs/X`
+  // instead — it passes `ref_template="/$defs/{model}"` to Pydantic's
+  // `model_json_schema()` (litellm/llms/anthropic/chat/transformation.py), so this
+  // is the DEFAULT shape for every Python caller using `response_format=<Model>`.
+  //
+  // That spelling is not a local pointer. Per RFC 3986 it is a path-absolute
+  // URI-reference with no fragment, so it addresses a different document and never
+  // resolves against the local `$defs`. LiteLLM's own code agrees: its OTHER
+  // Anthropic path calls `unpack_defs()` first, commented "Anthropic doesn't
+  // support external schema references (e.g., /$defs/CalendarEvent)".
+  //
+  // Every rule below matches `#/$defs/...`, so before this normalisation an
+  // unrecognised spelling did not merely go unfixed — the orphan-`$defs` pruner
+  // found no reference to the definition and DELETED it, leaving a dangling
+  // pointer, and `inlineRootRef` no-oped so a root `$ref` sailed through as
+  // "already valid". That is the single most destructive Anthropic input there is.
+  //
+  // Conditional, not unconditional (#318): rewrite only when the target actually
+  // exists locally. A `/$defs/X` with no local `X` really is external, and no
+  // provider resolves those — that gets named as a blocker instead of quietly
+  // rewritten into a pointer at something that was never there.
+  function normalizeRefSpelling(s, ledger, docUrl, why) {
+    var bags = ["$defs", "definitions"];
+    var rewritten = 0, external = [];
+    (function visit(v) {
+      if (Array.isArray(v)) { v.forEach(visit); return; }
+      if (!isPlainObject(v)) return;
+      if (typeof v.$ref === "string" && v.$ref.charAt(0) !== "#") {
+        var m = /^\/(\$defs|definitions)\/(.+)$/.exec(v.$ref);
+        var name = m ? m[2] : null;
+        if (m && isPlainObject(s[m[1]]) && isPlainObject(s[m[1]][name])) {
+          v.$ref = "#" + v.$ref;
+          rewritten++;
+        } else if (external.indexOf(v.$ref) === -1) {
+          external.push(v.$ref);
+        }
+      }
+      Object.keys(v).forEach(function (k) { visit(v[k]); });
+    })(s);
+
+    if (rewritten) {
+      ledger.push(entry("~", "root",
+        "Rewrote " + rewritten + " `$ref` from `/$defs/...` to `#/$defs/...`. Only the second form is " +
+        "a pointer into this document; the first addresses a different document and leaves the " +
+        "reference dangling. " + (why || "") + " LiteLLM emits this spelling by default for Python " +
+        "callers — it passes `ref_template=\"/$defs/{model}\"` to Pydantic — and its own " +
+        "`output_format` path inlines such refs first, commented \"Anthropic doesn't support " +
+        "external schema references\". The `tools[].input_schema` path it uses for " +
+        "`response_format=<Model>` does not.",
+        docUrl || DOCS.openai));
+    }
+    external.forEach(function (ref) {
+      ledger.push(entry("!", "root",
+        "`$ref: \"" + ref + "\"` points outside this document and there is no matching local " +
+        "definition to resolve it against. No provider fetches external schema references — the " +
+        "reference arrives dangling. Inline the definition or add it to `$defs`.",
+        docUrl || DOCS.openai));
+    });
+    return s;
+  }
+
   // `definitions` is draft-07 (what zod-to-json-schema emits); OpenAI's doc and
   // examples use `$defs`. Rename it and repoint every `$ref` that used it.
   function normalizeDefs(s, ledger, docUrl, why) {
@@ -559,6 +620,7 @@
     var s = clone(schema);
     var ledger = [];
 
+    s = normalizeRefSpelling(s, ledger);
     s = normalizeDefs(s, ledger);
     s = inlineRootRef(s, ledger);
     s = resolveRefSiblings(s, ledger);
@@ -881,6 +943,9 @@
     // `definitions` is draft-07; the transformer only knows `$defs`. Left alone
     // it is not merely ignored — it is stringified into the root `description`
     // and every `#/definitions/...` pointer is left dangling.
+    s = normalizeRefSpelling(s, ledger, DOCS.anthropic,
+      "Anthropic's transformer passes a `$ref` through verbatim without resolving or validating it, " +
+      "so a mis-spelled pointer reaches the model dangling rather than erroring.");
     s = normalizeDefs(s, ledger, DOCS.anthropic,
       "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref`. Anthropic's " +
       "structured-output transformer only reads `$defs`; a `definitions` bag is not ignored, it is " +
@@ -1248,6 +1313,14 @@
   function toGemini(schema, jsonPath) {
     var s = clone(schema);
     var ledger = [];
+
+    // Applies to BOTH paths: the narrow proto has no `$ref` at all, and the
+    // JSON-Schema path accepts `$ref`/`$defs` but resolves only real local
+    // pointers. Either way a `/$defs/X` spelling is broken, so fix it before
+    // the paths diverge.
+    s = normalizeRefSpelling(s, ledger, DOCS.gemini,
+      "Gemini resolves `$ref` only on the `responseJsonSchema` path, and only for genuine local " +
+      "pointers.");
 
     // ---- Path A: `responseJsonSchema` -> the SDK sends this VERBATIM --------
     // Subsetting here would be actively destructive: it would throw away

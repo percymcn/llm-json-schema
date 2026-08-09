@@ -931,5 +931,86 @@ var PYD_TUPLE = {
     rt.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
 })();
 
+// --- LiteLLM's ref spelling ------------------------------------------------
+// Pinned to the VERBATIM wire payload captured from litellm==1.96.0 by
+// intercepting httpx, from an ordinary Pydantic model. LiteLLM passes
+// `ref_template="/$defs/{model}"` to `model_json_schema()`, so `/$defs/X` — not
+// `#/$defs/X` — is the default shape for every Python caller doing
+// `response_format=<Model>` against Anthropic.
+//
+// Before the fix this was not merely unfixed. Every rule matches `#/$defs/`, so
+// the orphan-`$defs` pruner saw no reference to `Priority`, DELETED the
+// definition, and left the `$ref` pointing at nothing — while `inlineRootRef`
+// no-oped, so a root `$ref` was certified "already valid" (exit 0). That is the
+// exact shape the SDK reduces to a bare dangling pointer with the whole schema
+// gone. Verified against @anthropic-ai/sdk@0.116.0's transformJSONSchema.
+var LITELLM_ANTHROPIC = {
+  type: "object",
+  $defs: {
+    Priority: {
+      properties: {
+        level: { description: "how urgent", pattern: "^(low|high)$", title: "Level", type: "string" },
+        score: { maximum: 10, minimum: 1, title: "Score", type: "integer" }
+      },
+      required: ["level", "score"], title: "Priority", type: "object"
+    }
+  },
+  properties: {
+    title: { description: "short title", maxLength: 80, minLength: 3, title: "Title", type: "string" },
+    priority: { $ref: "/$defs/Priority" },
+    assignee: { anyOf: [{ type: "string" }, { type: "null" }], "default": null, title: "Assignee" }
+  },
+  required: ["title", "priority"], title: "Ticket"
+};
+
+(function () {
+  var r = E.toAnthropic(JSON.parse(JSON.stringify(LITELLM_ANTHROPIC)));
+  ok("litellm's /$defs/ ref is repointed to a real local pointer",
+    r.schema.properties.priority.$ref === "#/$defs/Priority");
+  // The regression that mattered most: the definition used to be deleted.
+  ok("the $defs bag survives instead of being pruned as orphaned",
+    !!r.schema.$defs && !!r.schema.$defs.Priority);
+  ok("the repoint is reported, not done silently",
+    has(r.ledger, "/$defs/") && has(r.ledger, "ref_template"));
+  // Coverage inside $defs was lost as a CONSEQUENCE of the deletion — the walker
+  // was always correct, the bag was simply gone by the time it ran.
+  ok("demote-to-prose advisories now reach inside $defs",
+    r.ledger.some(function (l) { return l.path.indexOf("$defs.Priority") === 0; }));
+})();
+
+// A root `$ref` in litellm's spelling: the false pass that started this.
+(function () {
+  var r = E.toAnthropic({
+    $ref: "/$defs/Priority",
+    $defs: { Priority: { type: "object", properties: { level: { type: "string" } }, required: ["level"] } }
+  });
+  ok("a root $ref in litellm's spelling is inlined, not passed as valid",
+    r.schema.$ref === undefined && r.schema.type === "object");
+  ok("the inlined root keeps the real properties",
+    !!r.schema.properties && !!r.schema.properties.level);
+})();
+
+// Conditional, not unconditional (#318): a `/$defs/X` with no local `X` really
+// IS external. Rewriting it would invent a pointer to something never there.
+(function () {
+  var r = E.toOpenAI({ type: "object", properties: { a: { $ref: "/$defs/Nowhere" } }, required: ["a"] });
+  ok("an unresolvable external ref is left alone, not rewritten",
+    r.schema.properties.a.$ref === "/$defs/Nowhere");
+  ok("an unresolvable external ref is a blocker, not a silent pass",
+    r.ledger.some(function (l) { return l.op === "!" && !l.advisory && has([l], "outside this document"); }));
+})();
+
+// All three providers share the normalisation — the #314 lesson (a fix to a
+// shared code path is not done until every provider is re-probed).
+(function () {
+  ["toOpenAI", "toAnthropic", "toGemini"].forEach(function (fn) {
+    var r = E[fn]({ type: "object", properties: { p: { $ref: "/$defs/P" } },
+      $defs: { P: { type: "object", properties: { x: { type: "string" } }, required: ["x"] } },
+      required: ["p"] });
+    var str = JSON.stringify(r.schema);
+    ok(fn + " repoints litellm's ref spelling", str.indexOf('"/$defs/P"') === -1);
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
