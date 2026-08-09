@@ -1078,5 +1078,46 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   ok("a service-rejected keyword still fails the gemini gate", bad.status !== 0);
 })();
 
+// The empty-tuple false pass, at the gate level. `{"type":"array","items":[]}`
+// is verbatim zod 4.4.3 output for `z.tuple([])` with `target: "draft-7"`.
+(function () {
+  var EMPTY_TUPLE = JSON.stringify({
+    type: "object",
+    properties: { b: { type: "array", items: [] } },
+    required: ["b"],
+    additionalProperties: false
+  });
+
+  // Was exit 0 on all four of these while every one of the four vendors
+  // rejects or destroys the document.
+  ["openai", "anthropic-json", "anthropic-json-python", "anthropic-go"].forEach(function (t) {
+    ok("`--check --to " + t + "` no longer passes an empty draft-07 tuple",
+      run(["--to", t, "--check"], EMPTY_TUPLE).status !== 0);
+  });
+
+  // OpenAI cannot be repaired -- there is no element type to invent (#336) --
+  // so it is a blocker, and exit 3 is the code that says "committing our
+  // output will not help" (#330).
+  ok("openai reports it as a blocker, not a fixable change",
+    run(["--to", "openai", "--check"], EMPTY_TUPLE).status === 3);
+
+  // Over-block guard: the tools path sends the schema verbatim and `betaTool`
+  // accepts it, so this gate must still pass.
+  ok("`--check --to anthropic` (tools) still passes it",
+    run(["--to", "anthropic", "--check"], EMPTY_TUPLE).status === 0);
+
+  // The compounding half: `alsoValidFor` was affirmatively recommending four
+  // targets that reject the document.
+  var advice = run(["--to", "gemini"], EMPTY_TUPLE);
+  ok("`alsoValidFor` no longer recommends targets that reject it",
+    advice.stderr.indexOf("anthropic-json") === -1 &&
+    advice.stderr.indexOf("already valid as-is for") !== -1);
+
+  // And the repair actually reaches the output the user is told to commit.
+  var fixed = run(["--to", "anthropic-json"], EMPTY_TUPLE);
+  ok("the converted output carries no array-form `items`",
+    fixed.status === 0 && JSON.parse(fixed.stdout).properties.b.items === undefined);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

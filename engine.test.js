@@ -3818,5 +3818,102 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("every anthropic `format` finding is advisory, never a gate failure", advisoryOnly);
 })();
 
+// #345's corollary said: when a rule is shared across implementations, check
+// whether the guard tests the KEY or the VALUE. This block is the systematic
+// version of that question turned on our OWN engine (#330's precedent). The
+// tuple guard read `!tuple.length` -- the array's VALUE -- where every
+// destination tests its SHAPE, so a ZERO-length array in `items` fell through
+// as "nothing to do". Measured 2026-08-09; `{"type":"array","items":[]}` is the
+// verbatim zod 4.4.3 rendering of `z.tuple([])` with `target: "draft-7"`.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function arr(extra) {
+    var b = { type: "array" };
+    Object.keys(extra || {}).forEach(function (k) { b[k] = extra[k]; });
+    return { type: "object", properties: { b: b }, required: ["b"], additionalProperties: false };
+  }
+  function propB(r) {
+    var pr = r.schema && r.schema.properties;
+    return (pr && pr.b) || {};
+  }
+
+  // (1) The whole point: an empty array in `items` is the tuple FORM and must
+  //     not survive into the output of any target that rejects that form.
+  //     Vendor verdicts on the raw document, all measured this cycle:
+  //       openai@7.4.0 toStrictJsonSchema .......... THROW (tuple-form `items`)
+  //       @anthropic-ai/sdk@0.116.0 outputFormat ... THROW
+  //       anthropic==0.121.0 transform_schema ...... RAISE TypeError
+  //       anthropic-sdk-go@v1.62.0 ................. schema: null (whole doc)
+  //       google-genai==2.17.0 types.Schema ........ REJECT
+  ["openai", "anthropic-json", "anthropic-json-python", "anthropic-go", "gemini", "gemini-client"]
+    .forEach(function (t) {
+      ok("`items: []` does not survive `--to " + t + "`",
+        propB(conv(arr({ items: [] }), t)).items === undefined);
+    });
+
+  // (2) ... and the removal is REPORTED, not silent (#329/#340: a repair that
+  //     deletes must be visible in the ledger).
+  ok("removing the empty tuple is reported in the ledger",
+    has(conv(arr({ items: [] }), "openai").ledger, "empty draft-07 tuple"));
+
+  // (3) The #330 class specifically: for narrow Gemini the OLD code exited 1 for
+  //     an unrelated `additionalProperties` edit while leaving `items: []` in the
+  //     output the user was told to commit. The fix has to fix it.
+  ok("narrow gemini's OUTPUT is finally free of the array-form `items`",
+    propB(conv(arr({ items: [] }), "gemini")).items === undefined);
+
+  // (4) Losslessness has one exception, and it is the #329 question ("what does
+  //     the node have LEFT?"): draft-07 `additionalItems` applies from the first
+  //     unlisted index, which with an empty list is EVERY element -- so it is the
+  //     real element schema and must MOVE, not be dropped alongside `items`.
+  var tail = conv(arr({ items: [], additionalItems: { type: "string" } }), "anthropic-json");
+  ok("`items: [] + additionalItems: S` becomes `items: S`",
+    propB(tail).items && propB(tail).items.type === "string" &&
+    propB(tail).additionalItems === undefined);
+
+  // (5) A length constraint written beside the empty tuple is not ours to touch.
+  ok("`maxItems` beside an empty tuple survives",
+    propB(conv(arr({ items: [], maxItems: 0 }), "anthropic-json")).maxItems === 0);
+
+  // --- over-block guards: being merely stricter than the vendor is this
+  // --- project's most repeated bug, so each of these pins a case that must NOT
+  // --- change. They hold both ways and are not counted as new coverage.
+
+  // (6) `prefixItems: []` is ACCEPTED by all three Anthropic SDKs (they demote it
+  //     to prose), so it must be left exactly where it is on that path.
+  ok("`prefixItems: []` is untouched on anthropic-json",
+    Array.isArray(propB(conv(arr({ prefixItems: [] }), "anthropic-json")).prefixItems));
+
+  // (7) The tools path applies no transform at all and `betaTool` accepts
+  //     `items: []` VERBATIM (measured), so `--to anthropic` must stay silent.
+  var tools = conv(arr({ items: [] }), "anthropic");
+  ok("`--to anthropic` (tools, verbatim) leaves `items: []` alone",
+    Array.isArray(propB(tools).items) &&
+    !has(tools.ledger, "empty draft-07 tuple"));
+
+  // (8) `gemini-json` accepts `prefixItems`, so its own rewrite -- a DIFFERENT
+  //     code path, using the correct shape guard already -- must be undisturbed.
+  var gj = conv(arr({ items: [] }), "gemini-json");
+  ok("gemini-json still rewrites the empty tuple to `prefixItems`",
+    Array.isArray(propB(gj).prefixItems) && propB(gj).items === undefined);
+
+  // (9) Regression pin: a NON-empty homogeneous tuple still collapses.
+  var homo = conv(arr({ items: [{ type: "string" }, { type: "string" }] }), "openai");
+  ok("a non-empty homogeneous tuple still collapses to `items` + min/maxItems",
+    propB(homo).items && propB(homo).items.type === "string" &&
+    propB(homo).minItems === 2 && propB(homo).maxItems === 2);
+
+  // (10) Regression pin: a heterogeneous tuple is still a blocker, and the
+  //      keyword stays visible so the reader can see what to remodel (#318).
+  var het = conv(arr({ items: [{ type: "string" }, { type: "integer" }] }), "openai");
+  ok("a heterogeneous tuple is still a human-fix blocker",
+    het.ledger.some(function (l) { return l.op === "!"; }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -975,7 +975,61 @@
     var tuple = null, kw = null;
     if (Array.isArray(node.prefixItems)) { tuple = node.prefixItems; kw = "prefixItems"; }
     else if (Array.isArray(node.items)) { tuple = node.items; kw = "items"; }
-    if (!tuple || !tuple.length) return false;
+    if (!tuple) return false;
+
+    // An EMPTY tuple is still the tuple FORM. This guard used to read
+    // `!tuple.length` — it tested the array's VALUE where every destination
+    // tests its SHAPE ("is `items` an array?"), so a zero-length array fell
+    // through as "nothing to do" and the draft-07 spelling survived into the
+    // output. Measured 2026-08-09 on `{"type":"array","items":[]}`, which is
+    // the VERBATIM zod 4.4.3 rendering of `z.tuple([])` with
+    // `target: "draft-7"`: toStrictJsonSchema THROWS ("uses tuple-form
+    // `items`"), @anthropic-ai/sdk 0.116.0 THROWS, anthropic 0.121.0 RAISES
+    // TypeError("'list' object is not a mapping") so the request is never
+    // built, anthropic-sdk-go v1.62.0 returns `schema: null` for the WHOLE
+    // document, and google-genai 2.17.0 `types.Schema` REJECTS it. We exited
+    // 0 on the first four and, on narrow Gemini, exited 1 for an unrelated
+    // edit while leaving `items: []` in the output the user was told to
+    // commit.
+    //
+    // Only the `items` spelling is handled here. `prefixItems: []` is already
+    // correct on every target (OpenAI blocks it as an unsupported keyword,
+    // narrow Gemini strips it, and all three Anthropic SDKs ACCEPT it —
+    // demoting it to prose), so touching it would be the stricter-than-the-
+    // vendor bug this project has shipped repeatedly.
+    if (!tuple.length) {
+      if (kw !== "items") return false;
+      // Deleting is lossless: array-form `items` applies schema[i] to element
+      // i, so with zero schemas no element is constrained and the node means
+      // exactly what `{"type": "array"}` means. The one exception is a
+      // sibling `additionalItems`, which in draft-07 applies from the first
+      // unlisted index — with an empty list that is EVERY element, so
+      // `items: [] + additionalItems: S` is precisely `items: S`. Dropping
+      // `items` while leaving `additionalItems` behind would widen the schema,
+      // because `additionalItems` is ignored without the array form.
+      var tail = node.additionalItems;
+      if (isPlainObject(tail)) {
+        node.items = clone(tail);
+        delete node.additionalItems;
+        ledger.push(entry("~", path,
+          "Rewrote an empty draft-07 tuple (`items: []`) with its `additionalItems` schema as a " +
+          "plain `items`. With no positional schemas, `additionalItems` applies to every element, " +
+          "so this is the same constraint in a spelling the destination accepts — and it has to " +
+          "move, because `additionalItems` is ignored without the array form.",
+          docUrl || DOCS.openai));
+      } else {
+        delete node.items;
+        ledger.push(entry("~", path,
+          "Removed an empty draft-07 tuple (`items: []`). It is the tuple FORM, which " +
+          (whyBlocked || "OpenAI strict mode cannot represent — it has no tuple form.") +
+          " With zero positional schemas it constrains no element, so this node already meant " +
+          "exactly `{\"type\": \"array\"}` and nothing is lost. (`z.tuple([])` emits this " +
+          "verbatim when the target is draft-07; note the generator has ALREADY lost the " +
+          "\"exactly zero elements\" part — if you meant that, add `maxItems: 0`.)",
+          docUrl || DOCS.openai));
+      }
+      return false;
+    }
 
     var head = canonical(tuple[0]);
     var homogeneous = tuple.every(function (t) { return canonical(t) === head; });
