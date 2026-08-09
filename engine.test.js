@@ -7,6 +7,10 @@ function ok(name, cond) {
   else { fail++; console.log("FAIL  " + name); }
 }
 function has(ledger, substr) {
+  // A converter that does not exist returns {ok:false} with no ledger. Treating
+  // that as a crash aborts the file and hides every assertion after it, so a
+  // missing ledger is simply "does not contain" — it reports as a failure.
+  if (!ledger || typeof ledger.some !== "function") return false;
   return ledger.some(function (l) { return l.msg.indexOf(substr) !== -1; });
 }
 
@@ -1189,6 +1193,112 @@ var INSTRUCTOR_ANTHROPIC = {
     var twice = E.convert(JSON.parse(JSON.stringify(once.schema)), p);
     ok(p + " is idempotent on the Instructor payload",
       JSON.stringify(once.schema) === JSON.stringify(twice.schema));
+  });
+})();
+
+// --- #322: non-strict is a CONDITION, not one API surface --------------------
+//
+// Verbatim wire payload captured from instructor==1.15.4 (Mode.TOOLS, the default)
+// via an intercepted httpx.Client.send. Instructor omits `strict` on every OpenAI
+// path — including the deprecated Mode.TOOLS_STRICT — so this is the schema a very
+// large Python audience actually sends, and `--to openai` proposed four edits to it.
+var INSTRUCTOR_OPENAI = {
+  type: "object",
+  properties: {
+    title: { description: "Short title", maxLength: 80, title: "Title", type: "string" },
+    priority: { default: "low", pattern: "^(low|high)$", title: "Priority", type: "string" },
+    score: { maximum: 100, minimum: 0, title: "Score", type: "integer" },
+    bbox: {
+      maxItems: 4, minItems: 4, title: "Bbox", type: "array",
+      prefixItems: [{ type: "integer" }, { type: "integer" },
+                    { type: "integer" }, { type: "integer" }]
+    },
+    tags: { items: { type: "string" }, title: "Tags", type: "array" },
+    assignee: { anyOf: [{ type: "string" }, { type: "null" }], default: null, title: "Assignee" }
+  },
+  required: ["bbox", "score", "tags", "title"]
+};
+
+// A missing target makes convert() return {ok:false} with no schema. Reading
+// through that would crash the file and hide every assertion below it, so these
+// blocks navigate defensively — a failure must report, not abort the suite.
+function at(obj, path) {
+  return path.split(".").reduce(function (o, k) {
+    return o && typeof o === "object" ? o[k] : undefined;
+  }, obj);
+}
+
+(function () {
+  var input = JSON.parse(JSON.stringify(INSTRUCTOR_OPENAI));
+  var r = E.convert(JSON.parse(JSON.stringify(input)), "openai-nonstrict");
+
+  ok("openai-nonstrict is a registered target", r.ok === true);
+  ok("openai-nonstrict passes the Instructor payload through byte-identical",
+    JSON.stringify(r.schema) === JSON.stringify(input));
+  ok("openai-nonstrict keeps the tuple strict mode has no form for",
+    Array.isArray(at(r, "schema.properties.bbox.prefixItems")));
+  ok("openai-nonstrict does not force every property required",
+    (at(r, "schema.required") || []).length === 4);
+  ok("openai-nonstrict does not add additionalProperties:false",
+    !!r.schema && !("additionalProperties" in r.schema));
+
+  // The reason non-strict applies differs between the two targets, and the reader
+  // needs the true one: on Realtime there is no field; elsewhere it is simply unset.
+  ok("openai-nonstrict says strict is absent or false, not that the field is missing",
+    has(r.ledger, "`strict` is absent or false"));
+  var rt = E.convert(JSON.parse(JSON.stringify(input)), "openai-realtime");
+  ok("openai-realtime still says the surface has no strict field",
+    has(rt.ledger, "has no `strict` field"));
+  ok("the two non-strict targets produce the SAME schema, differing only in wording",
+    JSON.stringify(rt.schema) === JSON.stringify(r.schema));
+
+  // Each target names its sibling, the way the Anthropic and Gemini pairs do.
+  ok("openai-nonstrict tells you how to get enforcement", has(r.ledger, "--to openai"));
+  ok("openai-nonstrict warns that some clients omit strict for you",
+    has(r.ledger, "Mode.TOOLS_STRICT"));
+  ok("openai-realtime does not claim strict is available on that surface",
+    has(rt.ledger, "no enforced"));
+
+  // Advisory only: a valid schema must not fail a CI gate (#317's property).
+  ok("openai-nonstrict raises no non-advisory blocker",
+    !!r.ledger && r.ledger.every(function (l) { return l.op !== "!" || l.advisory === true; }));
+})();
+
+(function () {
+  // The strict target must point at the escape hatch, but only when it changed
+  // something, and never in a way that fails a gate that legitimately passed.
+  var changed = E.toOpenAI(JSON.parse(JSON.stringify(INSTRUCTOR_OPENAI)));
+  ok("openai names openai-nonstrict when it proposes strict-only edits",
+    has(changed.ledger, "--to openai-nonstrict"));
+  ok("that cross-reference is advisory, so it cannot fail --check",
+    changed.ledger.filter(function (l) {
+      return l.msg.indexOf("--to openai-nonstrict") !== -1;
+    }).every(function (l) { return l.advisory === true; }));
+
+  var clean = E.toOpenAI({
+    type: "object", additionalProperties: false,
+    properties: { a: { type: "string" } }, required: ["a"]
+  });
+  ok("openai stays silent about openai-nonstrict when it changed nothing",
+    clean.ledger.length === 0);
+
+  // The whole point of the split: the same file gets different answers.
+  var strict = E.convert(JSON.parse(JSON.stringify(INSTRUCTOR_OPENAI)), "openai");
+  var loose = E.convert(JSON.parse(JSON.stringify(INSTRUCTOR_OPENAI)), "openai-nonstrict");
+  ok("openai and openai-nonstrict disagree on the same Instructor payload",
+    JSON.stringify(strict.schema) !== JSON.stringify(loose.schema));
+
+  ok("openai-nonstrict has its own doc URL, not the Realtime one",
+    E.DOCS["openai-nonstrict"] && E.DOCS["openai-nonstrict"] !== E.DOCS["openai-realtime"]);
+})();
+
+(function () {
+  ["openai-nonstrict", "openai-realtime"].forEach(function (p) {
+    var once = E.convert(JSON.parse(JSON.stringify(INSTRUCTOR_OPENAI)), p);
+    var twice = once.schema
+      ? E.convert(JSON.parse(JSON.stringify(once.schema)), p) : {};
+    ok(p + " is idempotent on the Instructor payload",
+      !!once.schema && JSON.stringify(once.schema) === JSON.stringify(twice.schema));
   });
 })();
 

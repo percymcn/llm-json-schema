@@ -27,6 +27,7 @@
     "anthropic-json": "https://platform.claude.com/docs/en/docs/build-with-claude/structured-outputs",
     gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
     "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
+    "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
     "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations"
   };
 
@@ -821,6 +822,19 @@
         }
       }
     });
+
+    // Every edit above is justified by strict mode, and `strict` is optional at four
+    // declaration sites in openai@7.4.0 — so a caller who never set it is being shown
+    // work they do not need to do. Only say so when we actually changed something,
+    // and keep it advisory: it must not fail a gate that legitimately passed.
+    if (ledger.length) {
+      ledger.push(entry("=", "root",
+        "These changes are required by strict mode only. If you are NOT setting " +
+        "`strict: true` (it is optional and defaults off — Instructor omits it on every " +
+        "OpenAI path, including the deprecated `Mode.TOOLS_STRICT`), the keyword subset " +
+        "does not apply and your schema is already valid: re-run with `--to openai-nonstrict`.",
+        DOCS.openai, true));
+    }
 
     return { schema: s, ledger: ledger };
   }
@@ -1703,14 +1717,44 @@
   // stripped and nothing is rewritten. Constraints are not grammar-enforced either
   // (there is no constrained decoder without strict), so they are advisory to the
   // model — which is worth SAYING, and is the whole value of this target.
-  function toOpenAIRealtime(input) {
+  //
+  // #322 — THE NAME WAS THE DEFECT. Shipping this as `openai-realtime` only scoped it
+  // to the surface where the condition was FIRST FOUND. The condition that actually
+  // selects this dialect is `strict` being absent or false, and in openai@7.4.0 that
+  // flag is optional at FOUR declaration sites outside Realtime:
+  //   shared.d.ts:112   FunctionDefinition.strict?: boolean | null
+  //   shared.d.ts:251   ResponseFormatJSONSchema.JSONSchema.strict?: boolean | null
+  //   responses.d.ts:741, :2456 (responses tools / text.format)
+  // each documented "Only a subset of JSON Schema is supported when `strict` is `true`".
+  // Realtime is the special case where non-strict is not a choice (no field at all);
+  // everywhere else it is the DEFAULT, because omitting `strict` is non-strict.
+  //
+  // This is not hypothetical. Instructor — Python-native, Pydantic-first, and the
+  // most common way Python code gets structured output — omits `strict` on EVERY
+  // OpenAI path: `Mode.TOOLS` (the default), `Mode.JSON_SCHEMA`, and even
+  // `Mode.TOOLS_STRICT`, which is deprecated and collapses to `Mode.TOOLS`, so a
+  // user who explicitly asks for strict silently gets non-strict. Measured on
+  // instructor==1.15.4 via an intercepted `httpx.Client.send`: no `strict` key in
+  // any of the three payloads. For those users `--to openai` exits 1 and proposes
+  // four edits to a schema their API accepts as written — a false CI failure, the
+  // #312/#314/#317 class — and the correct verdict was reachable only by typing a
+  // Realtime-named target they have no reason to try.
+  //
+  // `surfaceHasNoStrictField` distinguishes the two, because the REASON differs and
+  // the reader needs the true one: on Realtime there is no `strict` field to set;
+  // elsewhere the field exists and is simply unset, which means the fix for someone
+  // who WANTED enforcement is "set strict: true and re-run `--to openai`".
+  function toOpenAINonStrict(input, surfaceHasNoStrictField) {
     var schema = clone(input);
     var ledger = [];
-    var url = DOCS["openai-realtime"];
+    var url = surfaceHasNoStrictField
+      ? DOCS["openai-realtime"] : DOCS["openai-nonstrict"];
 
-    ledger.push(entry("=", "root",
-      "No changes needed. This surface has no `strict` field, so the Structured Outputs " +
-      "keyword subset does not apply — your schema is sent as plain JSON Schema.", url));
+    ledger.push(entry("=", "root", surfaceHasNoStrictField
+      ? "No changes needed. This surface has no `strict` field, so the Structured Outputs " +
+        "keyword subset does not apply — your schema is sent as plain JSON Schema."
+      : "No changes needed. `strict` is absent or false, so the Structured Outputs keyword " +
+        "subset does not apply — your schema is sent as plain JSON Schema.", url));
 
     // Everything `toOpenAI` would have removed or rewritten is legal here. Name the
     // specific keywords found so the reader can see the divergence is real and is
@@ -1732,6 +1776,19 @@
       "guidance the model can violate, so keep validating the response yourself.",
       url, true));
 
+    // Name the sibling target, the same way the Anthropic and Gemini pairs do. The
+    // reader picked a target from a flag they may not control (Instructor omits
+    // `strict` even in Mode.TOOLS_STRICT), so say what switching would cost.
+    ledger.push(entry("=", "root", surfaceHasNoStrictField
+      ? "Realtime function tools have no `strict` field, so there is no enforced " +
+        "alternative on this surface. On chat/responses you can set `strict: true` and " +
+        "re-run with `--to openai`."
+      : "If you want the constraints actually enforced, set `strict: true` on the tool or " +
+        "response_format and re-run with `--to openai` — but that dialect is a subset, so " +
+        "expect real edits. Note that some clients omit `strict` for you: Instructor's " +
+        "`Mode.TOOLS_STRICT` is deprecated and sends a non-strict payload.",
+      url, true));
+
     return { schema: schema, ledger: ledger };
   }
 
@@ -1748,7 +1805,11 @@
     // Gemini, so guessing it produces a false pass for everyone else.
     gemini: function (s) { return toGemini(s, false); },
     "gemini-json": function (s) { return toGemini(s, true); },
-    "openai-realtime": toOpenAIRealtime
+    // Non-strict is a property of the `strict` flag, not of one API surface, so the
+    // primary name is the CONDITION. `openai-realtime` stays as the surface where
+    // that condition is forced rather than chosen (and so nobody's script breaks).
+    "openai-nonstrict": function (s) { return toOpenAINonStrict(s, false); },
+    "openai-realtime": function (s) { return toOpenAINonStrict(s, true); }
   };
 
   // ---- public API ----------------------------------------------------------

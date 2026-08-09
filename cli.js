@@ -18,7 +18,7 @@
 var fs = require("fs");
 var E = require("./engine.js");
 
-var PROVIDERS = ["openai", "anthropic", "anthropic-json", "gemini", "gemini-json", "openai-realtime"];
+var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json", "gemini", "gemini-json", "openai-realtime"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -26,7 +26,19 @@ var USAGE = [
   "Usage:",
   "  llm-schema --to <provider> [file] [options]",
   "",
-  "Providers: " + PROVIDERS.join(", "),
+  "Providers — several vendors accept more than one dialect, and which one you are",
+  "on is decided by the request you send, not by your schema, so pick by condition:",
+  "",
+  "  openai             Structured Outputs, strict: true      (subset of JSON Schema)",
+  "  openai-nonstrict   strict absent or false                (full JSON Schema, unenforced)",
+  "  openai-realtime    Realtime function tools               (no strict field exists)",
+  "  anthropic          tools[].input_schema                  (sent verbatim)",
+  "  anthropic-json     output_format: {type: json_schema}    (rebuilt, unknowns -> prose)",
+  "  gemini             responseSchema                        (narrow Schema proto)",
+  "  gemini-json        responseJsonSchema                    (full JSON Schema)",
+  "",
+  "If you never set `strict`, you are on openai-nonstrict — it is optional and off by",
+  "default, and some clients omit it for you (Instructor does, on every OpenAI path).",
   "",
   "Options:",
   "  --to <provider>   Target provider (required)",

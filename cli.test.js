@@ -492,5 +492,59 @@ var INSTRUCTOR_ANTHROPIC = JSON.stringify({
     bad.status === 2 && /anthropic-json/.test(bad.stderr), bad.stderr);
 })();
 
+// --- #322: the CI gate an Instructor user actually runs ----------------------
+//
+// Verbatim wire payload from instructor==1.15.4 Mode.TOOLS (the default), which
+// omits `strict`. Before this cycle the only target giving the correct verdict was
+// named `openai-realtime` — a surface these users are not on and would never type.
+var INSTRUCTOR_OPENAI = JSON.stringify({
+  type: "object",
+  properties: {
+    title: { description: "Short title", maxLength: 80, title: "Title", type: "string" },
+    priority: { default: "low", pattern: "^(low|high)$", title: "Priority", type: "string" },
+    score: { maximum: 100, minimum: 0, title: "Score", type: "integer" },
+    bbox: {
+      maxItems: 4, minItems: 4, title: "Bbox", type: "array",
+      prefixItems: [{ type: "integer" }, { type: "integer" },
+                    { type: "integer" }, { type: "integer" }]
+    },
+    tags: { items: { type: "string" }, title: "Tags", type: "array" },
+    assignee: { anyOf: [{ type: "string" }, { type: "null" }], default: null, title: "Assignee" }
+  },
+  required: ["bbox", "score", "tags", "title"]
+});
+
+(function () {
+  var loose = run(["--to", "openai-nonstrict", "--check"], INSTRUCTOR_OPENAI);
+  ok("--check --to openai-nonstrict exits 0 on Instructor's default payload",
+    loose.status === 0, "status=" + loose.status + " " + loose.stderr);
+
+  var strict = run(["--to", "openai", "--check"], INSTRUCTOR_OPENAI);
+  ok("--check --to openai still exits 1 on the same payload (correct for strict)",
+    strict.status === 1, "status=" + strict.status);
+
+  ok("the strict failure tells the reader about openai-nonstrict",
+    /--to openai-nonstrict/.test(strict.stderr), strict.stderr);
+
+  var out = run(["--to", "openai-nonstrict"], INSTRUCTOR_OPENAI);
+  var emitted = null;
+  try { emitted = JSON.stringify(JSON.parse(out.stdout)); } catch (e) { emitted = null; }
+  ok("--to openai-nonstrict emits the schema unchanged",
+    emitted === JSON.stringify(JSON.parse(INSTRUCTOR_OPENAI)), "stdout=" + out.stdout.slice(0, 80));
+
+  var help = run(["--help"]);
+  ok("--help lists openai-nonstrict", /openai-nonstrict/.test(help.stdout));
+  ok("--help explains which condition selects each OpenAI target",
+    /strict absent or false/.test(help.stdout), help.stdout);
+
+  var bad = run(["--to", "openai-nonstrictt", "--check"], INSTRUCTOR_OPENAI);
+  ok("an unknown provider lists openai-nonstrict as valid",
+    bad.status === 2 && /openai-nonstrict/.test(bad.stderr), bad.stderr);
+
+  var rt = run(["--to", "openai-realtime", "--check"], INSTRUCTOR_OPENAI);
+  ok("openai-realtime keeps working for anyone who already scripted it",
+    rt.status === 0, "status=" + rt.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
