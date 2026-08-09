@@ -95,19 +95,40 @@
   //     API with an unsupported JSON Schema, you will receive an error."
   //
   // Because unsupported keywords ERROR rather than being ignored, this is an
-  // ALLOWLIST, not a blocklist. The doc's "Supported properties" section names
-  // the keywords below and nothing else; anything absent is stripped. A
-  // blocklist silently passed through `default` / `minLength` / `maxLength` /
-  // `$schema` — which is exactly what zod-to-json-schema, zod v4's
-  // z.toJSONSchema() and Pydantic emit for `.min()`, `.max()` and `.default()`.
+  // ALLOWLIST, not a blocklist.
+  //
+  // SECOND SOURCE (added after the doc alone proved too coarse): OpenAI's own
+  // official SDK ships the strict transformer that builds the exact payload it
+  // sends — `toStrictJsonSchema()` in openai@7.4.0 (`openai/lib/transform`). It
+  // throws on keywords the API cannot represent, and silently PRESERVES the
+  // rest. Running every keyword through it yields a sharper rule than the doc's
+  // "Supported properties" list, which under-reports what is actually accepted:
+  //
+  //   PRESERVED  minLength maxLength default examples readOnly writeOnly
+  //              deprecated $comment $id $schema title description
+  //   THROWS     uniqueItems minProperties maxProperties patternProperties
+  //              propertyNames unevaluatedProperties unevaluatedItems
+  //              additionalItems contains minContains not allOf
+  //              dependentRequired if then else
+  //
+  // The split is coherent: strict mode errors on keywords whose validation
+  // semantics its constrained decoder cannot compile, and accepts (ignores)
+  // annotations and soft constraints. So we strip only the first class.
+  // Stripping the second class was WRONG — it made `--check` fail on schemas
+  // OpenAI's own SDK sends verbatim, i.e. on any Zod `.describe()` / `.min()` /
+  // `.default()` or Pydantic `Field(description=..., default=...)`, which is
+  // most real generator output. Verified against openai@7.4.0.
   var OPENAI_SUPPORTED = {
     // structural
     type: 1, properties: 1, required: 1, additionalProperties: 1,
     items: 1, prefixItems: 1, anyOf: 1, enum: 1, "const": 1, $ref: 1, $defs: 1,
-    // annotations OpenAI's own examples carry (and which steer the model)
-    description: 1, title: 1,
+    // root metadata — explicitly retained by toStrictJsonSchema as rootMetadata
+    $schema: 1, $id: 1,
+    // annotations — preserved by the SDK transformer, and they steer the model
+    description: 1, title: 1, $comment: 1,
+    "default": 1, examples: 1, readOnly: 1, writeOnly: 1, deprecated: 1,
     // string
-    pattern: 1, format: 1,
+    pattern: 1, format: 1, minLength: 1, maxLength: 1,
     // number
     multipleOf: 1, maximum: 1, exclusiveMaximum: 1, minimum: 1, exclusiveMinimum: 1,
     // array
@@ -116,21 +137,27 @@
 
   // Why a given keyword is stripped. Anything not named here gets the generic
   // reason. These are the ones real generators actually emit.
+  // Every reason below is a keyword that openai@7.4.0's own `toStrictJsonSchema`
+  // THROWS on ("uses unsupported keyword `X` and cannot be represented in strict
+  // Structured Outputs"), i.e. the API genuinely cannot accept it.
   var OPENAI_STRIP_REASON = {
-    "default": "the API rejects it outright — \"certain properties in the schema are not permitted, such as 'minimum' or 'default' in specified contexts\". Zod `.default()` and Pydantic field defaults emit it.",
-    "minLength": "OpenAI's supported string properties are `pattern` and `format` only — `minLength` is not among them. Zod `z.string().min(n)` emits it.",
-    "maxLength": "OpenAI's supported string properties are `pattern` and `format` only — `maxLength` is not among them. Zod `z.string().max(n)` emits it.",
     "uniqueItems": "OpenAI's supported array properties are `minItems` and `maxItems` only.",
-    "$schema": "not part of OpenAI's supported schema set. It carries no validation meaning for the API, and every Zod/Pydantic generator emits it at the root.",
-    "examples": "annotation-only keyword, not in OpenAI's supported set.",
-    "deprecated": "annotation-only keyword, not in OpenAI's supported set.",
-    "readOnly": "annotation-only keyword, not in OpenAI's supported set.",
-    "writeOnly": "annotation-only keyword, not in OpenAI's supported set.",
+    "contains": "a conditional array constraint strict mode cannot compile.",
+    "minContains": "a conditional array constraint strict mode cannot compile.",
+    "additionalItems": "tuple-tail validation is not representable in strict mode; use `items`/`prefixItems`.",
+    "unevaluatedItems": "annotation-dependent array validation is not representable in strict mode.",
     "minProperties": "OpenAI's only supported object property is `additionalProperties`.",
     "maxProperties": "OpenAI's only supported object property is `additionalProperties`.",
     "patternProperties": "OpenAI's only supported object property is `additionalProperties`.",
     "propertyNames": "OpenAI's only supported object property is `additionalProperties`.",
-    "unevaluatedProperties": "OpenAI's only supported object property is `additionalProperties`."
+    "unevaluatedProperties": "OpenAI's only supported object property is `additionalProperties`.",
+    "allOf": "the doc names `allOf` unsupported; express the merged shape as one object instead.",
+    "not": "the doc names `not` unsupported.",
+    "dependentRequired": "the doc names `dependentRequired` unsupported.",
+    "dependentSchemas": "the doc names `dependentSchemas` unsupported.",
+    "if": "the doc names `if`/`then`/`else` unsupported.",
+    "then": "the doc names `if`/`then`/`else` unsupported.",
+    "else": "the doc names `if`/`then`/`else` unsupported."
   };
 
   // `definitions` is draft-07 (what zod-to-json-schema emits); OpenAI's doc and

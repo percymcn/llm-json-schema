@@ -125,14 +125,23 @@ var ZOD_V3 = {
   ok("zod-v3 definitions block is consumed", s.definitions === undefined && s.$defs === undefined);
   ok("zod-v3 every property ends up required", s.required.length === 5);
   ok("zod-v3 additionalProperties:false survives", s.additionalProperties === false);
-  ok("openai strips $schema", s.$schema === undefined);
-  ok("openai strips default (API rejects it)", s.properties.priority["default"] === undefined);
-  ok("openai strips minLength", s.properties.title.minLength === undefined);
-  ok("openai strips maxLength", s.properties.title.maxLength === undefined);
+  // These four were previously asserted as STRIPPED. That was wrong: openai@7.4.0's
+  // own `toStrictJsonSchema()` — the function building the payload the SDK sends —
+  // preserves all of them. Stripping them made `--check` fail on schemas OpenAI
+  // itself emits (any Zod `.describe()`/`.min()`/`.default()`). See engine.js.
+  ok("openai preserves $schema (SDK retains it as root metadata)", s.$schema === "http://json-schema.org/draft-07/schema#");
+  ok("openai preserves default", s.properties.priority["default"] === "low");
+  ok("openai preserves minLength", s.properties.title.minLength === 1);
+  ok("openai preserves maxLength", s.properties.title.maxLength === 120);
   ok("openai keeps supported minimum/maximum", s.properties.score.minimum === 0 && s.properties.score.maximum === 100);
   ok("openai keeps supported format", s.properties.id.format === "uuid");
-  ok("zod-v3 conversion is not a silent no-op", r.ledger.filter(function (l) { return l.op !== "="; }).length >= 8);
-  ok("ledger cites the default rejection verbatim", has(r.ledger, "not permitted, such as 'minimum' or 'default'"));
+  // Guard from #311: real generator input must not silently no-op. Anchored to the
+  // substantive fixes themselves, not to a count the bogus strips used to inflate.
+  var subst = r.ledger.filter(function (l) { return l.op !== "="; });
+  ok("zod-v3 conversion is not a silent no-op", subst.length >= 4);
+  ok("ledger reports the root $ref inlining", has(r.ledger, "Inlined the root `$ref`"));
+  ok("ledger reports definitions -> $defs", has(r.ledger, "Renamed draft-07 `definitions` to `$defs`"));
+  ok("optional fields are the fix that actually matters", has(r.ledger, "`priority` added to required") && has(r.ledger, "`notes` added to required"));
 })();
 
 // --- forced-required enum must admit null, or it is unsatisfiable ------------

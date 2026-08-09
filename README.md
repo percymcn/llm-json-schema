@@ -66,7 +66,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 ## Why
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
-- **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* Supported string properties are `pattern` and `format` **only**, so the extremely common `minLength`/`maxLength` (from `z.string().min()/.max()`) are rejected, as is `default` (from `.default()`).
+- **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* The error is raised for keywords whose validation semantics strict mode cannot compile (`uniqueItems`, `patternProperties`, `contains`, `allOf`, `not`, `if`/`then`/`else`, …). Annotations and soft constraints — `description`, `title`, `default`, `examples`, `minLength`/`maxLength`, `$schema`, `$id` — are **accepted and passed through untouched**, so this tool leaves them alone.
 - **Anthropic tool `input_schema`:** standard JSON Schema, object root, light constraints; `strict: true` goes on the tool, not the schema.
 - **Gemini `responseSchema`:** a JSON-Schema subset — needs `propertyOrdering`, has no `$ref` at all (so definitions get inlined), drops `pattern`/`minLength`/`maxLength`, and limits string `format` to `date-time`/`date`/`time`.
 
@@ -76,8 +76,8 @@ That root has no `type` and no `properties`, so a naive converter no-ops on it a
 reports "already valid" for a schema OpenAI will reject. This tool renames
 `definitions` → `$defs`, inlines the root `$ref`, and then applies the object
 rules to the real schema body. zod v4's `z.toJSONSchema()` and Pydantic's
-`model_json_schema()` emit a normal object root but still carry `$schema`,
-`default`, `minLength` and `maxLength`.
+`model_json_schema()` emit a normal object root, and the real fix they need is
+the `required`/optional rule rather than keyword stripping.
 
 Pydantic has a sharper trap. OpenAI supports `$ref`, but rejects a `$ref` that
 carries **sibling keywords** — `$ref cannot have keywords {'description'}`.
@@ -127,14 +127,14 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { convert } from "llm-json-schema";
 
 const Result = z.object({
-  title: z.string().min(1),               // -> minLength, which OpenAI rejects
-  priority: z.enum(["low", "high"]).default("low"),  // -> default, which OpenAI rejects
+  title: z.string().min(1),               // -> minLength, which OpenAI accepts as-is
+  priority: z.enum(["low", "high"]).default("low"),  // -> default, also accepted as-is
   notes: z.string().optional(),           // -> absent from `required`, which OpenAI rejects
 });
 
 const { schema, ledger } = convert(zodToJsonSchema(Result), "openai");
 // - root `$ref` into `definitions` is inlined, so the object rules actually apply
-// - `minLength` and `default` are removed (not in OpenAI's supported keyword set)
+// - `minLength`, `default` and `$schema` are left untouched — OpenAI accepts them
 // - `notes` -> type: ["string", "null"] and added to `required`
 // - `priority` is forced required, so `null` is added to its `enum` too —
 //   otherwise the nullable type and the enum contradict each other

@@ -164,5 +164,33 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--quiet still emits the schema", JSON.parse(r.stdout).required.indexOf("args") !== -1);
 })();
 
+// --- regression: --check must not false-fail on OpenAI's OWN payload ---------
+// This exact shape is what openai@7.4.0 `zodResponseFormat()` puts on the wire
+// (its `toStrictJsonSchema()` deliberately retains $schema/$id/annotations).
+// The gate used to exit 1 here, i.e. it red-flagged CI for a schema that works.
+(function () {
+  var SDK_PAYLOAD = JSON.stringify({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    type: "object",
+    properties: {
+      title: { type: "string", description: "the title", minLength: 1 },
+      notes: { anyOf: [{ type: "string" }, { type: "null" }] }
+    },
+    required: ["title", "notes"],
+    additionalProperties: false
+  });
+  var r = run(["--to", "openai", "--check"], SDK_PAYLOAD);
+  ok("--check passes on OpenAI's own SDK payload", r.status === 0, r.stderr);
+
+  // ...but still catches a genuinely unsupported keyword.
+  var bad = run(["--to", "openai", "--check"], JSON.stringify({
+    type: "object",
+    properties: { tags: { type: "array", items: { type: "string" }, uniqueItems: true } },
+    required: ["tags"],
+    additionalProperties: false
+  }));
+  ok("--check still fails on uniqueItems (SDK throws on it)", bad.status === 1, bad.stderr);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
