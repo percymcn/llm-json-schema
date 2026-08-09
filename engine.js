@@ -600,7 +600,9 @@
     if (inlined) {
       ledger.push(entry("~", "root",
         "Inlined " + inlined + " `$ref` reference" + (inlined === 1 ? "" : "s") +
-        " and dropped the `$defs`/`definitions` block — Gemini's schema subset has no `$ref`.",
+        " and dropped the `$defs`/`definitions` block — `@google/genai`'s `Schema` type has " +
+        "no `$ref`, so inlining is the form that works on this path. (Keep a top-level " +
+        "`$schema` instead and you stay on `responseJsonSchema`, where `$ref`/`$defs` are accepted.)",
         docUrl));
     }
     recursive.forEach(function (name) {
@@ -762,9 +764,13 @@
               DOCS.gemini));
           } else if (k === "additionalProperties") {
             ledger.push(entry("x", path,
-              "Removed `additionalProperties` — absent from the SDK's `Schema` type, and " +
-              "@google/genai drops it on the way out anyway (\"additionalProperties is not " +
-              "included in JSONSchema, skipping it\"). Unlike OpenAI, Gemini does not need it.",
+              "Removed `additionalProperties` — @google/genai strips it on the way out " +
+              "(\"additionalProperties is not included in JSONSchema, skipping it\"), and live " +
+              "v1beta calls reject it with `Unknown name \"additionalProperties\" at " +
+              "generation_config.response_schema … Cannot find field`. (Note the Python " +
+              "`Schema` type does declare it, so it may be accepted on Vertex; it is also " +
+              "accepted on the `responseJsonSchema` path.) Unlike OpenAI, Gemini does not " +
+              "need it to get strict behaviour.",
               DOCS.gemini));
             delete node[k];
           } else if (k === "prefixItems") {
