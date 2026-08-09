@@ -101,6 +101,17 @@
   // `prepareJsonSchemaForOpenAIStrictMode` produces exactly this from an
   // ordinary `z.record(z.string())`: the vendor then ACCEPTS the result.
   //
+  // There are TWO producer classes and the remedy differs, which is why the
+  // advisory below splits them. (a) A post-hoc compatibility layer that
+  // "repairs" a map which was still open when it left the caller's code —
+  // Mastra above, agno's `make_nested_strict`. There an earlier checkpoint
+  // exists. (b) The GENERATOR ITSELF, where the open form is never emitted at
+  // any point the caller could inspect — semantic-kernel 1.44.1's
+  // `KernelJsonSchemaBuilder.build(..., structured_output=True)` builds the
+  // value schema for a `Dict[str, str]` and then overwrites it with `false`
+  // three lines later in the same function. Telling that caller to "check
+  // before the layer runs" names a checkpoint that does not exist.
+  //
   // The discriminator is the ABSENCE of the `properties` key, not an empty one.
   // Measured: a deliberate `z.object({})` emits `properties: {}`, so requiring
   // the key to be missing separates a real empty object from an emptied map.
@@ -2877,14 +2888,23 @@
         "This object is closed (`additionalProperties: false`) and declares no `properties`, " +
         "so its only legal value is `{}` — the model can never put anything in it. Every " +
         "provider accepts this, so nothing will warn you. Most often it is not what anyone " +
-        "wrote: it is what is left after a compatibility layer \"fixed\" a map/dictionary by " +
-        "setting `additionalProperties: false`, which does not close an open map, it empties " +
-        "it. Two measured producers, in different ecosystems: `@mastra/schema-compat`'s " +
-        "`prepareJsonSchemaForOpenAIStrictMode` does exactly this to an ordinary " +
-        "`z.record(z.string())`, and agno 2.8.7's `make_nested_strict` " +
-        "(`agno/tools/function.py`) does it to a `Dict[str, str]` TOOL PARAMETER. The value type is already gone " +
-        "here and cannot be recovered — check the schema BEFORE that layer runs. If you really " +
-        "did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
+        "wrote: it is what is left after something set `additionalProperties: false` on a " +
+        "map/dictionary, which does not close an open map, it empties it. Either way the value " +
+        "type is already gone here and cannot be recovered from this file — but WHERE it was " +
+        "lost decides what you can do about it, and there are two measured cases. (a) A " +
+        "compatibility layer that ran AFTER your schema was generated: `@mastra/schema-compat`'s " +
+        "`prepareJsonSchemaForOpenAIStrictMode` does this to an ordinary `z.record(z.string())`, " +
+        "and agno 2.8.7's `make_nested_strict` (`agno/tools/function.py`) does it to a " +
+        "`Dict[str, str]` TOOL PARAMETER. There the open map still existed at some point, so " +
+        "check the schema BEFORE that layer runs. (b) The GENERATOR ITSELF, where the open form " +
+        "was never emitted at all and there is no earlier point to check: semantic-kernel " +
+        "1.44.1's `KernelJsonSchemaBuilder.build(..., structured_output=True)` builds the value " +
+        "schema for a `Dict[str, str]` and then overwrites it with `false` three lines later in " +
+        "the same function. In that case the only remedies are to remodel the field, or to take " +
+        "a different code path in that framework — measured: handing semantic-kernel the same " +
+        "model as a Pydantic `BaseModel` instead of a plain class keeps the map OPEN, which the " +
+        "vendor then rejects loudly instead of accepting a field that can never be filled. " +
+        "If you really did mean an always-empty object, ignore this. " + OPEN_MAP_REMEDY,
         DOCS[provider], true));
     });
 

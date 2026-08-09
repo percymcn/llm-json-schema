@@ -2936,5 +2936,117 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(conv(AGNO_RESPONSE_PATH_DICT, "openai").ledger, "added to required"));
 })();
 
+
+// --- semantic-kernel 1.44.1: the generator ITSELF empties the map ------------
+// A fourth independent generator in this fixture set: `KernelJsonSchemaBuilder`
+// builds JSON Schema straight from Python type hints, with no pydantic, no Zod
+// and no invopop anywhere in the path. Reached by
+// `_handle_structured_output` (`connectors/ai/open_ai/services/open_ai_handler.py:195`)
+// whenever `response_format` is a plain class rather than a `BaseModel`; the
+// result is then wrapped by `generate_structured_output_response_format_schema`,
+// which applies NO transform and stamps `strict: True`.
+//
+// Every payload below is the VERBATIM output of
+// `KernelJsonSchemaBuilder.build(parameter_type=..., structured_output=True)`
+// on semantic-kernel 1.44.1 / python 3.12 (#311), and every verdict is pinned
+// against `openai@7.4.0`'s `toStrictJsonSchema()` as MEASURED, not assumed.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  function emptiedMapEntry(r) {
+    for (var i = 0; i < r.ledger.length; i++) {
+      if (String(r.ledger[i].msg || "").indexOf("declares no `properties`") !== -1) return r.ledger[i];
+    }
+    return null;
+  }
+  // The emptied-map advisory ends with the shared open-map remedy, so its text
+  // mentions "open map" too. Discriminate on the OP, not on the prose: a
+  // blocker is `!` and never advisory.
+  function openMapBlocker(r) {
+    return r.ledger.some(function (l) {
+      return l.op === "!" && !l.advisory && String(l.msg || "").indexOf("This is an open map") !== -1;
+    });
+  }
+
+  // Vendor: ACCEPT verbatim. We must not touch it (over-blocking guard).
+  var SK_PLAIN = {
+    type: "object",
+    properties: { title: { type: "string" }, count: { type: "integer" } },
+    required: ["title", "count"], additionalProperties: false
+  };
+  ok("semantic-kernel: an ordinary class the vendor accepts verbatim is left alone",
+    conv(SK_PLAIN, "openai").ledger.length === 0);
+
+  // `Optional[str]` is dropped from `required` by the builder, and the builder
+  // ALSO staples `additionalProperties: false` onto the string node. Vendor
+  // REPAIRS (widens `required`), so a change is genuinely owed here -- and
+  // semantic-kernel's own path applies no transform, so nothing repairs it.
+  var SK_OPTIONAL = {
+    type: "object",
+    properties: { title: { type: "string" },
+                  note: { type: ["string", "null"], additionalProperties: false } },
+    required: ["title"], additionalProperties: false
+  };
+  ok("semantic-kernel: the optional field missing from `required` is caught",
+    has(conv(SK_OPTIONAL, "openai").ledger, "added to required"));
+  // `additionalProperties: false` on a STRING node is not an emptied map --
+  // there is no `object` in its `type`. Guard against a false advisory.
+  ok("semantic-kernel: a closed non-object node is not reported as an emptied map",
+    emptiedMapEntry(conv(SK_OPTIONAL, "openai")) === null);
+
+  // `Dict[str, str]`: the builder computes the value schema and then overwrites
+  // it with `false` three lines later. Vendor ACCEPTS this VERBATIM -- a silent
+  // 200 with a field that can never be populated.
+  var SK_DICT = {
+    type: "object",
+    properties: { title: { type: "string" }, tags: { type: "object", additionalProperties: false } },
+    required: ["title", "tags"], additionalProperties: false
+  };
+  ok("semantic-kernel: the emptied map is reported",
+    emptiedMapEntry(conv(SK_DICT, "openai")) !== null);
+  ok("semantic-kernel: the emptied map is ADVISORY, never a gate failure",
+    (emptiedMapEntry(conv(SK_DICT, "openai")) || {}).advisory === true);
+  ok("semantic-kernel: the advisory cites the third producer by name",
+    has(conv(SK_DICT, "openai").ledger, "semantic-kernel"));
+  ok("semantic-kernel: the advisory says there is no earlier point to check",
+    has(conv(SK_DICT, "openai").ledger, "no earlier point to check"));
+  ok("semantic-kernel: the advisory still names the post-hoc-layer case too",
+    has(conv(SK_DICT, "openai").ledger, "BEFORE that layer runs"));
+
+  // THE FINDING: the same logical model down the OTHER branch of the same
+  // function. `_handle_structured_output` case 1 sends a `BaseModel` through
+  // openai-python's `type_to_response_format_param`, which PRESERVES the open
+  // map (#329). Vendor THROWS on that one and ACCEPTS the emptied one, so the
+  // two branches of one function fail in OPPOSITE directions for one field --
+  // and our verdicts have to disagree in the same way.
+  var SK_PYDANTIC_DICT = {
+    properties: { title: { title: "Title", type: "string" },
+                  tags: { additionalProperties: { type: "string" }, title: "Tags", type: "object" } },
+    required: ["title", "tags"], title: "DictM", type: "object", additionalProperties: false
+  };
+  ok("semantic-kernel: the pydantic branch keeps the map OPEN -> blocker",
+    openMapBlocker(conv(SK_PYDANTIC_DICT, "openai")));
+  ok("semantic-kernel: the two branches of one function get opposite verdicts",
+    openMapBlocker(conv(SK_PYDANTIC_DICT, "openai")) &&
+    !openMapBlocker(conv(SK_DICT, "openai")) &&
+    emptiedMapEntry(conv(SK_DICT, "openai")) !== null);
+
+  // `Tuple[int, int, int, int]` -> draft-07 array-form `items`, which the
+  // vendor THROWS on. Homogeneous, so the collapse is lossless.
+  var SK_TUPLE = {
+    type: "object",
+    properties: { title: { type: "string" },
+                  bbox: { type: "array",
+                          items: [{ type: "integer" }, { type: "integer" },
+                                  { type: "integer" }, { type: "integer" }],
+                          additionalProperties: false } },
+    required: ["title", "bbox"], additionalProperties: false
+  };
+  ok("semantic-kernel: the array-form tuple is caught, not passed through",
+    has(conv(SK_TUPLE, "openai").ledger, "Collapsed a 4-element tuple"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
