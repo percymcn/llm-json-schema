@@ -209,8 +209,9 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--check passes on valid pydantic output (propertyOrdering is advisory)", r.status === 0, r.stderr);
   ok("--check still reports the optional suggestion", /optional suggestion/.test(r.stderr), r.stderr);
 
-  // zod-to-json-schema output: the top-level `$schema` routes it to
-  // `responseJsonSchema`, which takes it verbatim — nothing to fix.
+  // zod-to-json-schema output. The top-level `$schema` is what @google/genai
+  // (JS) reads to route to `responseJsonSchema` — but only that client, so the
+  // permissive dialect must be ASKED for (`--to gemini-json`), never inferred.
   var ZOD = JSON.stringify({
     $schema: "http://json-schema.org/draft-07/schema#",
     $ref: "#/definitions/S",
@@ -218,9 +219,9 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   });
   // Raw zod output does NOT pass: `definitions` is the draft-07 spelling and
   // the accepted list only has `$defs`, so it needs the rename + repoint.
-  var z = run(["--to", "gemini", "--check"], ZOD);
-  ok("--check fails on raw zod output for gemini (definitions -> $defs)", z.status === 1, z.stderr);
-  ok("--check keeps the $schema routing key", !/Removed .\$schema/.test(z.stderr), z.stderr);
+  var z = run(["--to", "gemini-json", "--check"], ZOD);
+  ok("--check fails on raw zod output for gemini-json (definitions -> $defs)", z.status === 1, z.stderr);
+  ok("gemini-json keeps the $schema routing key", !/Removed .\$schema/.test(z.stderr), z.stderr);
 
   // ...and the converted output then passes, i.e. the fix is complete.
   var fixed = run(["--to", "gemini"], ZOD);
@@ -249,17 +250,25 @@ var CAROUSEL_SCHEMA = JSON.stringify({
     properties: { slug: { type: "string", pattern: "^[a-z-]+$", minLength: 3 } },
     required: ["slug"]
   });
-  var r = run(["--to", "gemini"], zodV4);
-  ok("gemini $schema path exits 0 (nothing is rejected)", r.status === 0, r.stderr);
-  ok("gemini $schema path emits a visible notes section",
+  var r = run(["--to", "gemini-json"], zodV4);
+  ok("gemini-json path exits 0 (nothing is rejected)", r.status === 0, r.stderr);
+  ok("gemini-json path emits a visible notes section",
     /notes? \(no edit needed/.test(r.stderr), r.stderr);
   ok("the note names the unenforced keyword", /pattern/.test(r.stderr), r.stderr);
   ok("the note explains the routing switch", /responseJsonSchema/.test(r.stderr), r.stderr);
   ok("stdout is still the schema, constraints intact",
     JSON.parse(r.stdout).properties.slug.pattern === "^[a-z-]+$", r.stdout);
 
-  var c = run(["--to", "gemini", "--check"], zodV4);
+  var c = run(["--to", "gemini-json", "--check"], zodV4);
   ok("--check stays green on an ignored-keyword schema", c.status === 0, c.stderr);
+
+  // ...and the SAME schema on the narrow path must NOT silently claim the
+  // permissive dialect just because it carries `$schema` (#319).
+  var narrow = run(["--to", "gemini"], zodV4);
+  ok("--to gemini strips $schema instead of reading it as a route",
+    JSON.parse(narrow.stdout).$schema === undefined, narrow.stdout);
+  ok("--to gemini says which client the routing key belongs to",
+    /gemini-json/.test(narrow.stderr), narrow.stderr);
 })();
 
 // --- the gemini tuple false pass -------------------------------------------
@@ -298,6 +307,65 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--to gemini exits 3 on an unrepresentable tuple",
     run(["--to", "gemini"], het).status === 3, "");
 })();
+
+
+// --- #319: the routing switch belongs to a CLIENT, not to Gemini -------------
+// Verbatim wire payload captured from @langchain/openai@1.5.6 /
+// @langchain/google-genai@2.2.0 (zod@4.4.3) via an intercepting fetch. That
+// package depends on the LEGACY @google/generative-ai@0.24.1, which contains
+// zero occurrences of `responseJsonSchema` — so its top-level `$schema` routes
+// NOTHING and the payload lands on the narrow proto. Reading `$schema` as "the
+// permissive path" made `--check --to gemini` exit 0 on this exact schema.
+// The live v1beta endpoint rejects it with HTTP 400:
+//   Unknown name "$schema" ... Cannot find field.
+//   Unknown name "prefixItems" at '...properties[5].value': Cannot find field.
+// Converted output reaches auth instead ("API key not valid"), i.e. accepted.
+(function () {
+  var LANGCHAIN = JSON.stringify({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: {
+      title: { type: "string", minLength: 3, maxLength: 80, description: "Short summary", title: "ticket" },
+      priority: { type: "string", enum: ["low", "medium", "high"], title: "ticket" },
+      assignee: { type: "string", title: "ticket" },
+      bbox: {
+        type: "array", title: "ticket",
+        prefixItems: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }]
+      }
+    },
+    required: ["title", "priority", "bbox"],
+    additionalProperties: false,
+    title: "ticket"
+  });
+
+  var g = run(["--to", "gemini", "--check"], LANGCHAIN);
+  ok("#319 --check --to gemini FAILS on the real LangChain payload", g.status === 1, g.stderr);
+
+  var fixed = run(["--to", "gemini"], LANGCHAIN);
+  var out = JSON.parse(fixed.stdout);
+  ok("#319 narrow path drops $schema (live API: Unknown name \"$schema\")",
+    out.$schema === undefined, fixed.stdout);
+  ok("#319 narrow path leaves no prefixItems (live API rejects it)",
+    JSON.stringify(out).indexOf("prefixItems") === -1, fixed.stdout);
+  ok("#319 the fixed-length tuple survives as items+min/maxItems",
+    out.properties.bbox.items.type === "number" &&
+    out.properties.bbox.minItems === 4 && out.properties.bbox.maxItems === 4,
+    JSON.stringify(out.properties.bbox));
+  ok("#319 converting again changes nothing (idempotent)",
+    run(["--to", "gemini"], fixed.stdout).stdout === fixed.stdout);
+
+  // The same bytes on the path the caller can only pick themselves.
+  var j = run(["--to", "gemini-json", "--check"], LANGCHAIN);
+  ok("#319 --to gemini-json accepts it (that dialect really does take prefixItems)",
+    j.status === 0, j.stderr);
+  ok("#319 the two Gemini targets disagree on the same file",
+    g.status !== j.status);
+
+  // And OpenAI strict rejects it too: `assignee` is absent from `required`.
+  var o = run(["--to", "openai", "--check"], LANGCHAIN);
+  ok("#319 --check --to openai FAILS on the real LangChain payload", o.status === 1, o.stderr);
+})();
+
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

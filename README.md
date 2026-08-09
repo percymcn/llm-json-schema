@@ -56,7 +56,7 @@ API contract — which is why the ledger cites the rule for every change.
 
 | Flag | Meaning |
 |---|---|
-| `--to <provider>` | `openai` \| `anthropic` \| `gemini` (required) |
+| `--to <provider>` | `openai` \| `openai-realtime` \| `anthropic` \| `gemini` \| `gemini-json` (required) |
 | `--check` | Emit no schema; exit `1` if it isn't already compliant |
 | `--json` | Emit `{ok, compliant, schema, ledger, docUrl}` for scripting |
 | `--mode <m>` | `auto` (default) \| `schema` \| `example` |
@@ -92,7 +92,15 @@ Each provider accepts a different schema dialect, so a schema that works with on
   Unlike OpenAI, Anthropic does **not** require every key in `required` — the transformer passes your list through as given, so this tool does not force it.
 
   This tool keeps every demoted keyword (it is still enforced on the tools path) and reports it as an advisory note, so `--check` stays green on a schema that is legal but only partly enforced.
-- **Gemini has TWO schema paths, and a top-level `$schema` is the switch between them.** `@google/genai`'s `maybeMoveToResponseJsonSchema()` checks for a top-level `$schema`; if it's there, the schema goes to the **`responseJsonSchema`** request field, otherwise to **`responseSchema`**, the narrow OpenAPI-style `Schema` proto. This matters because **`zod-to-json-schema` always emits `$schema` and Pydantic's `model_json_schema()` never does** — the two generators land on opposite paths by default.
+- **Gemini has TWO schema paths, and which one you land on is a property of YOUR CLIENT, not of your schema.** The two request fields are **`responseJsonSchema`** (full JSON Schema) and **`responseSchema`** (the narrow OpenAPI-style `Schema` proto). Only one client picks for you:
+
+  | client | routes to `responseJsonSchema`? |
+  |---|---|
+  | `@google/genai` (JS) | yes — `maybeMoveToResponseJsonSchema()` moves it when there is a **top-level `$schema`** |
+  | `google-genai` (Python) | no — no `$schema` handling exists; you set `response_json_schema=` yourself |
+  | `@google/generative-ai` (legacy JS, used by `@langchain/google-genai`) | **no — the field does not exist in that package at all** |
+
+  So a top-level `$schema` is *not* a routing switch in general, and this tool will not read it as one. Pick the path with `--to gemini` (narrow proto) or `--to gemini-json` (`responseJsonSchema`). Getting this wrong is not a style question: LangChain emits a top-level `$schema` *and* lands on the narrow path, and the live `v1beta` endpoint answers with `HTTP 400 — Unknown name "$schema" … Cannot find field` / `Unknown name "prefixItems" … Cannot find field`.
 
   The two accepted subsets are **complementary — neither is a superset**:
 
@@ -102,7 +110,7 @@ Each provider accepts a different schema dialect, so a schema that works with on
   | `$ref`, `$defs`, `$anchor`, `$id`, `prefixItems`, `additionalProperties`, `oneOf` | ❌ | ✅ |
   | `type`, `format`, `title`, `description`, `enum`, `items`, `min/maxItems`, `minimum`, `maximum`, `anyOf`, `properties`, `required`, `propertyOrdering` | ✅ | ✅ |
 
-  So the tool converts for whichever path your schema is on, and tells you when a keyword would only survive on the other one.
+  So the tool converts for whichever path you name, and tells you when a keyword would only survive on the other one.
 
   The two paths also differ in how they treat an unsupported keyword, which is why the tool treats them differently. OpenAI's doc says outright that an unsupported schema means "you will receive an error", so unsupported keywords are **removed**. Gemini's `response_json_schema` says the full JSON Schema **may be sent** and merely that not all features are supported — so on that path unsupported keywords are **kept and flagged as unenforced**, because deleting a constraint the request tolerates costs you something and buys nothing. On the narrow proto path they are removed, and that one is machine-checkable rather than a judgement call: the Python SDK's `types.Schema` is declared `extra="forbid"`, so `Schema.model_validate()` raises on any keyword outside the proto. That makes it a vendor-owned oracle you can run with no API key — the same role `toStrictJsonSchema()` plays for OpenAI — and this tool's narrow-path output is round-tripped through it.
 

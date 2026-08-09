@@ -531,10 +531,11 @@ function blockers(r) {
 // --- Gemini inlines $refs rather than emitting an empty schema --------------
 (function () {
   // ZOD_V3 is verbatim zod-to-json-schema output, so it HAS a top-level
-  // `$schema`. @google/genai's maybeMoveToResponseJsonSchema() therefore moves
-  // it to `responseJsonSchema` and sends it verbatim — subsetting it here would
-  // delete the very key that buys the permissive path.
-  var keep = E.toGemini(ZOD_V3);
+  // `$schema`. That key makes @google/genai (JS) route to `responseJsonSchema`
+  // — but ONLY that client, so the path is now an explicit argument rather
+  // than something read off the schema (#319). These assertions are about the
+  // `responseJsonSchema` dialect, so they ask for it.
+  var keep = E.toGemini(ZOD_V3, true);
   ok("gemini preserves $schema (it is the routing switch)", keep.schema.$schema === ZOD_V3.$schema);
   ok("gemini leaves the $schema path's $ref intact",
     JSON.stringify(keep.schema).indexOf("$ref") !== -1);
@@ -548,7 +549,7 @@ function blockers(r) {
     type: "object",
     properties: { u: { $ref: "#/$defs/U", description: "the user" } },
     $defs: { U: { type: "object", properties: { n: { type: "string" } } } }
-  });
+  }, true);
   ok("gemini drops non-$ siblings of a $ref on the $schema path",
     !("description" in sib.schema.properties.u) && sib.schema.properties.u.$ref === "#/$defs/U");
 
@@ -559,7 +560,7 @@ function blockers(r) {
     properties: { root: { $ref: "#/$defs/Node" } },
     required: ["root"],
     $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } }
-  });
+  }, true);
   ok("gemini flags a required cyclic property", cyc.ledger.some(function (l) {
     return l.op === "!" && l.msg.indexOf("cyclic") !== -1;
   }));
@@ -568,7 +569,7 @@ function blockers(r) {
     type: "object",
     properties: { root: { $ref: "#/$defs/Node" } },
     $defs: { Node: { type: "object", properties: { child: { $ref: "#/$defs/Node" } } } }
-  });
+  }, true);
   ok("gemini allows a cycle in a non-required property",
     !cycOk.ledger.some(function (l) { return l.op === "!"; }));
   // "Sent verbatim" is the TRANSPORT, not acceptance: the accepted property
@@ -620,7 +621,7 @@ function blockers(r) {
     required: ["title", "slug", "score", "tags", "status"],
     additionalProperties: false
   };
-  var z4 = E.toGemini(JSON.parse(JSON.stringify(ZOD_V4)));
+  var z4 = E.toGemini(JSON.parse(JSON.stringify(ZOD_V4)), true);
   ok("gemini is a NO-OP on real zod-v4 output (nothing stripped)",
     JSON.stringify(z4.schema) === JSON.stringify(ZOD_V4));
   ok("gemini reports zod-v4 constraints as advisory only (CI stays green)",
@@ -829,7 +830,7 @@ var PYD_TUPLE = {
   // names `prefixItems` — so there the tuple survives losslessly instead.
   var jsonPath = copy(AI_SDK_TUPLE);
   jsonPath.$schema = "http://json-schema.org/draft-07/schema#";
-  var j = E.toGemini(jsonPath);
+  var j = E.toGemini(jsonPath, true);
   ok("gemini JSON path rewrites array-form items to prefixItems",
     Array.isArray(j.schema.properties.bbox.prefixItems) &&
     j.schema.properties.bbox.prefixItems.length === 4 &&
@@ -869,7 +870,7 @@ var PYD_TUPLE = {
     type: "object",
     properties: { n: { type: "number", enum: [15] } },
     required: ["n"]
-  });
+  }, true);
   ok("gemini JSON path leaves a numeric enum numeric",
     j.schema.properties.n.enum[0] === 15);
 })();

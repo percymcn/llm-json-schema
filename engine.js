@@ -25,6 +25,7 @@
     openai: "https://developers.openai.com/api/docs/guides/structured-outputs",
     anthropic: "https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview",
     gemini: "https://ai.google.dev/gemini-api/docs/structured-output",
+    "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations"
   };
 
@@ -1227,30 +1228,55 @@
     return out.filter(function (v, i) { return out.indexOf(v) === i; });
   }
 
-  function toGemini(schema) {
+  // `jsonPath` selects WHICH Gemini request field this schema is destined for:
+  //   false -> `responseSchema`     (the narrow `Schema` proto)  = `--to gemini`
+  //   true  -> `responseJsonSchema` (full JSON Schema)      = `--to gemini-json`
+  //
+  // It is a parameter and not an inference, and that is the whole point. #314
+  // found that `@google/genai` routes on a top-level `$schema` key and this
+  // function used to read that key as if it settled the question. It does not:
+  // the routing lives in ONE client, not in Gemini. Measured (#319):
+  //   @google/genai (JS)        — `maybeMoveToResponseJsonSchema()` auto-routes on `$schema`
+  //   google-genai (Python)     — no `$schema` handling at all; you set the field yourself
+  //   @google/generative-ai     — the LEGACY client, which `@langchain/google-genai@2.2.0`
+  //                               depends on: ZERO occurrences of `responseJsonSchema`.
+  //                               Everything goes to the narrow proto, `$schema` or not.
+  // So for a LangChain caller a top-level `$schema` routes nothing, and reading
+  // it as "permissive path" green-lit a payload the live API rejects with
+  // `Unknown name "prefixItems" ... Cannot find field`. Only the caller knows
+  // which client they hold, so the caller picks the target.
+  function toGemini(schema, jsonPath) {
     var s = clone(schema);
     var ledger = [];
 
-    // ---- Path A: top-level `$schema` -> the SDK sends this VERBATIM ---------
-    // `maybeMoveToResponseJsonSchema` only inspects TOP-LEVEL keys, so a nested
-    // `$schema` does not route (and is stripped below as an unknown keyword).
-    // Subsetting here would be actively destructive: it would delete the very
-    // key that buys the user the permissive path, then throw away constraints
-    // that path accepts. This is what the previous doc-derived version did to
-    // every `zod-to-json-schema` user.
-    if (typeof s.$schema === "string") {
-      // Keep `$schema`: it is the routing switch. Stripping it would silently
-      // downgrade the caller to the narrow proto path. But "sent verbatim" is
-      // the TRANSPORT, not acceptance — the backend still has its own allowlist.
-      ledger.push(entry("=", "root",
-        "Kept `$schema` — it is the routing switch. With it, @google/genai moves this to the " +
-        "`responseJsonSchema` request field (in Python, set `response_json_schema` yourself). " +
-        "That path keeps `$ref`/`$defs` and recursion, but it does NOT ENFORCE `pattern`, " +
-        "`minLength`, `maxLength`, `min/maxProperties`, `default` or `example` — those are " +
-        "silently ignored here and work only on the narrow `responseSchema` path. The two " +
-        "subsets are complementary; neither is a superset. Nothing below is an error: " +
-        "unsupported keywords are ignored, so `--check` stays green.",
-        DOCS.gemini, true));
+    // ---- Path A: `responseJsonSchema` -> the SDK sends this VERBATIM --------
+    // Subsetting here would be actively destructive: it would throw away
+    // constraints this path accepts. This is what the doc-derived version did
+    // to every `zod-to-json-schema` user.
+    if (jsonPath === true) {
+      if (typeof s.$schema === "string") {
+        // "sent verbatim" is the TRANSPORT, not acceptance — the backend still
+        // has its own allowlist.
+        ledger.push(entry("=", "root",
+          "Kept `$schema`. It is not merely decorative: @google/genai (JS) reads a TOP-LEVEL " +
+          "`$schema` and moves the schema to the `responseJsonSchema` request field for you. " +
+          "No other client does — in Python set `response_json_schema` yourself, and the legacy " +
+          "`@google/generative-ai` (what @langchain/google-genai uses) has no such field at all. " +
+          "This path keeps `$ref`/`$defs` and recursion, but it does NOT ENFORCE `pattern`, " +
+          "`minLength`, `maxLength`, `min/maxProperties`, `default` or `example` — those are " +
+          "silently ignored here and work only on the narrow `responseSchema` path. The two " +
+          "subsets are complementary; neither is a superset. Nothing below is an error: " +
+          "unsupported keywords are ignored, so `--check` stays green.",
+          DOCS.gemini, true));
+      } else {
+        ledger.push(entry("=", "root",
+          "No top-level `$schema`, so @google/genai (JS) will NOT auto-route this — it would " +
+          "send it as `responseSchema`, the narrow proto, where much of the output below is " +
+          "rejected outright. Put this schema in the `responseJsonSchema` request field " +
+          "explicitly (Python: `response_json_schema=`), or add a top-level `$schema` if you " +
+          "are on @google/genai. If you actually meant the narrow path, use `--to gemini`.",
+          DOCS.gemini, true));
+      }
 
       // `definitions` is the draft-07 spelling zod-to-json-schema emits, and it
       // is NOT in the accepted list — only `$defs` is. Renaming it (and
@@ -1333,7 +1359,23 @@
       return { schema: s, ledger: ledger };
     }
 
-    // ---- Path B: no `$schema` -> the narrow `Schema` proto ------------------
+    // ---- Path B: `responseSchema`, the narrow `Schema` proto ----------------
+    // Reachable WITH a top-level `$schema` now, which is the #319 fix. A
+    // LangChain caller has one (zod/`z.toJSONSchema()` emits it) and still
+    // lands here, because their client cannot route. Strip it explicitly with
+    // its own ledger line rather than letting the allowlist walk drop it as a
+    // nameless unknown — the reason matters more than the removal.
+    if (typeof s.$schema === "string") {
+      delete s.$schema;
+      ledger.push(entry("-", "root",
+        "Removed `$schema`. The narrow `responseSchema` proto has no such field, and " +
+        "`types.Schema` is declared `extra=\"forbid\"`, so leaving it is a rejection. Note this " +
+        "key is ALSO the auto-routing switch in @google/genai (JS) only — if that is your " +
+        "client and you wanted the permissive path, re-run with `--to gemini-json` instead of " +
+        "taking this narrow-path output.",
+        DOCS.gemini));
+    }
+
     s = inlineRefs(s, ledger, DOCS.gemini);
 
     // The SDK throws outright before the request is even built.
@@ -1566,7 +1608,11 @@
   var CONVERTERS = {
     openai: toOpenAI,
     anthropic: toAnthropic,
-    gemini: toGemini,
+    // Two request fields, two dialects, two targets. Never inferred — see the
+    // note on toGemini(): the routing switch belongs to one client, not to
+    // Gemini, so guessing it produces a false pass for everyone else.
+    gemini: function (s) { return toGemini(s, false); },
+    "gemini-json": function (s) { return toGemini(s, true); },
     "openai-realtime": toOpenAIRealtime
   };
 
