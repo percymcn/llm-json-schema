@@ -88,9 +88,9 @@ Each provider accepts a different schema dialect, so a schema that works with on
   | | Python `anthropic` | `@anthropic-ai/sdk` |
   |---|---|---|
   | `enum` | **preserved** — actually enforced | demoted into `description` prose |
-  | root `{$ref, $defs}` | **`$defs` kept**, pointer resolves | `$defs` dropped → dangling `$ref`, whole schema gone |
+  | root `{$ref, $defs}` | **accepted**, `$defs` kept, pointer resolves | **rejected**: `JSON schema must be an object, but got undefined` |
 
-  The Python transformer pops `$defs` *before* its `$ref` early-return, with a source comment naming that exact case. Note the draft-07 spelling `{$ref, definitions}` is destroyed by **both**, so the `definitions` → `$defs` rename this tool performs is unconditional.
+  The Python transformer pops `$defs` *before* its `$ref` early-return, with a source comment naming that exact case, and `messages.py` calls it with no root-type guard. The TypeScript failure is **loud, not silent** — both public helpers (`jsonSchemaOutputFormat`, `betaJSONSchemaOutputFormat`) throw, because a `$ref` root has no `type`. Only the internal `transformJSONSchema`, called directly, loses `$defs` quietly. Note the draft-07 spelling `{$ref, definitions}` is lost by **both**, so the `definitions` → `$defs` rename this tool performs is unconditional.
 
   Picking the wrong one is not cosmetic. `instructor`'s default Anthropic mode is `ANTHROPIC_TOOLS`, so an ordinary Pydantic model with a `tuple[int, int, int, int]` field goes on the wire **byte-identical** — gating it against the `output_format` rules is a CI failure on a payload Anthropic accepts exactly as written.
 
@@ -104,7 +104,7 @@ Each provider accepts a different schema dialect, so a schema that works with on
   The bounds still reach the model — as a sentence. They are no longer enforced, and nothing errors or warns. Same for `minLength`, `maxLength`, `pattern`, `maxItems`, `minItems` (unless it is exactly 0 or 1), `const`, `default` and any `format` outside `date-time, time, date, duration, email, hostname, uri, ipv4, ipv6, uuid`. (`enum` is demoted **only by the TypeScript SDK** — see the table above.)
 
   Two more that bite real generator output:
-  - A **root `$ref`** is fatal on the TypeScript SDK: the transformer returns early on `$ref`, so `zod-to-json-schema`'s `{$ref, definitions}` becomes literally `{"$ref":"#/definitions/X"}` — dangling pointer, whole schema gone, no error. `$ref` siblings are dropped outright too (not even demoted) — **that part is true of both SDKs**.
+  - A **root `$ref`** is fatal on the TypeScript SDK — it throws at the public helper (see above), and the internal `transformJSONSchema` instead returns early on `$ref`, so `zod-to-json-schema`'s `{$ref, definitions}` becomes literally `{"$ref":"#/definitions/X"}` — dangling pointer, whole schema gone, no error. `$ref` siblings are dropped outright too (not even demoted) — **that part is true of both SDKs**.
   - **Tuples** fail two different ways: array-form `items` (and `prefixItems` beside `items: false`) **throws** `JSON schema must have a type defined if anyOf/oneOf/allOf are not used` — a message that never mentions tuples — while a bare `prefixItems`, which is exactly what zod v4's `z.toJSONSchema(z.tuple([...]))` emits, is quietly demoted, leaving an array with **no item schema and no length at all**.
 
   Unlike OpenAI, Anthropic does **not** require every key in `required` — the transformer passes your list through as given, so this tool does not force it.

@@ -1038,20 +1038,28 @@
     // is unconditional and this skip is not.
     if (outputFormatPath && pythonSdk && rootRefResolvesInDefs(s)) {
       ledger.push(entry("=", "root",
-        "Left the root `$ref` (`" + s.$ref + "`) alone. The Python `anthropic` SDK processes `$defs` " +
-        "before it returns on a `$ref`, so the definition travels with the pointer and the schema " +
-        "arrives whole. This is the one case where the two SDKs produce different SCHEMAS rather " +
-        "than different warnings: `@anthropic-ai/sdk` (JS) returns first and drops `$defs`, so the " +
-        "same file becomes a dangling `{\"$ref\":\"" + s.$ref + "\"}` with everything else gone. If a " +
-        "TypeScript service also sends this schema, run `--to anthropic-json` and take its edit.",
+        "Left the root `$ref` (`" + s.$ref + "`) alone. The Python `anthropic` SDK calls " +
+        "`transform_schema()` with no root-type guard, and that function pops `$defs` BEFORE its " +
+        "`$ref` early-return, so the definition travels with the pointer and the schema arrives " +
+        "whole. This is the one case where the two SDKs produce different SCHEMAS rather than " +
+        "different warnings — but note the TypeScript failure is LOUD, not silent: both public " +
+        "helpers (`jsonSchemaOutputFormat`, `betaJSONSchemaOutputFormat`) reject a root `$ref` " +
+        "outright with \"JSON schema must be an object, but got undefined\", because a `$ref` root " +
+        "has no `type`. (Only the internal `transformJSONSchema`, called directly, loses `$defs` " +
+        "quietly.) So if a TypeScript service also sends this schema it will fail fast rather than " +
+        "mis-send — run `--to anthropic-json` and take its edit.",
         url, true));
     } else {
       s = inlineRootRef(s, ledger, url, outputFormatPath
-        ? "`@anthropic-ai/sdk`'s transformer returns as soon as it sees a `$ref`, so a root `$ref` " +
-          "discards everything beside it — `{$ref, $defs}` from Pydantic's `RootModel` and " +
-          "`{$ref, definitions}` from zod-to-json-schema both come out as just the bare pointer, " +
-          "dangling, with no error raised. (The Python SDK keeps `$defs` here, but is destroyed by " +
-          "the draft-07 `definitions` spelling just the same.)"
+        ? "A root `$ref` has no `type`, and `@anthropic-ai/sdk`'s public helpers " +
+          "(`jsonSchemaOutputFormat`, `betaJSONSchemaOutputFormat`) reject that outright: \"JSON " +
+          "schema must be an object, but got undefined\". Call the internal `transformJSONSchema` " +
+          "directly instead and it fails the other way — it returns as soon as it sees the `$ref` " +
+          "and drops `$defs`, leaving a dangling pointer with the whole schema gone and no error. " +
+          "Inlining fixes both. `{$ref, $defs}` from Pydantic's `RootModel` and `{$ref, definitions}` " +
+          "from zod-to-json-schema are the two shapes that land here. (The Python SDK has no root-type " +
+          "guard and keeps `$defs`, so it accepts the first shape — but the draft-07 `definitions` " +
+          "spelling is lost there too.)"
         : "A root `$ref` has no `type` of its own, and `betaTool()` throws \"JSON schema for tool ... " +
           "must be an object, but got undefined\" on any root that is not `type: \"object\"`. Inlining " +
           "the referenced definition gives the root its object type back. (Measured against " +
