@@ -236,5 +236,31 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--check still fails on gemini prefixItems", bad.status === 1, bad.stderr);
 })();
 
+// --- Gemini responseJsonSchema path: notes must be VISIBLE ------------------
+// A keyword that path ignores needs no edit, so it is an advisory "=" entry and
+// therefore not a `change`. Without explicit rendering it fell into the
+// "No changes needed" branch and the user was never told their `pattern` is
+// unenforced — a silent information loss on the one path where the tool's whole
+// value is the warning.
+(function () {
+  var zodV4 = JSON.stringify({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: { slug: { type: "string", pattern: "^[a-z-]+$", minLength: 3 } },
+    required: ["slug"]
+  });
+  var r = run(["--to", "gemini"], zodV4);
+  ok("gemini $schema path exits 0 (nothing is rejected)", r.status === 0, r.stderr);
+  ok("gemini $schema path emits a visible notes section",
+    /notes? \(no edit needed/.test(r.stderr), r.stderr);
+  ok("the note names the unenforced keyword", /pattern/.test(r.stderr), r.stderr);
+  ok("the note explains the routing switch", /responseJsonSchema/.test(r.stderr), r.stderr);
+  ok("stdout is still the schema, constraints intact",
+    JSON.parse(r.stdout).properties.slug.pattern === "^[a-z-]+$", r.stdout);
+
+  var c = run(["--to", "gemini", "--check"], zodV4);
+  ok("--check stays green on an ignored-keyword schema", c.status === 0, c.stderr);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

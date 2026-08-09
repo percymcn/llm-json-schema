@@ -266,6 +266,37 @@ var ZOD_V3 = {
     !!keep.schema.$defs && !keep.schema.definitions &&
     keep.schema.$ref === "#/$defs/Ticket");
 
+  // The strongest guard against re-introducing the strip. This is verbatim
+  // `z.toJSONSchema()` output from zod 4.4.3 — the generator our audience uses,
+  // and one that ALWAYS emits `$schema`, so it always lands on this path. Every
+  // constraint here (minLength/maxLength/pattern/minimum/maximum/minItems) is
+  // absent from the `responseJsonSchema` accepted list, so a strip-based
+  // implementation would silently gut all of them. The schema must come back
+  // BYTE-IDENTICAL, and the only ledger output may be advisory.
+  var ZOD_V4 = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object",
+    properties: {
+      title: { type: "string", minLength: 3, maxLength: 80, description: "Headline" },
+      slug: { type: "string", pattern: "^[a-z-]+$" },
+      score: { type: "number", minimum: 0, maximum: 100 },
+      tags: { minItems: 1, type: "array", items: { type: "string" } },
+      status: { type: "string", enum: ["draft", "live"] }
+    },
+    required: ["title", "slug", "score", "tags", "status"],
+    additionalProperties: false
+  };
+  var z4 = E.toGemini(JSON.parse(JSON.stringify(ZOD_V4)));
+  ok("gemini is a NO-OP on real zod-v4 output (nothing stripped)",
+    JSON.stringify(z4.schema) === JSON.stringify(ZOD_V4));
+  ok("gemini reports zod-v4 constraints as advisory only (CI stays green)",
+    z4.ledger.length > 0 &&
+    z4.ledger.every(function (l) { return l.op === "=" && l.advisory; }));
+  ok("gemini names each unenforced zod-v4 constraint",
+    ["minLength", "maxLength", "pattern"].every(function (kw) {
+      return z4.ledger.some(function (l) { return l.advisory && l.msg.indexOf(kw) !== -1; });
+    }));
+
   // Same generator output with `$schema` removed = the narrow proto path, where
   // #311's inlining fix must still hold (that bug emptied the whole schema).
   var noDollar = JSON.parse(JSON.stringify(ZOD_V3));
