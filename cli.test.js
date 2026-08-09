@@ -262,5 +262,42 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--check stays green on an ignored-keyword schema", c.status === 0, c.stderr);
 })();
 
+// --- the gemini tuple false pass -------------------------------------------
+// `--check --to gemini` printed "Valid for gemini." and exited 0 for a schema
+// `types.Schema` (extra="forbid") rejects with
+//   properties.bbox.items: Input should be a valid dictionary or object
+// A false pass in a CI gate is worse than no gate, because it is trusted. This
+// is the exact payload the Vercel AI SDK sends for `z.tuple([...])`.
+(function () {
+  var aiSdkTuple = JSON.stringify({
+    type: "object",
+    properties: {
+      bbox: { type: "array", items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }] }
+    },
+    required: ["bbox"]
+  });
+
+  var c = run(["--to", "gemini", "--check"], aiSdkTuple);
+  ok("--check --to gemini FAILS on an array-form tuple", c.status === 1, c.stderr);
+  ok("the failure names the tuple, not something incidental",
+    /tuple/i.test(c.stderr), c.stderr);
+
+  var r = run(["--to", "gemini"], aiSdkTuple);
+  ok("--to gemini collapses the tuple", r.status === 0, r.stderr);
+  var bbox = JSON.parse(r.stdout).properties.bbox;
+  ok("emitted gemini schema has no array in `items`", !Array.isArray(bbox.items), r.stdout);
+  ok("emitted gemini schema keeps the fixed length",
+    bbox.minItems === 4 && bbox.maxItems === 4, r.stdout);
+
+  // A heterogeneous tuple cannot be represented at all -> blocker, exit 3.
+  var het = JSON.stringify({
+    type: "object",
+    properties: { pair: { type: "array", items: [{ type: "string" }, { type: "number" }] } },
+    required: ["pair"]
+  });
+  ok("--to gemini exits 3 on an unrepresentable tuple",
+    run(["--to", "gemini"], het).status === 3, "");
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

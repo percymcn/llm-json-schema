@@ -587,6 +587,61 @@ var PYD_TUPLE = {
     r.schema.properties.pairs.items.required.indexOf("b") !== -1);
 })();
 
+// --- Gemini tuples: the false pass the other two providers had already fixed --
+// `items` is in GEMINI_ALLOWED, so an ARRAY in `items` used to pass the
+// allowlist untouched and the tool reported "Valid for gemini" for a schema
+// `types.Schema` (extra="forbid") rejects outright. This is the exact shape the
+// Vercel AI SDK puts on the wire for `z.tuple()`.
+(function () {
+  var AI_SDK_TUPLE = {
+    type: "object",
+    properties: {
+      bbox: { type: "array", items: [{ type: "number" }, { type: "number" }, { type: "number" }, { type: "number" }] }
+    },
+    required: ["bbox"]
+  };
+
+  var copy = function (o) { return JSON.parse(JSON.stringify(o)); };
+
+  var r = E.toGemini(copy(AI_SDK_TUPLE));
+  var bbox = r.schema.properties.bbox;
+  ok("gemini collapses a homogeneous array-form tuple",
+    !Array.isArray(bbox.items) && bbox.items.type === "number");
+  ok("gemini keeps the fixed length via minItems/maxItems",
+    bbox.minItems === 4 && bbox.maxItems === 4);
+  ok("gemini array-form tuple is NOT a silent pass",
+    r.ledger.some(function (l) { return l.op !== "=" && !l.advisory; }));
+
+  // prefixItems used to be deleted outright, which threw away the element type.
+  var p = E.toGemini({
+    type: "object",
+    properties: { xs: { type: "array", prefixItems: [{ type: "string" }, { type: "string" }] } },
+    required: ["xs"]
+  });
+  ok("gemini recovers the element type from a homogeneous prefixItems",
+    p.schema.properties.xs.items && p.schema.properties.xs.items.type === "string");
+
+  var het = E.toGemini({
+    type: "object",
+    properties: { pair: { type: "array", items: [{ type: "string" }, { type: "number" }] } },
+    required: ["pair"]
+  });
+  ok("gemini heterogeneous tuple is a blocker, not a silent rewrite",
+    het.ledger.some(function (l) { return l.op === "!" && l.msg.indexOf("differently-typed") !== -1; }));
+  ok("gemini leaves a blocked tuple visible",
+    Array.isArray(het.schema.properties.pair.items));
+
+  // Path A ($schema present) routes to responseJsonSchema, whose accepted list
+  // names `prefixItems` — so there the tuple survives losslessly instead.
+  var jsonPath = copy(AI_SDK_TUPLE);
+  jsonPath.$schema = "http://json-schema.org/draft-07/schema#";
+  var j = E.toGemini(jsonPath);
+  ok("gemini JSON path rewrites array-form items to prefixItems",
+    Array.isArray(j.schema.properties.bbox.prefixItems) &&
+    j.schema.properties.bbox.prefixItems.length === 4 &&
+    j.schema.properties.bbox.items === undefined);
+})();
+
 ["openai", "anthropic", "gemini"].forEach(function (provider) {
   var once = E.convert(PYD_TUPLE, provider, { mode: "schema" });
   var twice = E.convert(once.schema, provider, { mode: "schema" });

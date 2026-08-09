@@ -924,6 +924,28 @@
         "Renamed draft-07 `definitions` to `$defs` and repointed every `$ref` — " +
         "`responseJsonSchema` accepts `$defs`, not `definitions`. (zod-to-json-schema emits `definitions`.)");
 
+      // Array-form `items` is the DRAFT-07 spelling of a tuple, and it is the
+      // one the Vercel AI SDK actually puts on the wire for `z.tuple()`. The
+      // accepted list above names `items` and `prefixItems` separately, in the
+      // 2020-12 sense: `items` is the schema for every element, `prefixItems`
+      // is the positional list. So an array sitting in `items` is not the
+      // "items" that list accepts. Renaming it is lossless and lands on a
+      // keyword this path explicitly accepts — unlike the narrow path below,
+      // no positions have to be given up. Must run before the allowlist walk,
+      // which would otherwise wave the array through as an accepted `items`.
+      walk(s, "root", function (node, path) {
+        if (!Array.isArray(node.items)) return;
+        node.prefixItems = node.items;
+        delete node.items;
+        ledger.push(entry("~", path,
+          "Rewrote draft-07 tuple-form `items` (an array of schemas) as `prefixItems`. " +
+          "`responseJsonSchema` accepts `prefixItems` for positional tuples; an array inside " +
+          "`items` is the draft-07 spelling and is not what that list means by `items`. " +
+          "Nothing is lost — every position keeps its own schema. (`z.tuple()` through the " +
+          "Vercel AI SDK emits exactly this array form.)",
+          DOCS.gemini));
+      });
+
       walk(s, "root", function (node, path) {
         Object.keys(node).forEach(function (k) {
           if (!GEMINI_JSON_ALLOWED[k]) {
@@ -990,8 +1012,28 @@
     });
 
     walk(s, "root", function (node, path) {
+      // Tuples. `items` is in GEMINI_ALLOWED, so an ARRAY sitting in `items`
+      // used to sail straight through the allowlist untouched — the third time
+      // an alternate spelling of a container has hidden from a keyword check
+      // (`definitions` vs `$defs`, then the same array-`items` false pass in
+      // OpenAI). `types.Schema` is `extra="forbid"` and its `items` is a single
+      // Schema, so it rejects the array outright:
+      //   "properties.bbox.items: Input should be a valid dictionary or object"
+      // `minItems`/`maxItems` ARE fields of `Schema` (verified against the same
+      // oracle), so the homogeneous collapse keeps the fixed length here.
+      var tupleBlocked = normalizeTuple(node, path, ledger, DOCS.gemini,
+        "Gemini's `responseSchema` proto has no tuple form — `types.Schema` declares `items` " +
+        "as a single schema and is `extra=\"forbid\"`, so it rejects both an array in `items` " +
+        "and `prefixItems`.",
+        "The `responseSchema` proto has no tuple form, but every position here has the same " +
+        "schema, and `minItems`/`maxItems` are fields of `types.Schema`, so the fixed length " +
+        "survives as a real constraint on this path.");
+
       // drop keywords outside the supported subset
       Object.keys(node).forEach(function (k) {
+        // A blocked (heterogeneous) tuple stays visible so the reader can see
+        // the shape they have to remodel.
+        if (tupleBlocked && (k === "prefixItems" || k === "items")) return;
         if (!GEMINI_ALLOWED[k]) {
           if (k === "$ref") {
             ledger.push(entry("!", path,
