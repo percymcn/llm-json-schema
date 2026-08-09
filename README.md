@@ -6,23 +6,25 @@ Available three ways, all running the same dependency-free engine:
 
 | | |
 |---|---|
-| **CLI / CI gate** | `npx llm-json-schema --to openai schema.json` |
+| **CLI / CI gate** | `npx github:percymcn/llm-json-schema --to openai schema.json` |
 | **Library** | `require("llm-json-schema").toOpenAI(schema)` |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
 > Status: **v0.1 — CLI + library added** (Cycle #309). Unit-tested: 21 engine assertions + 31 CLI assertions (`npm test`). Provider rules verified against official docs on 2026-07-30.
+>
+> Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
 ## Quick start
 
 ```bash
 # Fix a schema for OpenAI strict mode
-npx llm-json-schema --to openai schema.json > fixed.json
+npx github:percymcn/llm-json-schema --to openai schema.json > fixed.json
 
 # Pipe it
-cat schema.json | npx llm-json-schema --to gemini
+cat schema.json | npx github:percymcn/llm-json-schema --to gemini
 
 # Fail CI if a schema isn't valid for the provider you ship against
-npx llm-json-schema --to openai --check schema.json
+npx github:percymcn/llm-json-schema --to openai --check schema.json
 ```
 
 The fixed schema goes to **stdout**; the explanation ledger goes to **stderr**, so redirection stays clean.
@@ -100,7 +102,7 @@ const { schema, ledger } = toOpenAI(mySchema);
 - Gemini — https://ai.google.dev/gemini-api/docs/structured-output
 
 ## Distribution
-Organic Google search only (loop-owned, un-gated). Targets error-message long-tails first (e.g. *"additionalProperties is required to be false"*, *"gemini responseSchema $ref not supported"*); the head term comes later with domain age.
+Organic search (targets error-message long-tails first, e.g. *"additionalProperties is required to be false"*, *"gemini responseSchema $ref not supported"*) plus direct `npx github:` install. An npm registry release would add the registry's own discovery surface; that's pending.
 
 ## License
 MIT.
