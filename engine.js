@@ -3,15 +3,19 @@
  *
  * Dependency-free. Runs in the browser and in Node (for tests).
  *
- * Every rule encoded here is sourced from the provider's CURRENT official docs
- * (fetched 2026-07-30; OpenAI keyword set re-verified 2026-08-08). Each RULE
- * carries the doc URL it came from so the UI can cite it — the provider-
- * divergence logic IS the product's value.
+ * Rules are sourced from the provider's CURRENT official docs AND, where the
+ * vendor ships one, from the vendor's own client SDK — which encodes the
+ * ACCEPTED keyword set, while the docs only describe the SUPPORTED subset.
+ * The two differ, and the SDK wins. Each rule carries the URL it came from so
+ * the UI can cite it — the provider-divergence logic IS the product's value.
  *
  * Sources:
  *   OpenAI    https://developers.openai.com/api/docs/guides/structured-outputs
+ *             + `openai@7.4.0` lib/transform `toStrictJsonSchema()`  [2026-08-08]
  *   Anthropic https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview
  *   Gemini    https://ai.google.dev/gemini-api/docs/structured-output
+ *             + `@google/genai@2.16.0` `Schema` type, `processJsonSchema()`,
+ *               `maybeMoveToResponseJsonSchema()`                    [2026-08-09]
  */
 
 (function (root) {
@@ -39,10 +43,17 @@
     return false;
   }
 
-  // Ledger entry: { op: "+"|"~"|"x"|"!", path, msg, rule, ruleUrl }
+  // Ledger entry: { op: "+"|"~"|"x"|"!", path, msg, ruleUrl, advisory }
   //   +  added        ~  changed        x  removed        !  violation (cannot auto-fix)
-  function entry(op, path, msg, ruleUrl) {
-    return { op: op, path: path || "root", msg: msg, ruleUrl: ruleUrl };
+  //
+  // `advisory: true` marks an OPTIONAL improvement — the schema is already
+  // accepted without it. `--check` must not fail CI on these: a gate that goes
+  // red on a valid schema is the same false-failure class as a doc-derived
+  // allowlist rejecting a payload the vendor accepts.
+  function entry(op, path, msg, ruleUrl, advisory) {
+    var e = { op: op, path: path || "root", msg: msg, ruleUrl: ruleUrl };
+    if (advisory) e.advisory = true;
+    return e;
   }
 
   // ---- schema inference from a JSON example --------------------------------
@@ -476,17 +487,47 @@
     return { schema: s, ledger: ledger };
   }
 
-  // ---- Gemini responseSchema -----------------------------------------------
-  // Supported subset (from the Gemini doc): type, title, description, properties,
-  // required, additionalProperties, enum, format (string: date-time|date|time),
-  // minimum, maximum, items, prefixItems, minItems, maxItems, anyOf, nullable,
-  // propertyOrdering. NOT supported: $ref/$defs (except recursive "#"), pattern,
-  // minLength, maxLength, multipleOf, allOf/not/if/then/else, patternProperties.
+  // ---- Gemini: TWO paths, and `$schema` is the switch between them ----------
+  //
+  // Verified 2026-08-09 against the vendor SDK `@google/genai@2.16.0`, not the
+  // doc — the doc describes only the narrow path and never mentions the switch.
+  //
+  //   `GoogleGenAI.maybeMoveToResponseJsonSchema()`: if the schema handed to
+  //   `responseSchema` contains a `$schema` key, the SDK MOVES it to the
+  //   `responseJsonSchema` request field and sends it VERBATIM (`tJsonSchema`
+  //   is the identity function). That path is full JSON Schema — `$ref`,
+  //   `$defs` and recursion all survive to the wire.
+  //
+  //   With no `$schema` key it goes to `responseSchema`, which is the narrow
+  //   `Schema` proto: `processJsonSchema()` upper-cases `type` and drops
+  //   `additionalProperties`.
+  //
+  // This matters because `zod-to-json-schema` ALWAYS emits `$schema` and
+  // `pydantic.model_json_schema()` never does — so the two generators our
+  // audience uses land on opposite paths by default.
+  //
+  // GEMINI_ALLOWED below is the field list of the SDK's own exported `Schema`
+  // interface (dist/genai.d.ts) — the vendor's encoding of what the proto
+  // accepts. It is NOT the SDK's pass-through behaviour: `processJsonSchema`
+  // is close to an identity function and forwards unknown keywords untouched,
+  // so "the SDK didn't strip it" proves nothing here. (Contrast OpenAI, where
+  // the transformer throws and pass-through IS the signal — see #312.)
+  //
+  // Corrections this list encodes, both directions:
+  //   ADDED   pattern, minLength, maxLength, minProperties, maxProperties,
+  //           default, example — all in the vendor `Schema` type, all of which
+  //           the previous doc-derived list deleted. Pydantic emits
+  //           minLength/maxLength/pattern/title constantly.
+  //   REMOVED prefixItems — absent from `Schema` (same false pass as the
+  //           OpenAI `prefixItems` bug fixed in the previous cycle).
+  //   REMOVED additionalProperties — absent from `Schema`, and the SDK
+  //           explicitly skips it ("not included in JSONSchema, skipping it").
   var GEMINI_ALLOWED = {
-    "type": 1, "title": 1, "description": 1, "properties": 1, "required": 1,
-    "additionalProperties": 1, "enum": 1, "format": 1, "minimum": 1, "maximum": 1,
-    "items": 1, "prefixItems": 1, "minItems": 1, "maxItems": 1, "anyOf": 1,
-    "nullable": 1, "propertyOrdering": 1
+    "anyOf": 1, "default": 1, "description": 1, "enum": 1, "example": 1,
+    "format": 1, "items": 1, "maxItems": 1, "maxLength": 1, "maxProperties": 1,
+    "maximum": 1, "minItems": 1, "minLength": 1, "minProperties": 1,
+    "minimum": 1, "nullable": 1, "pattern": 1, "properties": 1,
+    "propertyOrdering": 1, "required": 1, "title": 1, "type": 1
   };
   var GEMINI_STRING_FORMATS = { "date-time": 1, "date": 1, "time": 1, "enum": 1 };
 
@@ -550,7 +591,45 @@
     var s = clone(schema);
     var ledger = [];
 
+    // ---- Path A: top-level `$schema` -> the SDK sends this VERBATIM ---------
+    // `maybeMoveToResponseJsonSchema` only inspects TOP-LEVEL keys, so a nested
+    // `$schema` does not route (and is stripped below as an unknown keyword).
+    // Subsetting here would be actively destructive: it would delete the very
+    // key that buys the user the permissive path, then throw away constraints
+    // that path accepts. This is what the previous doc-derived version did to
+    // every `zod-to-json-schema` user.
+    if (typeof s.$schema === "string") {
+      ledger.push(entry("=", "root",
+        "Left unchanged — and that is the fix. This schema has a top-level `$schema`, " +
+        "so @google/genai routes it to the `responseJsonSchema` request field and sends it " +
+        "verbatim; `$ref`, `$defs` and recursion all survive. Do NOT strip `$schema` to fit " +
+        "the narrow `responseSchema` subset — removing it silently downgrades you to a path " +
+        "that drops `pattern`, `minLength` and the rest.",
+        DOCS.gemini));
+      // Deliberately op "=", not "!": nothing needs fixing, so `--check` must
+      // exit 0. A "!" here would fail CI for every zod-to-json-schema user —
+      // the same false-failure class as the OpenAI allowlist bug.
+      ledger.push(entry("=", "root",
+        "Caveat: this holds when you call through the SDK (or set `responseJsonSchema` yourself). " +
+        "If you POST to `responseSchema` directly over REST, you are on the narrow proto path — " +
+        "delete `$schema` and re-run to get the subsetted form.",
+        DOCS.gemini));
+      return { schema: s, ledger: ledger };
+    }
+
+    // ---- Path B: no `$schema` -> the narrow `Schema` proto ------------------
     s = inlineRefs(s, ledger, DOCS.gemini);
+
+    // The SDK throws outright before the request is even built.
+    walk(s, "root", function (node, path) {
+      if (node.type !== undefined && node.anyOf !== undefined) {
+        ledger.push(entry("!", path,
+          "`type` and `anyOf` are both set. @google/genai throws " +
+          "\"type and anyOf cannot be both populated.\" before it sends anything — " +
+          "drop one of them.",
+          DOCS.gemini));
+      }
+    });
 
     walk(s, "root", function (node, path) {
       // drop keywords outside the supported subset
@@ -560,16 +639,35 @@
             ledger.push(entry("!", path,
               "`$ref` is not supported by Gemini (except recursive `#`). Inline the referenced schema.",
               DOCS.gemini));
+          } else if (k === "additionalProperties") {
+            ledger.push(entry("x", path,
+              "Removed `additionalProperties` — absent from the SDK's `Schema` type, and " +
+              "@google/genai drops it on the way out anyway (\"additionalProperties is not " +
+              "included in JSONSchema, skipping it\"). Unlike OpenAI, Gemini does not need it.",
+              DOCS.gemini));
+            delete node[k];
+          } else if (k === "prefixItems") {
+            ledger.push(entry("x", path,
+              "Removed `prefixItems` — not a field of the SDK's `Schema` type, so the " +
+              "`responseSchema` proto has nowhere to put it. Gemini has no tuple form; " +
+              "model it as an object with named fields, or a homogeneous `items` array.",
+              DOCS.gemini));
+            delete node[k];
           } else {
             ledger.push(entry("x", path,
-              "Removed `" + k + "` — not in Gemini's supported schema subset.",
+              "Removed `" + k + "` — not a field of the SDK's `Schema` type " +
+              "(`@google/genai` dist/genai.d.ts), so the `responseSchema` proto cannot carry it.",
               DOCS.gemini));
             delete node[k];
           }
         }
       });
 
-      // string `format` limited to date-time / date / time
+      // string `format` limited to date-time / date / time.
+      // NOTE: doc-sourced, not SDK-verified — the SDK types `format` as a bare
+      // `string` and gives no verdict. Kept as a strip because the asymmetry
+      // favours it: an unsupported `format` is a hard 400, while `format` is
+      // advisory, so dropping it costs little.
       if (node.type === "string" && node.format && !GEMINI_STRING_FORMATS[node.format]) {
         ledger.push(entry("x", path,
           "Removed `format: " + node.format + "` — Gemini supports only date-time, date, time for strings.",
@@ -583,14 +681,20 @@
         if (keys.length && !node.propertyOrdering) {
           node.propertyOrdering = keys.slice();
           ledger.push(entry("+", path,
-            "Added `propertyOrdering` — Gemini uses it to fix the field order it emits.",
-            DOCS.gemini));
+            "Added `propertyOrdering` — Gemini uses it to fix the field order it emits. " +
+            "Optional: the schema is already accepted without it.",
+            DOCS.gemini, true));
         }
       }
     });
 
     if (ledger.length === 0) {
-      ledger.push(entry("=", "root", "No changes needed. This schema is within Gemini's supported subset.", DOCS.gemini));
+      ledger.push(entry("=", "root",
+        "No changes needed. Every keyword here is a field of the SDK's `Schema` type, " +
+        "so the `responseSchema` proto can carry all of it. (Adding a top-level `$schema` " +
+        "would instead route you to `responseJsonSchema`, which accepts full JSON Schema " +
+        "including `$ref` and recursion.)",
+        DOCS.gemini));
     }
     return { schema: s, ledger: ledger };
   }

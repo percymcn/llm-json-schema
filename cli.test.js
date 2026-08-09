@@ -192,5 +192,41 @@ var CAROUSEL_SCHEMA = JSON.stringify({
   ok("--check still fails on uniqueItems (SDK throws on it)", bad.status === 1, bad.stderr);
 })();
 
+// --- Gemini: --check must not go red on schemas the API accepts -------------
+// Verified 2026-08-09 against @google/genai@2.16.0 by capturing the wire payload.
+(function () {
+  // Verbatim pydantic model_json_schema() output. Every keyword here is a field
+  // of the SDK's `Schema` type, so it is accepted as-is; the only thing we have
+  // to say about it is an OPTIONAL `propertyOrdering` suggestion.
+  var PYD = JSON.stringify({
+    properties: {
+      name: { description: "full name", maxLength: 20, minLength: 3, title: "Name", type: "string" },
+      code: { pattern: "^[A-Z]{3}$", title: "Code", type: "string" }
+    },
+    required: ["name", "code"], title: "S", type: "object"
+  });
+  var r = run(["--to", "gemini", "--check"], PYD);
+  ok("--check passes on valid pydantic output (propertyOrdering is advisory)", r.status === 0, r.stderr);
+  ok("--check still reports the optional suggestion", /optional suggestion/.test(r.stderr), r.stderr);
+
+  // zod-to-json-schema output: the top-level `$schema` routes it to
+  // `responseJsonSchema`, which takes it verbatim — nothing to fix.
+  var ZOD = JSON.stringify({
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $ref: "#/definitions/S",
+    definitions: { S: { type: "object", properties: { name: { type: "string", minLength: 3 } }, required: ["name"] } }
+  });
+  var z = run(["--to", "gemini", "--check"], ZOD);
+  ok("--check passes on zod output for gemini", z.status === 0, z.stderr);
+
+  // ...but a real violation still fails: prefixItems has no home in the proto.
+  var bad = run(["--to", "gemini", "--check"], JSON.stringify({
+    type: "object",
+    properties: { pair: { type: "array", prefixItems: [{ type: "string" }] } },
+    propertyOrdering: ["pair"]
+  }));
+  ok("--check still fails on gemini prefixItems", bad.status === 1, bad.stderr);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

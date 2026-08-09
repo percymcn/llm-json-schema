@@ -106,12 +106,15 @@ function main(argv) {
 
     var changes = res.ledger.filter(function (l) { return l.op !== "="; });
     var blockers = res.ledger.filter(function (l) { return l.op === "!"; });
+    // Advisory entries are optional improvements — the schema is already
+    // accepted without them, so they must never turn a CI gate red.
+    var required = changes.filter(function (l) { return !l.advisory; });
 
     if (opts.json) {
       process.stdout.write(JSON.stringify({
         ok: blockers.length === 0,
         provider: opts.provider,
-        compliant: changes.length === 0,
+        compliant: required.length === 0,
         inferred: res.inferred,
         schema: res.schema,
         ledger: res.ledger,
@@ -127,6 +130,11 @@ function main(argv) {
       }
       if (changes.length === 0) {
         process.stderr.write("Already valid for " + opts.provider + ". No changes needed.\n");
+      } else if (opts.check && required.length === 0) {
+        // Valid as-is; everything we found is an optional suggestion.
+        process.stderr.write("Valid for " + opts.provider + ". " + changes.length +
+          " optional suggestion" + (changes.length === 1 ? "" : "s") + ":\n");
+        process.stderr.write(renderLedger(changes) + "\n");
       } else {
         process.stderr.write((opts.check ? "Not compliant with " : "Fixed for ") + opts.provider +
           " (" + changes.length + " change" + (changes.length === 1 ? "" : "s") + "):\n");
@@ -138,7 +146,7 @@ function main(argv) {
       }
     }
 
-    if (opts.check && changes.length) process.exit(1);
+    if (opts.check && required.length) process.exit(1);
     if (blockers.length) process.exit(3);
     process.exit(0);
   });

@@ -68,7 +68,9 @@ API contract — which is why the ledger cites the rule for every change.
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
 - **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* The error is raised for keywords whose validation semantics strict mode cannot compile (`uniqueItems`, `patternProperties`, `contains`, `allOf`, `not`, `if`/`then`/`else`, …). Annotations and soft constraints — `description`, `title`, `default`, `examples`, `minLength`/`maxLength`, `$schema`, `$id` — are **accepted and passed through untouched**, so this tool leaves them alone.
 - **Anthropic tool `input_schema`:** standard JSON Schema, object root, light constraints; `strict: true` goes on the tool, not the schema.
-- **Gemini `responseSchema`:** a JSON-Schema subset — needs `propertyOrdering`, has no `$ref` at all (so definitions get inlined), drops `pattern`/`minLength`/`maxLength`, and limits string `format` to `date-time`/`date`/`time`.
+- **Gemini — two paths, and a top-level `$schema` is the switch between them.** `@google/genai`'s `maybeMoveToResponseJsonSchema()` checks for a top-level `$schema`; if it's there the schema is moved to the **`responseJsonSchema`** request field and sent **verbatim** (full JSON Schema — `$ref`, `$defs` and recursion all survive). With no `$schema` it goes to **`responseSchema`**, the narrow `Schema` proto: `$ref` must be inlined, `additionalProperties` and `prefixItems` are dropped, string `format` is limited to `date-time`/`date`/`time`, and `propertyOrdering` is worth adding.
+
+  This matters because **`zod-to-json-schema` always emits `$schema` and Pydantic's `model_json_schema()` never does** — the two generators land on opposite paths by default. Note that `pattern`, `minLength`, `maxLength`, `minProperties`, `maxProperties`, `default` and `example` are all fields of the SDK's own `Schema` type, so they are kept on **both** paths; stripping them (as the Gemini doc's narrower "supported properties" list implies) silently throws away your validation constraints.
 
 ### What generators actually emit
 `zod-to-json-schema` wraps your schema as `{ "$ref": "#/definitions/X", "definitions": { … } }`.
@@ -158,7 +160,9 @@ it through the CLI (`--to openai --check`) in your test suite.
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
 - OpenAI — https://developers.openai.com/api/docs/guides/structured-outputs
 - Anthropic — https://platform.claude.com/docs/en/docs/build-with-claude/tool-use/overview
-- Gemini — https://ai.google.dev/gemini-api/docs/structured-output
+- Gemini — https://ai.google.dev/gemini-api/docs/structured-output plus `@google/genai@2.16.0` (the `Schema` type, `processJsonSchema()` and `maybeMoveToResponseJsonSchema()`), verified 2026-08-09 by capturing the request body the SDK actually builds
+
+Where a vendor ships a client SDK, the SDK outranks the doc: docs describe the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 
 ## Distribution
 Organic search (targets error-message long-tails first, e.g. *"additionalProperties is required to be false"*, *"gemini responseSchema $ref not supported"*) plus direct `npx github:` install. An npm registry release would add the registry's own discovery surface; that's pending.

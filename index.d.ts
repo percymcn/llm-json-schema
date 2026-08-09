@@ -24,6 +24,11 @@ export interface LedgerEntry {
   msg: string;
   /** Provider doc URL the rule was derived from. */
   ruleUrl: string;
+  /**
+   * `true` for an OPTIONAL improvement — the provider already accepts the
+   * schema without it. `--check` ignores these, so they never fail a CI gate.
+   */
+  advisory?: boolean;
 }
 
 export interface ConvertSuccess {

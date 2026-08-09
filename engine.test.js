@@ -56,9 +56,33 @@ function has(ledger, substr) {
   });
   ok("gemini adds propertyOrdering", Array.isArray(r.schema.propertyOrdering) &&
     r.schema.propertyOrdering[0] === "email");
-  ok("gemini drops unsupported `pattern`", !("pattern" in r.schema.properties.email));
-  ok("gemini drops unsupported `minLength`", !("minLength" in r.schema.properties.email));
+  // `pattern` and `minLength` ARE fields of the SDK's `Schema` type
+  // (@google/genai dist/genai.d.ts) — the doc's narrower "supported properties"
+  // list is what made us delete them. Verified 2026-08-09 by capturing the wire
+  // payload the SDK builds: both arrive at `responseSchema` untouched.
+  ok("gemini KEEPS `pattern` (in the SDK Schema type)", r.schema.properties.email.pattern === "^.+@.+$");
+  ok("gemini KEEPS `minLength` (in the SDK Schema type)", r.schema.properties.email.minLength === 3);
   ok("gemini drops unsupported string format `email`", !("format" in r.schema.properties.email));
+})();
+
+// --- Gemini: keywords the vendor Schema type does NOT have ------------------
+(function () {
+  var r = E.toGemini({
+    type: "object",
+    additionalProperties: false,
+    properties: { pair: { type: "array", prefixItems: [{ type: "string" }] } }
+  });
+  ok("gemini drops additionalProperties (SDK skips it)", !("additionalProperties" in r.schema));
+  ok("gemini drops prefixItems (no tuple form in Schema)",
+    !("prefixItems" in r.schema.properties.pair));
+})();
+
+// --- Gemini: `type` + `anyOf` together makes the SDK throw ------------------
+(function () {
+  var r = E.toGemini({ type: "object", anyOf: [{ type: "string" }] });
+  ok("gemini blocks type+anyOf co-population", r.ledger.some(function (l) {
+    return l.op === "!" && l.msg.indexOf("anyOf cannot be both populated") !== -1;
+  }));
 })();
 
 // --- Gemini: flags $ref / $defs ---
@@ -172,7 +196,25 @@ var ZOD_V3 = {
 
 // --- Gemini inlines $refs rather than emitting an empty schema --------------
 (function () {
-  var r = E.toGemini(ZOD_V3);
+  // ZOD_V3 is verbatim zod-to-json-schema output, so it HAS a top-level
+  // `$schema`. @google/genai's maybeMoveToResponseJsonSchema() therefore moves
+  // it to `responseJsonSchema` and sends it verbatim — subsetting it here would
+  // delete the very key that buys the permissive path.
+  var keep = E.toGemini(ZOD_V3);
+  ok("gemini preserves $schema (it is the routing switch)", keep.schema.$schema === ZOD_V3.$schema);
+  ok("gemini leaves the $schema path's $ref intact",
+    JSON.stringify(keep.schema).indexOf("$ref") !== -1);
+  ok("gemini explains the responseJsonSchema routing", keep.ledger.some(function (l) {
+    return l.msg.indexOf("responseJsonSchema") !== -1;
+  }));
+  ok("gemini makes no destructive change on the $schema path",
+    keep.ledger.every(function (l) { return l.op === "="; }));
+
+  // Same generator output with `$schema` removed = the narrow proto path, where
+  // #311's inlining fix must still hold (that bug emptied the whole schema).
+  var noDollar = JSON.parse(JSON.stringify(ZOD_V3));
+  delete noDollar.$schema;
+  var r = E.toGemini(noDollar);
   ok("gemini inlines the zod-v3 root $ref", r.schema.type === "object" && !!r.schema.properties);
   ok("gemini output has no $ref left", JSON.stringify(r.schema).indexOf("$ref") === -1);
   var rec = E.toGemini({
