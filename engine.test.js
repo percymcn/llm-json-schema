@@ -8117,5 +8117,89 @@ function fanoutSchema(depth, cyclic) {
      JSON.stringify(once) === JSON.stringify(twice));
 })();
 
+// ---------------------------------------------------------------------------
+// #382 -- a PROVIDER NAME is a caller-supplied string too.
+//
+// #380 fixed every membership read whose key comes from the caller's DOCUMENT,
+// #381 the matching writes. Neither asked about the third source of untrusted
+// strings: the ARGUMENT on the public API boundary. `CONVERTERS[provider]` is a
+// plain lookup, so eight prototype names resolved to inherited functions, the
+// `if (!conv)` guard passed, and `convert()` threw a TypeError in five distinct
+// ways instead of returning the `{ok:false, error:"Unknown provider: ..."}` it
+// documents.
+//
+// The assertions below deliberately require BOTH halves: the documented shape
+// (ok === false AND the exact message prefix) and, separately, that every real
+// provider still converts -- without that second half the "fix" could simply be
+// "reject everything", which would pass every assertion above it.
+(function () {
+  var PROTO_NAMES = ["toString", "constructor", "valueOf", "hasOwnProperty",
+                     "__proto__", "isPrototypeOf", "propertyIsEnumerable",
+                     "toLocaleString"];
+  var DOC = { type: "object", properties: { a: { type: "string" } },
+              required: ["a"], additionalProperties: false };
+
+  function tryConvert(provider) {
+    // Guarded: the whole point is that the pre-fix engine THROWS here, and a
+    // throw that escapes aborts the rest of this file -- #322's trap, which has
+    // now bitten five cycles. Catching it turns "crashes" into a reported
+    // failure so a reverted run still prints a number.
+    try {
+      var r = E.convert(JSON.parse(JSON.stringify(DOC)), provider);
+      return { threw: false, r: r };
+    } catch (e) {
+      return { threw: true, message: String(e && e.message) };
+    }
+  }
+
+  PROTO_NAMES.forEach(function (name) {
+    var got = tryConvert(name);
+    ok("#382 provider `" + name + "` returns the documented error, does not throw",
+       !got.threw && got.r && got.r.ok === false &&
+       got.r.error.indexOf("Unknown provider: " + name) === 0,
+       got.threw ? "threw: " + got.message : JSON.stringify(got.r && got.r.error));
+  });
+
+  // The control, and it is what makes the eight rows above a statement about
+  // the prototype chain rather than about unknown names in general: an ordinary
+  // unknown name took the correct path even before the fix.
+  var ctrl = tryConvert("frobnicate");
+  ok("#382 CONTROL: an ordinary unknown provider still returns the same error",
+     !ctrl.threw && ctrl.r.ok === false &&
+     ctrl.r.error.indexOf("Unknown provider: frobnicate") === 0);
+
+  // Non-string arguments reach the same lookup and must not throw either.
+  [null, undefined, 123].forEach(function (v) {
+    var got = tryConvert(v);
+    ok("#382 provider `" + String(v) + "` returns an error rather than throwing",
+       !got.threw && got.r && got.r.ok === false &&
+       got.r.error.indexOf("Unknown provider:") === 0,
+       got.threw ? "threw: " + got.message : "");
+  });
+
+  // OVER-BLOCK GUARD. Without this the fix could be "reject every provider".
+  var REAL = ["openai", "openai-nonstrict", "openai-realtime", "anthropic",
+              "anthropic-json", "anthropic-json-python", "anthropic-go",
+              "gemini", "gemini-json", "gemini-client"];
+  var allOk = true, firstBad = "";
+  REAL.forEach(function (p) {
+    var got = tryConvert(p);
+    if (got.threw || !got.r || got.r.ok !== true) {
+      allOk = false;
+      if (!firstBad) firstBad = p + " -> " + (got.threw ? got.message : JSON.stringify(got.r && got.r.error));
+    }
+  });
+  ok("#382 all ten real providers still convert (fix is not 'reject everything')",
+     allOk, firstBad);
+
+  // The five `DOCS[provider]` reads inside convert() sit BEHIND the gate, so a
+  // provider that gets past it is an own key of the registry. Pinned because a
+  // later cycle moving the gate would silently re-open all five.
+  ok("#382 every registry key that converts also has an own DOCS entry",
+     REAL.every(function (p) {
+       return Object.prototype.hasOwnProperty.call(E.DOCS, p);
+     }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

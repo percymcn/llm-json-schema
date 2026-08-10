@@ -6175,6 +6175,36 @@
     } else {
       return { ok: false, error: "Expected a JSON string or an object, got " + (input === null ? "null" : typeof input) };
     }
+    // `hasOwn`, not a plain lookup. #380 fixed every membership read whose key
+    // comes from the caller's DOCUMENT and #381 the matching writes; neither
+    // asked about the third source of untrusted strings, which is the one on
+    // the PUBLIC API BOUNDARY -- this argument. `CONVERTERS["toString"]` is a
+    // truthy inherited function, so the guard below passed and `conv(schema)`
+    // then failed somewhere downstream: measured, eight prototype names threw a
+    // TypeError in five distinct ways (`__proto__` -> "conv is not a function",
+    // `toString`/`constructor` -> reading 'slice' of undefined, `valueOf` /
+    // `hasOwnProperty` / `isPrototypeOf` / `propertyIsEnumerable` -> "Cannot
+    // convert undefined or null to object", `toLocaleString` -> "called on null
+    // or undefined"), with `frobnicate` returning cleanly as the control.
+    //
+    // That is a DOCUMENTED CONTRACT being false: `convert` promises
+    // `{ok:false, error:"Unknown provider: ..."}` for a name it does not know,
+    // and a library caller wrapping this in a service got an uncaught throw --
+    // a 500 where the contract says 400 -- for exactly the strings that arrive
+    // from a query parameter or a config file.
+    //
+    // The CLI cannot reach it: `cli.js` validates against an ARRAY
+    // (`PROVIDERS.indexOf`), which has no prototype hole. Two implementations of
+    // one rule disagreeing about one input (#372) -- fixed here rather than by
+    // giving the engine a copy of the array, because the object IS the registry
+    // and a second list would be free to drift from it.
+    //
+    // This gate also covers the five `DOCS[provider]` reads below: past it,
+    // `provider` is an own key of the registry, so none of them can pick up an
+    // inherited function either.
+    if (!hasOwn(CONVERTERS, provider)) {
+      return { ok: false, error: "Unknown provider: " + provider };
+    }
     var conv = CONVERTERS[provider];
     if (!conv) return { ok: false, error: "Unknown provider: " + provider };
 

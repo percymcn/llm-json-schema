@@ -1688,5 +1688,34 @@ function fanout(depth) {
      gem.stdout.indexOf("toString") === -1);
 })();
 
+// ---------------------------------------------------------------------------
+// #382 -- the CLI half of the same rule.
+//
+// The CLI validates `--to` against an ARRAY (`PROVIDERS.indexOf`), which has no
+// prototype hole, so it was already correct while the engine's object lookup
+// was not: two implementations of one rule disagreeing about one input (#372).
+// The engine is now the one that must not drift, but pinning the CLI matters
+// too -- if someone "simplifies" it into a lookup on the same registry object,
+// this is the test that fails.
+(function () {
+  var SIMPLE = JSON.stringify({
+    type: "object", properties: { a: { type: "string" } },
+    required: ["a"], additionalProperties: false
+  });
+  ["toString", "constructor", "__proto__", "valueOf", "frobnicate"].forEach(function (name) {
+    var r = run(["--to", name, "--check", "-"], SIMPLE);
+    ok("#382 CLI: --to " + name + " is rejected cleanly (exit 2, no stack trace)",
+       r.status === 2 &&
+       r.stderr.indexOf("Unknown provider") !== -1 &&
+       r.stderr.indexOf("TypeError") === -1,
+       "status=" + r.status + " stderr=" + String(r.stderr).slice(0, 120));
+  });
+
+  // Over-block guard for the CLI too: a real provider must still pass.
+  var good = run(["--to", "openai", "--check", "-"], SIMPLE);
+  ok("#382 CLI: a real provider is unaffected", good.status === 0,
+     "status=" + good.status);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

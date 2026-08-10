@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1301 engine + 275 CLI + 44 ESM/library assertions = **1620** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1315 engine + 281 CLI + 44 ESM/library assertions = **1640** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -789,7 +789,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1620 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1640 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1611,3 +1611,32 @@ copied and its pointers dangled.
 
 ## License
 MIT.
+
+### A provider name is a caller-supplied string too
+
+`convert(doc, provider)` documents one contract for a name it does not know:
+`{ok: false, error: "Unknown provider: …"}`. For eight strings that contract was
+false — it threw a `TypeError` instead, in five distinct ways:
+
+| provider argument | before | after |
+|---|---|---|
+| `frobnicate` (control) | `{ok:false, "Unknown provider: frobnicate"}` | unchanged |
+| `toString`, `constructor` | **throws** `Cannot read properties of undefined (reading 'slice')` | `{ok:false, …}` |
+| `valueOf`, `hasOwnProperty`, `isPrototypeOf`, `propertyIsEnumerable` | **throws** `Cannot convert undefined or null to object` | `{ok:false, …}` |
+| `__proto__` | **throws** `conv is not a function` | `{ok:false, …}` |
+| `toLocaleString` | **throws** `called on null or undefined` | `{ok:false, …}` |
+
+`CONVERTERS[provider]` is a plain object lookup, so those names resolve to
+inherited functions from `Object.prototype`, the `if (!conv)` guard sees a truthy
+value and lets them through, and the failure lands somewhere downstream.
+
+**The CLI never had this hole** — it validates `--to` against an *array*
+(`PROVIDERS.indexOf`), and an array has no prototype chain to fall through. Two
+implementations of one rule, disagreeing about one input; the object one was
+wrong. The fix is `hasOwn(CONVERTERS, provider)` at the gate, which also covers
+the five `DOCS[provider]` reads behind it.
+
+Reachability is honest and narrow: the CLI cannot produce it, so this is the
+**library** surface — a service doing `convert(doc, req.query.provider)` got an
+uncaught throw (a 500) where the documented contract says a clean rejection (a
+400), for exactly the strings that arrive from query parameters and config files.
