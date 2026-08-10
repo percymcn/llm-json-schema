@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1085 engine + 258 CLI + 42 ESM/library assertions = **1385** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1105 engine + 258 CLI + 42 ESM/library assertions = **1405** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -28,6 +28,41 @@ npx github:percymcn/llm-json-schema --to openai --check schema.json
 ```
 
 The fixed schema goes to **stdout**; the explanation ledger goes to **stderr**, so redirection stays clean.
+
+
+### A `$ref` beside constraining siblings is an intersection
+
+`{ "properties": {"a": …}, "required": ["a"], "$ref": "#/$defs/Base" }` does not
+mean "Base, decorated". In draft 2020-12 the referent **and** the siblings both
+apply, so it means "declares an `a` **and** satisfies Base" — the same
+intersection `allOf` spells differently. We implemented it as an *overwrite*,
+so the referent's `properties` and `required` were silently discarded.
+
+Measured on one nested shape whose raw accept set requires both `a` and `b`,
+across all ten targets: three forwarded it untouched and were right; six emitted
+a schema where `b` was no longer typed or required; `gemini-json` dropped the
+node's own `a` instead. Three different wrong answers, none of them either
+dialect's reading, all at zero blockers. All ten now preserve the accept set
+exactly, and a required name that a closed side forbids is a **blocker** —
+there is no repair, so the remodelling is named instead.
+
+The same blindness made the `allOf` spelling fail the gate: a `$ref` *member*
+declares no `properties` of its own, so the mergeability test could not look
+through it and blocked. `{properties: {...}, allOf: [{$ref: Base}]}` and
+`{allOf: [{$ref: Base}, {...}]}` — the standard "extend a base schema" idiom —
+are **accepted** by `toStrictJsonSchema()` with the merged property set, and we
+failed CI on them. `$ref` members are now resolved before the merge, but only
+where the node itself constrains: a bare `{allOf: [{$ref}]}` and the Pydantic v1
+`{description, allOf: [{$ref}]}` still come out as a `$ref` beside annotations,
+which is the form the vendor accepts.
+
+Reachability, stated at its true strength: neither pydantic 2.13.4, pydantic
+1.10.22, zod 3 + `zod-to-json-schema@3.24.5` nor zod 4 emits a constraining
+`$ref` sibling — pydantic renders a described reference as `{$ref, description}`
+(annotations only) and zod inlines. So the population is the same hand-authored
+/ OpenAPI-composition one where closing a schema and composing it are both
+ordinary. The reason to fix it anyway is that the failure is a silent
+accept-set change in a CI gate.
 
 ### Why a CLI
 
@@ -662,7 +697,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1385 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1405 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

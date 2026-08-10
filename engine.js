@@ -1368,13 +1368,128 @@
   // why the failure looks maddeningly input-dependent.
   // Fix: inline the referenced definition at the use site and let the siblings
   // win. Bare `$ref`s (no siblings) are left alone — those are legal.
-  function resolveRefSiblings(s, ledger, docUrl, whyFixed, whyRecursive) {
-    if (!isPlainObject(s.$defs)) return s;
-    var defs = s.$defs, fixed = 0, unresolved = [];
+  // A `$ref` beside CONSTRAINING siblings is an INTERSECTION, not a decoration
+  // on the referent. #370 established that for `allOf`; this is the same
+  // operation in its other spelling — draft 2020-12 applies the referent AND the
+  // siblings, so `{properties:{a}, required:["a"], $ref:T}` means "an `a` AND
+  // whatever T requires". We implemented it as an OVERWRITE (`target[k] =
+  // node[k]`), i.e. #349's parent-wins bug living in the function next door: a
+  // node that declared `properties` silently DISCARDED the referent's entire
+  // `properties` and `required`, at zero blockers.
+  //
+  // Measured on one nested shape whose raw accept set is `0001` (an object must
+  // carry both `a` and `b`), across all ten targets: three pass it through
+  // untouched and are correct; SIX emitted `0101` or `0100` — `b` no longer
+  // typed, no longer required — and `gemini-json` emitted `0011`, dropping the
+  // node's OWN `a` instead. Three different wrong answers, none of them either
+  // dialect's reading (draft-07 IGNORES `$ref` siblings, so it means only the
+  // referent; 2020-12 intersects, so it means both), and every one of them
+  // silent.
+  //
+  // So merge, and apply #370's closed-branch restriction: a branch declaring
+  // `additionalProperties: false` forbids every property it does not itself
+  // declare, so the merged property set is the union RESTRICTED to every closed
+  // branch's own declarations, and a required name outside that intersection
+  // makes the schema unsatisfiable — no repair exists, so name it (#329).
+  function intersectRef(target, node, siblings, path, ledger, docUrl) {
+    var closedSets = [];
+    [target, node].forEach(function (b) {
+      if (isPlainObject(b) && b.additionalProperties === false) {
+        closedSets.push(Object.keys(isPlainObject(b.properties) ? b.properties : {}));
+      }
+    });
+    var allowed = null;
+    if (closedSets.length) {
+      allowed = closedSets[0].slice();
+      closedSets.slice(1).forEach(function (st) {
+        allowed = allowed.filter(function (k) { return st.indexOf(k) !== -1; });
+      });
+    }
+    var isAllowed = function (k) { return allowed === null || allowed.indexOf(k) !== -1; };
 
-    function visit(node, stack) {
-      if (Array.isArray(node)) return node.map(function (n) { return visit(n, stack); });
+    var req = [];
+    [target, node].forEach(function (b) {
+      (Array.isArray(b && b.required) ? b.required : []).forEach(function (k) {
+        if (req.indexOf(k) === -1) req.push(k);
+      });
+    });
+    var excluded = req.filter(function (k) { return !isAllowed(k); });
+    if (excluded.length) {
+      ledger.push(entry("!", path,
+        "This `$ref` and its siblings cannot both be satisfied. A `$ref` beside constraining " +
+        "siblings is an INTERSECTION — draft 2020-12 applies the referenced schema AND the " +
+        "siblings — and one side declares `additionalProperties: false`, which forbids every " +
+        "property it does not itself declare. The properties allowed by both together are [" +
+        (allowed && allowed.length ? "`" + allowed.join("`, `") + "`" : "none") + "], while `" +
+        excluded.join("`, `") + "` " + (excluded.length > 1 ? "are" : "is") + " required, so no " +
+        "object can satisfy this node. We will not merge it for you: taking the union would " +
+        "silently ADMIT " + (excluded.length > 1 ? "properties" : "a property") + " the schema " +
+        "forbids. Either drop `additionalProperties: false` from the closed side, or declare `" +
+        excluded.join("`, `") + "` there too.",
+        docUrl || DOCS.openai));
+      return null;
+    }
+
+    // Same property declared on both sides with DIFFERENT subschemas: the true
+    // meaning is the intersection of the two, which strict mode cannot express,
+    // and picking either side would silently change what is accepted (#347).
+    var tProps = isPlainObject(target.properties) ? target.properties : null;
+    var nProps = isPlainObject(node.properties) ? node.properties : null;
+    if (tProps && nProps) {
+      var clash = null;
+      Object.keys(nProps).forEach(function (k) {
+        if (clash === null && k in tProps && canonical(tProps[k]) !== canonical(nProps[k])) clash = k;
+      });
+      if (clash !== null) {
+        ledger.push(entry("!", path,
+          "This node and the schema its `$ref` points at both declare a property `" + clash +
+          "`, with different shapes. A `$ref` beside constraining siblings is an INTERSECTION, so " +
+          "the real meaning is \"satisfies BOTH\" — which strict mode cannot express, and picking " +
+          "either side would silently change what this schema accepts. Declare `" + clash +
+          "` once, with the shape you actually mean.",
+          docUrl || DOCS.openai));
+        return null;
+      }
+    }
+
+    var out = clone(target);
+    if (nProps) {
+      if (!isPlainObject(out.properties)) out.properties = {};
+      Object.keys(nProps).forEach(function (k) {
+        if (!(k in out.properties)) out.properties[k] = clone(nProps[k]);
+      });
+    }
+    if (req.length) out.required = req.slice();
+    siblings.forEach(function (k) {
+      if (k === "properties" || k === "required") return;
+      out[k] = clone(node[k]);
+    });
+
+    // Lossless by construction: every name removed here is one a closed side
+    // already forbade, so no instance that was legal before becomes illegal.
+    // Reported rather than silent — a property vanishing is exactly the edit a
+    // reader must see (#318).
+    var dropped = [];
+    if (allowed !== null && isPlainObject(out.properties)) {
+      Object.keys(out.properties).forEach(function (k) { if (!isAllowed(k)) dropped.push(k); });
+      dropped.forEach(function (k) { delete out.properties[k]; });
+      if (Array.isArray(out.required)) {
+        out.required = out.required.filter(isAllowed);
+      }
+    }
+    return { schema: out, dropped: dropped };
+  }
+
+  function resolveRefSiblings(s, ledger, docUrl, whyFixed, whyRecursive, blockedOut) {
+    if (!isPlainObject(s.$defs)) return s;
+    var defs = s.$defs, fixed = 0, unresolved = [], blocked = 0, droppedNames = [];
+
+    function visit(node, stack, path) {
+      if (Array.isArray(node)) {
+        return node.map(function (n, i) { return visit(n, stack, path + "[" + i + "]"); });
+      }
       if (!isPlainObject(node)) return node;
+      var blockedHere = false;
 
       // `$defs` is the definition bag, not a constraining sibling: `{$ref, $defs}`
       // is the canonical root-ref shape every generator emits, and counting it
@@ -1391,19 +1506,39 @@
         if (stack.indexOf(name) !== -1) {
           if (unresolved.indexOf(name) === -1) unresolved.push(name);
         } else {
-          var target = visit(clone(defs[name]), stack.concat([name]));
-          siblings.forEach(function (k) { target[k] = visit(node[k], stack); });
-          fixed++;
-          return target;
+          var target = visit(clone(defs[name]), stack.concat([name]), path);
+          var visited = {};
+          siblings.forEach(function (k) { visited[k] = visit(node[k], stack, path); });
+          var merged = intersectRef(target, visited, siblings, path, ledger, docUrl);
+          if (merged) {
+            fixed++;
+            merged.dropped.forEach(function (k) {
+              if (droppedNames.indexOf(k) === -1) droppedNames.push(k);
+            });
+            return merged.schema;
+          }
+          // Blocked: leave the shape exactly as written so the reader can see
+          // what to remodel (#318). Nothing is silently repaired. Record the
+          // node's structural identity so the exit-side `$ref`-sibling blocker
+          // does not report the SAME node a second time with a remedy that does
+          // not apply here (#359: when two rules can reach one node, the
+          // boundary between them is part of the design).
+          blocked++;
+          blockedHere = true;
         }
       }
 
       var out = {};
-      Object.keys(node).forEach(function (k) { out[k] = visit(node[k], stack); });
+      Object.keys(node).forEach(function (k) { out[k] = visit(node[k], stack, path + "/" + k); });
+      // Track the object we hand back BY IDENTITY, not by a snapshot: the rest
+      // of the pipeline mutates this node (it gains `additionalProperties`, its
+      // `required` is rewritten), so a structural fingerprint taken here would
+      // no longer match by the time the exit-side check runs.
+      if (blockedHere && Array.isArray(blockedOut)) blockedOut.push(out);
       return out;
     }
 
-    var result = visit(s, []);
+    var result = visit(s, [], "root");
     // once refs are inlined the definitions they pointed at may be orphaned;
     // dead `$defs` still count against OpenAI's 5000-property budget.
     // This decides what to KEEP by looking for references, so per #320 it must
@@ -1451,7 +1586,21 @@
       ledger.push(entry("~", "root",
         "Inlined " + fixed + " `$ref` that carried sibling keywords — " + (whyFixed ||
           "OpenAI rejects those with \"$ref cannot have keywords\"." ) +
-        " Pydantic emits this for a nested-model or Enum field that also has a `description`.",
+        " Pydantic emits this for a nested-model or Enum field that also has a `description`. " +
+        "Where the siblings constrain (`properties`/`required`), this is a MERGE, not an " +
+        "overwrite: a `$ref` beside constraining siblings is an intersection, so the referent's " +
+        "declarations are kept alongside the node's own.",
+        docUrl || DOCS.openai));
+    }
+    if (droppedNames.length) {
+      ledger.push(entry("~", "root",
+        "Dropped `" + droppedNames.join("`, `") + "` while merging a `$ref` with its siblings: one " +
+        "side declares `additionalProperties: false` without declaring " +
+        (droppedNames.length > 1 ? "them" : "it") + ", so no object could ever have carried " +
+        (droppedNames.length > 1 ? "them" : "it") + " and keeping " +
+        (droppedNames.length > 1 ? "them" : "it") + " would WIDEN what this schema accepts. If you " +
+        "meant " + (droppedNames.length > 1 ? "these" : "this") + " to be usable, declare " +
+        (droppedNames.length > 1 ? "them" : "it") + " on the closed side too.",
         docUrl || DOCS.openai));
     }
     unresolved.forEach(function (name) {
@@ -1824,7 +1973,8 @@
     s = normalizeRefSpelling(s, ledger);
     s = normalizeDefs(s, ledger);
     s = inlineRootRef(s, ledger);
-    s = resolveRefSiblings(s, ledger);
+    var refIntersectBlocked = [];
+    s = resolveRefSiblings(s, ledger, undefined, undefined, undefined, refIntersectBlocked);
 
     // These two entry-side blockers are kept for their PROVENANCE: they can say
     // "you wrote this", and the union one names the spelling the caller actually
@@ -1891,6 +2041,55 @@
       // gone, reported as a successful fix. Silent widening, again.
       var allOfBlocked = false;
       if (Array.isArray(node.allOf) && node.allOf.length) {
+        // A `$ref` MEMBER is a branch of the intersection, not an opaque token —
+        // and we treated it as opaque, so the mergeability test (which demands
+        // `type: "object"` and `properties` on every member) saw a member with
+        // neither and BLOCKED. Measured on openai@7.4.0: the standard OpenAPI
+        // "extend this base schema" idiom — `{properties:{a},required:["a"],
+        // allOf:[{$ref:Base}]}` and `{allOf:[{$ref:Base},{...}]}` — is ACCEPTED
+        // by the vendor with the merged property set and its accept set
+        // PRESERVED EXACTLY, and we failed the gate on it. That is the
+        // over-strictness class this project has now shipped ~10 times.
+        //
+        // Resolve first, then let the existing intersection merge decide. The
+        // guards are what keep every currently-passing shape byte-identical:
+        //   * only when the node itself constrains, or there are 2+ members —
+        //     so `{allOf:[{$ref}]}` and the Pydantic v1 `{description,
+        //     allOf:[{$ref}]}` still come out as a `$ref` beside annotations,
+        //     the form the vendor accepts and #349 pinned;
+        //   * only for OBJECT referents — a `$ref` to a scalar is a shape the
+        //     vendor throws on, and resolving it would route an unsatisfiable
+        //     node through a merge that reports success;
+        //   * fail closed on anything unresolvable, chained or recursive, so a
+        //     dangling pointer still reaches the blocker that owns it (#320).
+        var refMemberNeedsMerge =
+          isPlainObject(node.properties) || Array.isArray(node.required) || node.allOf.length > 1;
+        var refMembersResolved = 0;
+        if (refMemberNeedsMerge) {
+          node.allOf = node.allOf.map(function (m) {
+            if (!isPlainObject(m) || typeof m.$ref !== "string") return m;
+            var extra = Object.keys(m).filter(function (k) { return k !== "$ref"; });
+            if (!extra.every(function (k) { return OPENAI_ANNOTATION_KEYWORDS[k]; })) return m;
+            var tgt = resolveLocalDef(s, m.$ref);
+            if (!tgt || typeof tgt.$ref === "string") return m;
+            if (!(tgt.type === "object" || isPlainObject(tgt.properties))) return m;
+            if (JSON.stringify(tgt).indexOf(m.$ref) !== -1) return m; // recursive
+            var res = clone(tgt);
+            extra.forEach(function (k) { if (!(k in res)) res[k] = clone(m[k]); });
+            refMembersResolved++;
+            return res;
+          });
+        }
+        if (refMembersResolved) {
+          ledger.push(entry("~", path,
+            "Resolved " + refMembersResolved + " `$ref` member" + (refMembersResolved === 1 ? "" : "s") +
+            " of this `allOf` into the schema " + (refMembersResolved === 1 ? "it points" : "they point") +
+            " at, so the merge below can see what " + (refMembersResolved === 1 ? "it declares" : "they declare") +
+            ". This is the standard \"extend a base schema\" shape; OpenAI's transformer merges it " +
+            "and we used to fail the gate on it, because a `$ref` member declares no `properties` " +
+            "of its own and the mergeability test could not look through it.",
+            DOCS.openai));
+        }
         var members = node.allOf;
 
         // An `allOf` is an INTERSECTION, and a branch that declares
@@ -2533,6 +2732,11 @@
     // `toStrictJsonSchema()` actually throws.
     walk(s, "root", function (node, path) {
       if (typeof node.$ref !== "string") return;
+      // Already owned by the intersection rule, which refused to merge this
+      // exact node and said why. Reporting it again here would add a remedy
+      // ("write the `$ref` WITHOUT the `allOf` wrapper") that is wrong for a
+      // caller who never wrote a wrapper.
+      if (refIntersectBlocked.indexOf(node) !== -1) return;
       var bad = Object.keys(node).filter(function (k) {
         return k !== "$ref" && !toleratedRefSibling(k, path === "root", node);
       });
@@ -4087,10 +4291,12 @@
     });
     if (!Object.keys(defs).length) return s;
 
-    var inlined = 0, recursive = [];
+    var inlined = 0, recursive = [], geminiDropped = [];
 
-    function resolve(node, stack) {
-      if (Array.isArray(node)) return node.map(function (n) { return resolve(n, stack); });
+    function resolve(node, stack, path) {
+      if (Array.isArray(node)) {
+        return node.map(function (n, i) { return resolve(n, stack, path + "[" + i + "]"); });
+      }
       if (!isPlainObject(node)) return node;
 
       var ref = typeof node.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref) : null;
@@ -4100,22 +4306,45 @@
           if (recursive.indexOf(name) === -1) recursive.push(name);
           return node; // leave it; a blocker is reported below
         }
-        var target = resolve(clone(defs[name]), stack.concat([name]));
-        // siblings alongside `$ref` win over the definition's own keys
-        Object.keys(node).forEach(function (k) { if (k !== "$ref") target[k] = resolve(node[k], stack); });
+        var target = resolve(clone(defs[name]), stack.concat([name]), path);
+        // Siblings alongside `$ref` used to WIN over the definition's own keys,
+        // which for `properties`/`required` is a deletion rather than a
+        // precedence rule: a `$ref` beside constraining siblings is an
+        // INTERSECTION (the same operation `allOf` spells differently, #370), so
+        // the referent's declarations have to survive. Measured before the fix:
+        // a nested `{properties:{a},required:["a"],$ref:T}` whose raw accept set
+        // requires BOTH `a` and `b` came out of `--to gemini` accepting objects
+        // with no `b` at all — silently, at zero blockers, with the ledger
+        // saying only "Inlined 1 `$ref` reference".
+        var sibs = Object.keys(node).filter(function (k) { return k !== "$ref"; });
+        var visited = {};
+        sibs.forEach(function (k) { visited[k] = resolve(node[k], stack, path); });
+        var merged = intersectRef(target, visited, sibs, path, ledger, docUrl || DOCS.gemini);
+        if (!merged) return node; // blocked: leave the shape visible (#318)
+        merged.dropped.forEach(function (k) {
+          if (geminiDropped.indexOf(k) === -1) geminiDropped.push(k);
+        });
         inlined++;
-        return target;
+        return merged.schema;
       }
 
       var out = {};
-      Object.keys(node).forEach(function (k) { out[k] = resolve(node[k], stack); });
+      Object.keys(node).forEach(function (k) { out[k] = resolve(node[k], stack, path + "/" + k); });
       return out;
     }
 
-    var result = resolve(s, []);
+    var result = resolve(s, [], "root");
     delete result.$defs;
     delete result.definitions;
 
+    if (geminiDropped.length) {
+      ledger.push(entry("~", "root",
+        "Dropped `" + geminiDropped.join("`, `") + "` while inlining a `$ref` with constraining " +
+        "siblings: one side declares `additionalProperties: false` without declaring " +
+        (geminiDropped.length > 1 ? "them" : "it") + ", so no object could ever have carried " +
+        (geminiDropped.length > 1 ? "them" : "it") + ".",
+        docUrl || DOCS.gemini));
+    }
     if (inlined) {
       ledger.push(entry("~", "root",
         "Inlined " + inlined + " `$ref` reference" + (inlined === 1 ? "" : "s") +
@@ -4621,6 +4850,38 @@
         // "If $ref is set on a sub-schema, no other properties, except for
         //  than those starting as a `$`, may be set."
         if (typeof node.$ref === "string") {
+          // The vendor forbids the combination, so a `$ref` carrying
+          // CONSTRAINING siblings has exactly two outcomes: inline that one node
+          // and keep what it means, or delete the siblings and lose it. We used
+          // to always delete — reported, so not silent, but still a constraint
+          // loss where a lossless repair exists, and the removal note itself
+          // said "Inline the definition if you need it". Inline it instead, as
+          // an INTERSECTION (#370) rather than letting either side win, so this
+          // path now agrees with the other nine targets about what the same
+          // document means. Annotations, unresolvable pointers and recursive
+          // definitions still take the delete path: there is no inline for a
+          // recursive `$ref`, and this path's whole value is that it keeps
+          // `$ref`/`$defs` and recursion elsewhere.
+          var refTgt = resolveLocalDef(s, node.$ref);
+          var constrains = isPlainObject(node.properties) || Array.isArray(node.required);
+          var selfRef = refTgt && JSON.stringify(refTgt).indexOf(node.$ref) !== -1;
+          if (refTgt && constrains && !selfRef) {
+            var gSibs = Object.keys(node).filter(function (k) { return k !== "$ref"; });
+            var gView = {};
+            gSibs.forEach(function (k) { gView[k] = node[k]; });
+            var gMerged = intersectRef(clone(refTgt), gView, gSibs, path, ledger, DOCS.gemini);
+            if (gMerged) {
+              Object.keys(node).forEach(function (k) { delete node[k]; });
+              Object.keys(gMerged.schema).forEach(function (k) { node[k] = gMerged.schema[k]; });
+              ledger.push(entry("~", path,
+                "Inlined this `$ref` and merged it with its siblings — on the `responseJsonSchema` " +
+                "path a `$ref` sub-schema may carry no properties except ones starting with `$`, " +
+                "and these siblings constrain, so deleting them would drop what the node means. " +
+                "A `$ref` beside constraining siblings is an intersection, so both sides are kept.",
+                DOCS.gemini));
+              return;
+            }
+          }
           Object.keys(node).forEach(function (k) {
             if (k.charAt(0) !== "$") {
               ledger.push(entry("x", path,

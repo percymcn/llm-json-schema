@@ -6639,5 +6639,169 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- #371: a `$ref` beside constraining siblings is an INTERSECTION ---------
+// Same operation `allOf` spells differently (#370). We implemented it as an
+// OVERWRITE, so the referent's `properties`/`required` were discarded — a
+// silent accept-set change at zero blockers, on NINE of ten targets, in three
+// different directions. Nothing in 1085 assertions had ever pinned what this
+// shape merges to, which is why it survived.
+(function () {
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function led(r) { return (r && r.ledger) || []; }
+  function blk(r) {
+    return led(r).filter(function (l) { return l.op === "!" && !l.advisory; }).length;
+  }
+  function pnode(r) {
+    var s = r && r.schema;
+    return (s && s.properties && s.properties.p) || null;
+  }
+  function pprops(r) {
+    var n = pnode(r);
+    return n && n.properties ? Object.keys(n.properties).sort().join(",") : "(none)";
+  }
+  function preq(r) {
+    var n = pnode(r);
+    return n && Array.isArray(n.required) ? n.required.slice().sort().join(",") : "(none)";
+  }
+  function doc(inner, T) {
+    return { type: "object", properties: { p: clone(inner) }, required: ["p"],
+             additionalProperties: false, $defs: { T: clone(T) } };
+  }
+  function conv(inner, T, target) {
+    try { return E.convert(doc(inner, T), target); } catch (e) { return { ok: false, ledger: [] }; }
+  }
+
+  var T_OPEN   = { type: "object", properties: { b: { type: "string" } }, required: ["b"] };
+  var T_CLOSED = { type: "object", properties: { b: { type: "string" } }, required: ["b"],
+                   additionalProperties: false };
+  var T_SCALAR = { type: "string", minLength: 2 };
+
+  var SIBLING   = { properties: { a: { type: "string" } }, required: ["a"], $ref: "#/$defs/T" };
+  var ALLOFWRAP = { type: "object", properties: { a: { type: "string" } }, required: ["a"],
+                    allOf: [{ $ref: "#/$defs/T" }] };
+  var ALLOFTWO  = { allOf: [{ $ref: "#/$defs/T" },
+                            { type: "object", properties: { a: { type: "string" } }, required: ["a"] }] };
+
+  // The referent's `b` used to vanish. Verified against openai@7.4.0: the
+  // vendor's own merged output carries BOTH names with a union `required`.
+  var oa = conv(SIBLING, T_OPEN, "openai");
+  ok("#371 a constraining `$ref` sibling MERGES rather than overwrites",
+    pprops(oa) === "a,b" && preq(oa) === "a,b" && blk(oa) === 0);
+  ok("#371 the merge is reported as a merge, not a bare inline",
+    has(led(oa), "this is a MERGE, not an overwrite"));
+
+  // The finding is that the ten targets DISAGREED about one document. Every
+  // target that rewrites this shape must now reach the same property set.
+  var REWRITERS = ["openai", "anthropic-json", "anthropic-json-python", "anthropic-go",
+                   "gemini", "gemini-json", "gemini-client"];
+  ok("#371 every rewriting target agrees on the merged property set",
+    REWRITERS.every(function (t) {
+      var r = conv(SIBLING, T_OPEN, t);
+      return blk(r) === 0 && pprops(r) === "a,b" && preq(r) === "a,b";
+    }));
+  // The three that pass the document through untouched were already correct —
+  // 2020-12 intersects, so leaving it alone preserves the meaning. Pinning them
+  // is what stops a later cycle "fixing" a target that has nothing to fix.
+  ok("#371 scope pin: the verbatim targets still forward the `$ref` untouched",
+    ["anthropic", "openai-nonstrict", "openai-realtime"].every(function (t) {
+      var n = pnode(conv(SIBLING, T_OPEN, t));
+      return n && n.$ref === "#/$defs/T";
+    }));
+
+  // DISCRIMINATOR. Two inputs identical but for whether the REFERENT is closed.
+  // Without this pair the rule could be firing on any `$ref` sibling at all and
+  // every other assertion here would still pass (#364/#366's pattern).
+  var closedR = conv(SIBLING, T_CLOSED, "openai");
+  ok("#371 DISCRIMINATOR: identical shapes, open vs closed referent, disagree",
+    blk(oa) === 0 && blk(closedR) === 1);
+  ok("#371 a closed referent makes the node unsatisfiable -> blocker, no merge",
+    has(led(closedR), "cannot both be satisfied"));
+  // Exactly ONE blocker: the generic `$ref`-sibling rule reaches the same node
+  // and its remedy ("write the `$ref` WITHOUT the `allOf` wrapper") is wrong for
+  // a caller who never wrote a wrapper (#359).
+  ok("#371 the same node is not reported twice",
+    blk(closedR) === 1 && !has(led(closedR), "sits beside"));
+
+  // A property declared on both sides with different shapes: the true meaning
+  // is the intersection of the two, which strict mode cannot express.
+  var clashR = conv({ properties: { b: { type: "integer" } }, required: ["b"], $ref: "#/$defs/T" },
+                    T_OPEN, "openai");
+  ok("#371 a clashing property is a blocker, not a silent pick",
+    blk(clashR) === 1 && has(led(clashR), "both declare a property"));
+  // ...and an IDENTICAL re-declaration is not a clash. The test is conflict,
+  // not duplication (#349).
+  var dupR = conv({ properties: { b: { type: "string" } }, required: ["b"], $ref: "#/$defs/T" },
+                  T_OPEN, "openai");
+  ok("#371 over-block guard: an identical re-declaration is not a clash",
+    blk(dupR) === 0 && pprops(dupR) === "b");
+
+  // --- the `allOf` spelling of the same intersection ------------------------
+  // openai@7.4.0 ACCEPTS this and preserves the accept set exactly; we failed
+  // the gate on it, which is the over-strictness class this project has shipped
+  // ~10 times.
+  var w = conv(ALLOFWRAP, T_OPEN, "openai");
+  ok("#371 `allOf:[{$ref}]` beside own properties merges instead of blocking",
+    blk(w) === 0 && pprops(w) === "a,b" && preq(w) === "a,b");
+  ok("#371 the resolution of a `$ref` member is reported",
+    has(led(w), "Resolved 1 `$ref` member"));
+  var two = conv(ALLOFTWO, T_OPEN, "openai");
+  ok("#371 `allOf:[{$ref},{object}]` merges instead of blocking",
+    blk(two) === 0 && pprops(two) === "a,b" && preq(two) === "a,b");
+  ok("#371 a closed referent still blocks in the `allOf` spelling",
+    blk(conv(ALLOFWRAP, T_CLOSED, "openai")) === 1);
+
+  // Over-block guards. Each of these is a shape the vendor ACCEPTS as written,
+  // and resolving the `$ref` would expand the document for no benefit or route
+  // an unsatisfiable node through a merge that reports success.
+  ok("#371 over-block guard: a bare `{allOf:[{$ref}]}` is left as a `$ref`",
+    (function () {
+      var n = pnode(conv({ allOf: [{ $ref: "#/$defs/T" }] }, T_OPEN, "openai"));
+      return n && (n.$ref === "#/$defs/T" || (n.allOf && n.allOf[0].$ref === "#/$defs/T"));
+    })());
+  ok("#371 over-block guard: the Pydantic v1 shape keeps its `$ref`",
+    (function () {
+      var n = pnode(conv({ title: "Inner", description: "d", allOf: [{ $ref: "#/$defs/T" }] },
+                         T_OPEN, "openai"));
+      return n && (n.$ref === "#/$defs/T" || (n.allOf && n.allOf[0].$ref === "#/$defs/T"));
+    })());
+  ok("#371 over-block guard: a `$ref` to a NON-object member is not resolved",
+    (function () {
+      var r = conv(ALLOFWRAP, T_SCALAR, "openai");
+      return !has(led(r), "Resolved 1 `$ref` member");
+    })());
+  ok("#371 over-block guard: a dangling `$ref` member is not resolved",
+    (function () {
+      var r = conv({ type: "object", properties: { a: { type: "string" } }, required: ["a"],
+                     allOf: [{ $ref: "#/$defs/NOPE" }] }, T_OPEN, "openai");
+      return !has(led(r), "Resolved 1 `$ref` member");
+    })());
+  ok("#371 over-block guard: an ordinary schema is untouched by all of this",
+    (function () {
+      var r = E.convert({ type: "object", properties: { a: { type: "string" } },
+                          required: ["a"], additionalProperties: false }, "openai");
+      return blk(r) === 0 && !has(led(r), "MERGE, not an overwrite") &&
+             !has(led(r), "Resolved 1 `$ref` member");
+    })());
+
+  // `gemini-json` keeps `$ref`/`$defs` deliberately, and the vendor forbids a
+  // `$ref` carrying non-`$` siblings — so the choice there is inline-one-node
+  // or delete the constraints. It used to always delete (reported, but a loss
+  // where a lossless repair exists); annotations still take the delete path,
+  // because that is the path whose whole value is keeping `$ref` and recursion.
+  ok("#371 gemini-json inlines a CONSTRAINING sibling instead of deleting it",
+    (function () {
+      var r = conv(SIBLING, T_OPEN, "gemini-json");
+      return pprops(r) === "a,b" && has(led(r), "Inlined this `$ref` and merged it");
+    })());
+  ok("#371 gemini-json still DELETES an annotation-only sibling per the vendor rule",
+    (function () {
+      var r = conv({ description: "d", $ref: "#/$defs/T" }, T_OPEN, "gemini-json");
+      var n = pnode(r);
+      return n && n.$ref === "#/$defs/T" && has(led(r), "Removed `description` alongside `$ref`");
+    })());
+})();
+
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
