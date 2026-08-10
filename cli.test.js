@@ -1297,5 +1297,43 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     })).status === 0);
 })();
 
+// --- #355: malformed containers through the binary ---------------------------
+// Exit 3, not 1: committing our output cannot help, because we could not read
+// the document in the first place (#330 -- a 1 is fixed by rerunning without
+// --check, a 3 never is).
+(function () {
+  var BODY = { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false };
+  function withKw(kw, v) { var s = JSON.parse(JSON.stringify(BODY)); s[kw] = v; return s; }
+
+  ok("#355 `$defs: true` exits 3 (was 0 — the #354 hole)",
+    run(["--to", "anthropic-json-python", "--check"], JSON.stringify(withKw("$defs", true))).status === 3);
+  ok("#355 `$defs: true` exits 3 on openai too",
+    run(["--to", "openai", "--check"], JSON.stringify(withKw("$defs", true))).status === 3);
+  ok("#355 `properties` holding a boolean exits 3",
+    run(["--to", "anthropic-go", "--check"], JSON.stringify({ type: "object", properties: true })).status === 3);
+  ok("#355 a non-schema `properties` MEMBER exits 3",
+    run(["--to", "openai", "--check"], JSON.stringify({ type: "object", properties: { a: "string" } })).status === 3);
+
+  // The diagnosis has to reach the binary's output, not just the ledger.
+  (function () {
+    var r = run(["--to", "openai", "--check"], JSON.stringify(withKw("$defs", true)));
+    var text = (r.stdout || "") + (r.stderr || "");
+    ok("#355 the message names the keyword and what it must hold",
+      /`\$defs` must be an object mapping names to schemas/.test(text));
+    ok("#355 the message says the subtree was skipped",
+      /SKIPPED/.test(text));
+    ok("#355 the message carries the measured Go total-loss consequence",
+      /schema: null/.test(text) && /anthropic-sdk-go/.test(text));
+  })();
+
+  // Over-block guards through the binary: empty containers are legal and stay so.
+  ok("#355 guard: `anyOf: []` still passes (#347)",
+    run(["--to", "openai", "--check"], JSON.stringify({
+      type: "object", properties: { p: { anyOf: [] } }, required: ["p"], additionalProperties: false
+    })).status !== 3);
+  ok("#355 guard: an ordinary schema still exits 0",
+    run(["--to", "openai", "--check"], JSON.stringify(BODY)).status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

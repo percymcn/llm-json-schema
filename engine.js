@@ -670,6 +670,170 @@
     return sawSubstantive;
   }
 
+  // What each shape test above actually requires, in words. Kept beside the
+  // table on purpose: a keyword added to SCHEMA_KEYWORD_SHAPE without a line
+  // here would report "a different kind of value", which is useless, so a test
+  // asserts the two stay in step (#334 -- make the agreement a test, not a
+  // comment).
+  var SHAPE_WANTS = {
+    items: "a schema, or an array of schemas (draft-07 tuple form)",
+    additionalItems: "a schema or a boolean", contains: "a schema", "not": "a schema",
+    "if": "a schema", then: "a schema", "else": "a schema",
+    propertyNames: "a schema", additionalProperties: "a schema or a boolean",
+    unevaluatedProperties: "a schema or a boolean", unevaluatedItems: "a schema or a boolean",
+    $defs: "an object mapping names to schemas", definitions: "an object mapping names to schemas",
+    properties: "an object mapping property names to schemas",
+    patternProperties: "an object mapping regexes to schemas",
+    dependentSchemas: "an object mapping property names to schemas",
+    anyOf: "an array of schemas", oneOf: "an array of schemas",
+    allOf: "an array of schemas", prefixItems: "an array of schemas",
+    $ref: "a string", $schema: "a string", $id: "a string", $anchor: "a string",
+    $dynamicRef: "a string",
+    type: "a string, or an array of strings",
+    "enum": "an array", "const": "any value",
+    required: "an array of strings", dependentRequired: "an object",
+    minimum: "a number", maximum: "a number", exclusiveMinimum: "a number",
+    exclusiveMaximum: "a number", multipleOf: "a number",
+    minLength: "a number", maxLength: "a number", pattern: "a string", format: "a string",
+    contentEncoding: "a string", contentMediaType: "a string",
+    minItems: "a number", maxItems: "a number", uniqueItems: "a boolean",
+    minContains: "a number", maxContains: "a number",
+    minProperties: "a number", maxProperties: "a number",
+    nullable: "a boolean", discriminator: "an object", propertyOrdering: "an array of strings"
+  };
+
+  function kindOf(v) {
+    return v === null ? "null" : Array.isArray(v) ? "an array"
+      : typeof v === "object" ? "an object"
+      : typeof v === "string" ? "a string"
+      : typeof v === "number" ? "a number"
+      : typeof v === "boolean" ? "the boolean `" + v + "`" : typeof v;
+  }
+
+  // SCHEMA_KEYWORD_SHAPE answers "does this keyword hold the right KIND of
+  // thing?", and until now it was asked in exactly one place: looksLikeSchema,
+  // at the ROOT, as a data-or-schema tiebreaker -- and behind a fast path that
+  // returns early the moment `type`/`properties`/`$ref`/a combinator is present,
+  // so on an ordinary-looking document it never ran at all. One level down it
+  // was never asked.
+  //
+  // That matters because every descent guard in walk() and
+  // findBooleanSubschemas() is a TYPE TEST -- `if (isPlainObject(node[bag]))`,
+  // `if (Array.isArray(node[kw]))`. A keyword holding the wrong type therefore
+  // reads EXACTLY like an absent keyword: the subtree is skipped in silence and
+  // the engine then reports "Already valid. No changes needed." -- an
+  // affirmative claim derived from having looked at nothing. Same asymmetry as
+  // #320 (a keep-rule reading "I could not find a reference" as "nothing
+  // references this") and #342 ("this reference points somewhere" as "somewhere
+  // exists"), now on the DESCENT side.
+  //
+  // Only SCHEMA POSITIONS are checked, so a property literally NAMED `$defs` or
+  // `anyOf` is not a false positive (#334's control). Unknown keywords
+  // (`x-foo`, vendor extensions) have no entry and are left alone.
+  // SCOPE, and it is deliberately narrow -- both halves were forced by running
+  // the check over the captured corpus before believing it:
+  //
+  //  1. SUBSCHEMA-BEARING POSITIONS ONLY. The defect is an UNEXAMINED SUBTREE.
+  //     `exclusiveMaximum: true` is malformed too, but nothing is skipped and
+  //     our verdict is not uninformed -- and those are exactly the degenerate
+  //     typed-field rows #354 measured on the Go client and deliberately did
+  //     not ship, because no generator emits them. Widening to every keyword
+  //     would re-litigate that decision by accident. Measured-and-not-shipped
+  //     the same way here: `required: "a"`, `enum: {}`, `type: 5`, `format: null`.
+  //
+  //  2. KIND, NOT MEMBERSHIP. The test is "is this the right KIND of thing?",
+  //     NOT the table's isSubschemaMap/isSubschemaArray -- those additionally
+  //     require non-emptiness, and an EMPTY container is legal and deliberately
+  //     supported here: `items: []` is #346's zero-length draft-07 tuple,
+  //     `anyOf: []`/`allOf: []` are #347's unsatisfiable/vacuous forms,
+  //     `properties: {}` and `patternProperties: {}` are ordinary. Using the
+  //     stricter predicate blocked 24 real captured inputs and would have
+  //     deleted four cycles of measured behaviour. Empty is the INVERSE of
+  //     non-empty, not a malformed version of it (#347).
+  var CONTAINER_SHAPE = {
+    $defs: "map", definitions: "map", properties: "map",
+    patternProperties: "map", dependentSchemas: "map",
+    anyOf: "arr", oneOf: "arr", allOf: "arr", prefixItems: "arr",
+    "not": "sub", "if": "sub", then: "sub", "else": "sub", contains: "sub",
+    propertyNames: "sub", additionalProperties: "sub",
+    unevaluatedProperties: "sub", unevaluatedItems: "sub", additionalItems: "sub",
+    items: "sub-or-arr"
+  };
+  var isSchemaValue = function (v) { return isPlainObject(v) || v === true || v === false; };
+
+  function findMalformedKeywords(root) {
+    var bad = [];
+    function note(path, kw, v) {
+      bad.push({ path: path, kw: kw, want: SHAPE_WANTS[kw] || "a different kind of value", got: kindOf(v) });
+    }
+    function visit(node, path) {
+      if (!isPlainObject(node)) return;
+      Object.keys(node).forEach(function (k) {
+        var shape = Object.prototype.hasOwnProperty.call(CONTAINER_SHAPE, k) ? CONTAINER_SHAPE[k] : null;
+        if (!shape) return;                    // unknown / non-container keyword: not ours
+        var v = node[k];
+        if (shape === "map") {
+          if (!isPlainObject(v)) return note(path, k, v);
+          Object.keys(v).forEach(function (n) {
+            var m = v[n];
+            // A MEMBER that is not a schema is the same defect one level down:
+            // walk() drops it on the same `isPlainObject` guard, in silence.
+            if (!isSchemaValue(m)) return note(path + "." + k + "." + n, k, m);
+            visit(m, path + "." + k + "." + n);
+          });
+          return;
+        }
+        if (shape === "arr" || (shape === "sub-or-arr" && Array.isArray(v))) {
+          if (!Array.isArray(v)) return note(path, k, v);
+          v.forEach(function (m, i) {
+            if (!isSchemaValue(m)) return note(path + "/" + k + "[" + i + "]", k, m);
+            visit(m, path + "/" + k + "[" + i + "]");
+          });
+          return;
+        }
+        if (!isSchemaValue(v)) return note(path, k, v);
+        visit(v, path + "/" + k);
+      });
+    }
+    visit(root, "root");
+    return bad;
+  }
+
+  // No repair is possible and that is the whole reason this is a blocker: there
+  // is no way to know what `properties: true` was meant to say, and #329's rule
+  // is that when a repair cannot be invented the remedy gets NAMED instead.
+  //
+  // Severity is universal across targets, and the justification is deliberately
+  // NOT vendor tolerance -- it is a statement about OUR OWN analysis. Measured
+  // 2026-08-09, the clients do not agree and two of them accept it:
+  //   anthropic-sdk-go v1.62.0  the WHOLE DOCUMENT comes back `schema: null`
+  //                             (#332's total-loss shape) and the request is
+  //                             built anyway -- 15 of 17 probed shapes.
+  //   anthropic 0.121.0 (py)    `transform_schema` RAISES, request never built.
+  //   @anthropic-ai/sdk 0.116.0 `betaJSONSchemaOutputFormat` THROWS on some
+  //                             shapes; `betaTool` forwards ALL of them verbatim.
+  //   openai 7.4.0              `toStrictJsonSchema` ACCEPTS `properties: true`
+  //                             and `$defs: true`.
+  // "The client forwarded it" is weak evidence here (#354): a decoder cannot be
+  // constrained by a `properties` that is a boolean, so acceptance is not
+  // correctness (#347).
+  function malformedKeywordMessage(hit) {
+    return "`" + hit.kw + "` must be " + hit.want + ", but here it is " + hit.got + ". " +
+      "This document is not valid JSON Schema, so everything inside that keyword was " +
+      "SKIPPED -- every rule that would have looked in there never ran. That is why this " +
+      "is a blocker rather than a note: without it this file would come back " +
+      "\"already valid\", which would be a claim about a part of your schema that was " +
+      "never examined. Measured on the vendor clients 2026-08-09, they disagree and two " +
+      "of them do NOT complain: `anthropic-sdk-go` v1.62.0 returns `schema: null` for the " +
+      "WHOLE document and builds the request anyway; `anthropic` 0.121.0 (Python) raises " +
+      "so the request is never built; `@anthropic-ai/sdk` 0.116.0 throws on the " +
+      "`output_format` path but forwards it verbatim on `tools[].input_schema`; and " +
+      "`openai` 7.4.0's `toStrictJsonSchema` accepts several of these outright. Being " +
+      "accepted is not the same as being honoured -- a constrained decoder cannot use a " +
+      "`properties` that is a boolean. There is no repair: fix the keyword to hold " +
+      hit.want + ".";
+  }
+
   // ---- OpenAI Structured Outputs (strict) ----------------------------------
   // Rules (all quoted/derived from the OpenAI doc):
   //  - "additionalProperties: false must always be set in objects"
@@ -3994,6 +4158,23 @@
     }
 
     var result = conv(schema);
+
+    // Well-formedness, on the INPUT and provider-independent. Entry side per
+    // #341/#342: this is a claim about what the caller GAVE us, not about what
+    // we are handing back. Skipped when the input was treated as an example --
+    // an inferred schema is well formed by construction, and the "looked like
+    // an example" note already tells that reader what happened.
+    //
+    // unshift, not push: if a keyword is malformed, every other line in the
+    // ledger was computed from a document we could not fully read, so this has
+    // to be the first thing the reader sees.
+    if (!inferred) {
+      var malformed = findMalformedKeywords(schema);
+      for (var mi = malformed.length - 1; mi >= 0; mi--) {
+        result.ledger.unshift(entry("!", malformed[mi].path,
+          malformedKeywordMessage(malformed[mi]), DOCS[provider]));
+      }
+    }
 
     // An emptied map is provider-independent: it is a fact about the document
     // the caller is holding, not about who accepts it, and EVERY provider

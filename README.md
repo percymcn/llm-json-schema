@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 749 engine + 208 CLI + 34 ESM/library assertions = **991** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 779 engine + 217 CLI + 34 ESM/library assertions = **1030** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -394,11 +394,63 @@ differently on purpose:
   moving the boolean into a slot the vendor does reject. Same keyword class,
   opposite answers, decided by whether this tool moves the node.
 
-Known gap, stated rather than papered over: a boolean standing in for the
-`$defs` **bag itself** (`{"$defs": true}`) is not detected and exits 0. It is a
-real hole and an unreachable one — no generator emits it — and the walker it
-would change is shared by all ten targets, so it is recorded rather than
-patched in passing.
+That gap is now closed, and closing it turned out to be a different rule — see
+below.
+
+## A container holding the wrong kind of thing, and the silence it caused
+
+A boolean standing in for the `$defs` **bag itself** (`{"$defs": true}`) used to
+exit 0. It is not a boolean subschema at all: `$defs` is not a schema position,
+its value must be an *object of schemas*, so `true` there is a malformed
+keyword — a different defect with a different remedy.
+
+The cause is general. Every descent guard in this engine is a **type test** —
+`if (isPlainObject(node[bag]))`, `if (Array.isArray(node[kw]))` — so a keyword
+holding the wrong type reads exactly like a keyword that **isn't there**: the
+subtree is skipped in silence, and the tool then answers *"Already valid. No
+changes needed."* That is an affirmative claim derived from having looked at
+nothing. It is the same asymmetry as a keep-rule reading *"I could not find a
+reference to this"* as *"nothing references this"*, now on the descent side.
+
+The shape table needed to catch it already existed — it was written to decide
+*"is this pasted JSON a schema or an example?"*, was consulted only at the
+**root**, and was skipped entirely by a fast path whenever `type` or
+`properties` was present. It had never been asked the question it is shaped to
+answer one level down.
+
+Measured against the vendor clients on 2026-08-09, they disagree and **two of
+them do not complain**:
+
+| client | `{"$defs": true}` and friends |
+|---|---|
+| `anthropic-sdk-go` v1.62.0 | **whole document** comes back `schema: null`, request built anyway (15 of 17 probed shapes) |
+| `anthropic` 0.121.0 (Python) | `transform_schema` **raises**, request never built (5 shapes) |
+| `@anthropic-ai/sdk` 0.116.0 | `betaJSONSchemaOutputFormat` **throws** (3); `betaTool` forwards **all** verbatim |
+| `openai` 7.4.0 | `toStrictJsonSchema` **accepts** `$defs: true` and `properties: true` |
+
+So this **blocks on every target**, and the justification is deliberately not
+vendor tolerance — it is a statement about *our own* analysis being uninformed.
+Being accepted is not being honoured: a constrained decoder cannot use a
+`properties` that is a boolean. No repair is possible (nothing can recover what
+`properties: true` was meant to say), so the blocker names the fix instead.
+
+Two things it deliberately does **not** do, both forced by running the rule over
+the tool's own captured corpus before trusting it:
+
+- **Empty is not malformed.** `items: []`, `anyOf: []`, `allOf: []`,
+  `properties: {}`, `patternProperties: {}` are the right *kind* of thing and
+  are legal. Keying the rule on the stricter "is this a non-empty map/array of
+  valid schemas?" predicate blocked **24 real captured inputs** and would have
+  deleted four cycles of measured behaviour.
+- **Only subschema-bearing positions.** `exclusiveMaximum: true` is malformed
+  too, but nothing is skipped and no verdict is uninformed. `required: "a"`,
+  `enum: {}`, `type: 5` and `format: null` are measured and deliberately left
+  out of this rule for the same reason.
+
+Over-block risk is measured, not asserted: across 3,770 (input, target) pairs
+from the tool's own corpus, **0** real generator or framework payloads are
+flagged, and **0** clean inputs are turned into malformed output by any of the
+ten converters.
 
 Where it is rejected, this tool **blocks** rather than repairing. There is no
 repair — a dialect that constrains decoding has no way to express "anything
@@ -505,7 +557,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 991 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1030 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

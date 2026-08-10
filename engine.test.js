@@ -4791,5 +4791,139 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     !blocked(E.toAnthropic(o({ $ref: "#/$defs/T", $defs: { T: OBJ } }), true, "python").ledger));
 })();
 
+// --- #355: a container keyword holding the wrong KIND of thing ---------------
+// Every descent guard in walk() and findBooleanSubschemas() is a type test, so a
+// malformed container reads exactly like an absent one: the subtree is skipped
+// in silence and the engine then answers "Already valid. No changes needed."
+// #354 recorded `{"$defs": true}` as a known exit-0 hole and left it; this is
+// that hole, and the rest of the class it belongs to.
+//
+// Vendor consequences MEASURED 2026-08-09 (they disagree, and two do not
+// complain): anthropic-sdk-go v1.62.0 returns `schema: null` for the WHOLE
+// document on 15 of 17 probed shapes and builds the request anyway; anthropic
+// 0.121.0 `transform_schema` RAISES on 5; @anthropic-ai/sdk 0.116.0
+// `betaJSONSchemaOutputFormat` throws on 3 while `betaTool` forwards all of
+// them verbatim; openai 7.4.0 `toStrictJsonSchema` ACCEPTS `$defs: true` and
+// `properties: true`. The blocker is universal anyway because it is a statement
+// about OUR analysis being uninformed, not about vendor tolerance.
+(function () {
+  var TARGETS = Object.keys(E.DOCS);
+  function malformed(l) {
+    return (l || []).some(function (e) {
+      return e.op === "!" && !e.advisory && /is not valid JSON Schema/.test(e.msg);
+    });
+  }
+  function hits(sch, provider) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), provider || "openai");
+    return r && r.ok !== false && malformed(r.ledger);
+  }
+  function hitsEvery(sch) { return TARGETS.every(function (t) { return hits(sch, t); }); }
+  function hitsNone(sch) { return TARGETS.every(function (t) { return !hits(sch, t); }); }
+  var BODY = { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false };
+  function withKw(kw, v) { var s = JSON.parse(JSON.stringify(BODY)); s[kw] = v; return s; }
+
+  // --- the recorded #354 gap, on every target --------------------------------
+  ok("#355 `$defs: true` is caught on ALL ten targets (the #354 hole)", hitsEvery(withKw("$defs", true)));
+  ok("#355 `definitions: true` is caught", hitsEvery(withKw("definitions", true)));
+  ok("#355 `dependentSchemas: true` is caught", hitsEvery(withKw("dependentSchemas", true)));
+
+  // --- the rest of the class -------------------------------------------------
+  ok("#355 `properties` holding a boolean is caught", hitsEvery({ type: "object", properties: true }));
+  ok("#355 `properties` holding an array is caught", hitsEvery({ type: "object", properties: [{ a: 1 }] }));
+  ok("#355 `properties` holding a string is caught", hitsEvery({ type: "object", properties: "a" }));
+  ok("#355 `anyOf` holding an object (not an array) is caught", hitsEvery({ anyOf: { type: "string" } }));
+  ok("#355 `prefixItems` holding a boolean is caught", hitsEvery(withKw("prefixItems", true)));
+
+  // A MEMBER that is not a schema is the same defect one level down: walk()
+  // drops it on the same isPlainObject guard, in silence.
+  ok("#355 a `properties` MEMBER that is not a schema is caught",
+    hitsEvery({ type: "object", properties: { a: "string" } }));
+  ok("#355 an `anyOf` MEMBER that is not a schema is caught",
+    hitsEvery({ anyOf: [{ type: "string" }, "nope"] }));
+
+  // It has to descend, or it is only a root check.
+  ok("#355 a malformed container NESTED in a property is caught",
+    hitsEvery({ type: "object", properties: { o: { type: "object", $defs: true } }, required: ["o"] }));
+  ok("#355 a malformed container inside `$defs` is caught",
+    hitsEvery({ type: "object", properties: { a: { $ref: "#/$defs/T" } }, $defs: { T: { type: "object", properties: true } } }));
+
+  // --- OVER-BLOCK GUARDS: these hold both ways, and are the reason the rule is
+  // keyed on KIND rather than on the table's isSubschemaMap/isSubschemaArray.
+  // The stricter predicate blocked 24 real captured corpus inputs.
+  ok("#355 guard: `items: []` is empty, not malformed (#346)",
+    hitsNone({ type: "object", properties: { b: { type: "array", items: [] } }, required: ["b"] }));
+  ok("#355 guard: `anyOf: []` is empty, not malformed (#347)",
+    hitsNone({ type: "object", properties: { p: { anyOf: [] } }, required: ["p"] }));
+  ok("#355 guard: `allOf: []` is vacuously true, not malformed (#347)",
+    hitsNone({ type: "object", properties: { p: { type: "string", allOf: [] } }, required: ["p"] }));
+  ok("#355 guard: `properties: {}` is an empty object, not malformed",
+    hitsNone({ type: "object", properties: {}, additionalProperties: false }));
+  ok("#355 guard: `patternProperties: {}` is not malformed",
+    hitsNone({ type: "object", properties: { m: { type: "object", patternProperties: {} } }, required: ["m"] }));
+  ok("#355 guard: draft-07 tuple form (`items` as an ARRAY of schemas) is legal",
+    hitsNone({ type: "object", properties: { b: { type: "array", items: [{ type: "integer" }, { type: "string" }] } }, required: ["b"] }));
+  ok("#355 guard: a boolean subschema in a legal position is not malformed (#333)",
+    hitsNone({ type: "object", properties: { d: true }, required: ["d"] }));
+  ok("#355 guard: `additionalProperties` takes a boolean BY DESIGN",
+    hitsNone(BODY) && hitsNone({ type: "object", additionalProperties: true }) &&
+    hitsNone({ type: "object", additionalProperties: { type: "string" } }));
+  // #334's control: a property literally NAMED after a container keyword is in a
+  // DATA position, not a schema position, and must never be a false positive.
+  ok("#355 guard: a property NAMED `$defs`/`anyOf` is not a false positive",
+    hitsNone({ type: "object", properties: { $defs: { type: "boolean" }, anyOf: { type: "string" } }, required: ["$defs", "anyOf"] }));
+  ok("#355 guard: an ordinary schema is untouched on every target", hitsNone(BODY));
+
+  // --- SCOPE PINS: measured malformed, deliberately NOT shipped. These are the
+  // degenerate typed-field rows #354 declined (no generator emits them) and they
+  // skip no subtree, so our verdict is not uninformed. Pinned so a later widening
+  // is a deliberate decision rather than an accident.
+  ok("#355 scope: `required: \"a\"` is out of scope for this rule", hitsNone(withKw("required", "a")));
+  ok("#355 scope: `exclusiveMaximum: true` is out of scope (#354 declined it)",
+    hitsNone(withKw("exclusiveMaximum", true)));
+  ok("#355 scope: `format: null` on a leaf is out of scope (#345)",
+    hitsNone({ type: "object", properties: { x: { type: "string", format: null } }, required: ["x"] }));
+
+  // An inferred schema is well formed by construction, so the check is skipped
+  // for example input rather than reporting on a document we built ourselves.
+  ok("#355 an input treated as an EXAMPLE is not reported as malformed",
+    !malformed((E.convert({ items: [1, 2, 3], total: 12.5 }, "openai") || {}).ledger));
+
+  // The blocker is a real blocker, not an advisory (#317: advisories must never
+  // fail a gate, and this one must).
+  ok("#355 the entry is a non-advisory blocker", (function () {
+    var e = (E.convert(withKw("$defs", true), "openai").ledger || []).filter(function (x) {
+      return /is not valid JSON Schema/.test(x.msg);
+    })[0];
+    return e && e.op === "!" && !e.advisory;
+  })());
+  // It must be FIRST: every other ledger line was computed from a document we
+  // could not fully read.
+  ok("#355 the blocker is the first ledger entry", (function () {
+    var l = E.convert(withKw("$defs", true), "openai").ledger || [];
+    return l.length && /is not valid JSON Schema/.test(l[0].msg);
+  })());
+  // Parity, behaviourally rather than by exporting the tables: EVERY container
+  // keyword must produce a real description. A keyword added to CONTAINER_SHAPE
+  // without a SHAPE_WANTS line would fall back to "a different kind of value",
+  // which tells the reader nothing (#334 -- make the agreement a test).
+  ok("#355 every container keyword has a real description", (function () {
+    var kws = ["$defs", "definitions", "properties", "patternProperties", "dependentSchemas",
+      "anyOf", "oneOf", "allOf", "prefixItems", "not", "if", "then", "else", "contains",
+      "propertyNames", "additionalProperties", "unevaluatedProperties", "unevaluatedItems",
+      "additionalItems", "items"];
+    return kws.every(function (kw) {
+      var e = (E.convert(withKw(kw, "not-a-schema"), "openai").ledger || [])[0];
+      return e && /is not valid JSON Schema/.test(e.msg) && !/a different kind of value/.test(e.msg);
+    });
+  })());
+
+  // The message has to name the keyword AND what it should have held.
+  ok("#355 the message names the keyword and the required kind", (function () {
+    var m = (E.convert({ type: "object", properties: true }, "openai").ledger || [])[0];
+    return m && /`properties` must be an object mapping property names to schemas/.test(m.msg) &&
+      /the boolean `true`/.test(m.msg);
+  })());
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
