@@ -769,9 +769,14 @@ whenever the document contains a `$ref`. Measured on one document carrying a
 The same defect one container over emptied the `$defs` bag while leaving the
 `$ref` pointing into it — a dangling pointer handed back as valid.
 
-Scope, stated honestly: **neither dominant generator emits this.** Measured,
-`z.object({"__proto__": …})` on zod 4 and the pydantic equivalent both drop the
-field themselves before it ever reaches a schema, so the reachable population is
+Scope, stated honestly: **neither dominant generator emits this.** Measured on
+zod 4.4.3 and pydantic 2.13.4, both drop the field themselves before it reaches a
+schema — note a zod shape has to be built with a **computed** key to test at all,
+since `{ "__proto__": … }` in an object literal is *itself* the prototype-setter
+syntax. zod's version of the loss is the same defect we had: it drops the field
+from `properties` while `required` goes on naming it, so it emits a schema that
+requires a property it does not declare (reported upstream). So the reachable
+population is
 hand-authored / OpenAPI / MCP tool schemas — and schemas that *describe* arbitrary
 JSON, where `__proto__` is an ordinary key. Nor is this a rejection being
 avoided: `toStrictJsonSchema()` accepts the raw document with the property
