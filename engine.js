@@ -1355,12 +1355,11 @@
   function resolvesLocally(root, ref) {
     if (ref === "#" || ref === "") return true;
     if (ref.charAt(0) !== "#") return false;
-    var frag = ref.slice(1);
-    if (frag.charAt(0) !== "/") return false; // `#name` — a `$anchor`, not a pointer
-    var toks = frag.split("/").slice(1);
+    var toks = pointerTokens(ref);
+    if (!toks) return false; // `#name` — a `$anchor`, not a pointer
     var cur = root;
     for (var i = 0; i < toks.length; i++) {
-      var t = decodeURIComponent(toks[i]).replace(/~1/g, "/").replace(/~0/g, "~");
+      var t = toks[i];
       if (Array.isArray(cur)) {
         if (!/^\d+$/.test(t) || Number(t) >= cur.length) return false;
         cur = cur[Number(t)];
@@ -1462,17 +1461,44 @@
   // is what makes a pointer INTO a definition (`#/$defs/T/properties/x`)
   // count as a reference to `T` -- the case the string match missed, because
   // the closing quote it searched for is not there.
+  // THE one place a `$ref` fragment is turned into JSON Pointer tokens. Four
+  // functions used to parse one themselves (`localDefRefs`, `resolvesLocally`,
+  // `derefLocal`, and the two raw regexes in the Gemini path); they disagreed,
+  // which is the drift class #372/#377 already paid for twice.
+  //
+  // Returns null for anything that is not a local pointer (`#`, `#anchor`, an
+  // absolute URI, a non-string), else the DECODED tokens. Every caller then
+  // fails closed on null.
+  //
+  // `decodeURIComponent` THROWS on a malformed escape, and that is not
+  // hypothetical: shipped, `--to openai --check` on a `$ref` of `#/$defs/%zz`
+  // printed a `URIError` stack trace and exited **1** -- the code this CLI
+  // documents as "here are your changes, commit the output" (#330), so a dead
+  // gate was indistinguishable by exit code from a normal verdict (#376). A
+  // token that cannot be decoded is used AS WRITTEN, which keeps the function
+  // total and still fails closed at lookup: a literal `%zz` key matches only a
+  // definition genuinely called `%zz`, which is the correct answer.
+  function pointerTokens(ref) {
+    if (typeof ref !== "string" || ref.charAt(0) !== "#") return null;
+    var body = ref.slice(1);
+    if (body.charAt(0) !== "/") return null; // "#" (self) or "#name" (a $anchor)
+    return body.slice(1).split("/").map(function (t) {
+      var d;
+      try { d = decodeURIComponent(t); } catch (e) { d = t; }
+      return d.replace(/~1/g, "/").replace(/~0/g, "~");
+    });
+  }
+
   function localDefRefs(doc, bag) {
     var names = {}, bailOut = false;
-    var head = new RegExp("^#\\/" + bag.replace(/\$/g, "\\$") + "\\/([^/]+)");
     (function scan(v) {
       if (bailOut) return;
       if (Array.isArray(v)) { v.forEach(scan); return; }
       if (!isPlainObject(v)) return;
       if (typeof v.$ref === "string") {
-        var m = head.exec(v.$ref);
-        if (m) {
-          names[decodeURIComponent(m[1]).replace(/~1/g, "/").replace(/~0/g, "~")] = true;
+        var toks = pointerTokens(v.$ref);
+        if (toks && toks.length >= 2 && toks[0] === bag) {
+          names[toks[1]] = true;
         } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
           bailOut = true;
         }
@@ -1492,6 +1518,42 @@
     if (!m) return null;
     var bag = root[m[1]];
     return isPlainObject(bag) && isPlainObject(bag[m[2]]) ? bag[m[2]] : null;
+  }
+
+  // Resolve a `$ref` that points AT OR INTO a definition bag, as a POINTER
+  // rather than as a name. Returns {key, name, node} or null.
+  //
+  //   key  -- the canonical decoded pointer. This is the CYCLE IDENTITY: two
+  //           different pointers into one definition are different nodes, so
+  //           keying recursion on the definition NAME reports a cycle where
+  //           there is none, and keying it on the pointer is both precise and
+  //           terminating (a pointer reached twice on one path IS a cycle).
+  //   name -- the first token, i.e. what the definition is CALLED, which is
+  //           what a blocker message has to say.
+  //
+  // The two Gemini sites (the inliner and the cycle scan) each carried
+  // `/^#\/(?:\$defs|definitions)\/(.+)$/` and used the capture RAW. `.+` is
+  // greedy across `/`, so `#/$defs/T/properties/x` looked up a definition
+  // literally named `T/properties/x` and missed; and with no decode, a name
+  // carrying an RFC 6901 escape or a `%20` missed too. Both misses read as
+  // "this reference is not to a definition", which is the fail-open direction.
+  function defBagRef(root, ref) {
+    var toks = pointerTokens(ref);
+    if (!toks || toks.length < 2) return null;
+    if (toks[0] !== "$defs" && toks[0] !== "definitions") return null;
+    if (!isPlainObject(root[toks[0]])) return null;
+    var cur = root[toks[0]];
+    for (var i = 1; i < toks.length; i++) {
+      if (!isPlainObject(cur) && !Array.isArray(cur)) return null;
+      if (!Object.prototype.hasOwnProperty.call(cur, toks[i])) return null;
+      cur = cur[toks[i]];
+    }
+    // Deliberately the same acceptance test as `resolvesLocally`, which decides
+    // whether a surviving `$ref` is reported as dangling. If the two disagreed,
+    // one rule would refuse to inline a pointer the other calls resolvable --
+    // and the document would be blocked for dangling at a location that is not.
+    if (!isPlainObject(cur) && typeof cur !== "boolean") return null;
+    return { key: "#/" + toks.join("/"), name: toks[1], node: cur };
   }
 
   function rootRefTarget(s) {
@@ -1991,14 +2053,13 @@
 
   // "#/$defs/A" style pointers only; anything else is not locally resolvable.
   function derefLocal(root, ref) {
-    if (ref.charAt(0) !== "#") return undefined;
-    var body = ref.slice(1);
-    if (body === "" || body === "/") return root;
-    if (body.charAt(0) !== "/") return undefined;
-    var parts = body.slice(1).split("/");
+    if (typeof ref !== "string") return undefined;
+    if (ref === "#" || ref === "#/") return root;
+    var parts = pointerTokens(ref);
+    if (!parts) return undefined;
     var cur = root;
     for (var i = 0; i < parts.length; i++) {
-      var key = decodeURIComponent(parts[i]).replace(/~1/g, "/").replace(/~0/g, "~");
+      var key = parts[i];
       if (!isPlainObject(cur) && !Array.isArray(cur)) return undefined;
       if (!(key in cur)) return undefined;
       cur = cur[key];
@@ -4562,14 +4623,14 @@
       }
       if (!isPlainObject(node)) return node;
 
-      var ref = typeof node.$ref === "string" ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref) : null;
-      if (ref && defs[ref[1]]) {
-        var name = ref[1];
-        if (stack.indexOf(name) !== -1) {
+      var ref = defBagRef(s, node.$ref);
+      if (ref) {
+        var name = ref.name;
+        if (stack.indexOf(ref.key) !== -1) {
           if (recursive.indexOf(name) === -1) recursive.push(name);
           return node; // leave it; a blocker is reported below
         }
-        var target = resolve(clone(defs[name]), stack.concat([name]), path);
+        var target = resolve(clone(ref.node), stack.concat([ref.key]), path);
         // Siblings alongside `$ref` used to WIN over the definition's own keys,
         // which for `properties`/`required` is a deletion rather than a
         // precedence rule: a `$ref` beside constraining siblings is an
@@ -4666,17 +4727,31 @@
   // path unrolls cycles only inside NON-required properties, so a recursive
   // required field is a human fix, not something we can rewrite.
   function cyclicRequired(s) {
-    var defs = {};
-    [s.$defs, s.definitions].forEach(function (bag) {
-      if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { defs[k] = bag[k]; });
+    // Definitions are carried as {key, name, node} rather than a name->node map,
+    // because the walks below identify a node by its POINTER. Mixing the two --
+    // a `seen` list of pointers seeded with a NAME -- silently re-enters the
+    // definition it was meant to exclude and reports the same cyclic path
+    // twice; that is exactly what the corpus differential caught here.
+    var defs = [];
+    ["$defs", "definitions"].forEach(function (bag) {
+      if (!isPlainObject(s[bag])) return;
+      Object.keys(s[bag]).forEach(function (k) {
+        defs.push({ key: "#/" + bag + "/" + k, name: k, node: s[bag][k] });
+      });
     });
-    if (!Object.keys(defs).length) return { paths: [], truncated: false };
+    if (!defs.length) return { paths: [], truncated: false };
     var out = [], outSeen = {};
 
-    function refName(node) {
-      var m = isPlainObject(node) && typeof node.$ref === "string"
-        ? /^#\/(?:\$defs|definitions)\/(.+)$/.exec(node.$ref) : null;
-      return m ? m[1] : null;
+    // Was a NAME lookup with the same greedy, undecoded regex as the inliner.
+    // A cycle whose edge is spelled as a pointer INTO a definition was
+    // therefore invisible, and that fails OPEN: measured, two documents
+    // describing the identical cycle -- one edge written `#/$defs/T` and the
+    // other `#/$defs/T/properties/x` -- got exit 3 and exit **0** from
+    // `--to gemini-json`, a false pass on exactly the recursive-required shape
+    // this scan exists to catch.
+    function refTarget(node) {
+      return isPlainObject(node) && node.$ref !== undefined
+        ? defBagRef(s, node.$ref) : null;
     }
 
     // Memoized by definition NAME. Without the memo this walks PATHS rather than
@@ -4701,13 +4776,13 @@
         return node.some(function (n) { return reachesCycle(n, stack); });
       }
       if (!isPlainObject(node)) return false;
-      var name = refName(node);
-      if (name) {
-        if (stack.indexOf(name) !== -1) return true;
-        if (!defs[name]) return false;
-        if (Object.prototype.hasOwnProperty.call(cycleMemo, name)) return cycleMemo[name];
-        var r = reachesCycle(defs[name], stack.concat([name]));
-        cycleMemo[name] = r;
+      if (node.$ref !== undefined) {
+        var t = refTarget(node);
+        if (!t) return false;
+        if (stack.indexOf(t.key) !== -1) return true;
+        if (Object.prototype.hasOwnProperty.call(cycleMemo, t.key)) return cycleMemo[t.key];
+        var r = reachesCycle(t.node, stack.concat([t.key]));
+        cycleMemo[t.key] = r;
         return r;
       }
       return Object.keys(node).some(function (k) { return reachesCycle(node[k], stack); });
@@ -4743,8 +4818,8 @@
         });
       }
       if (isPlainObject(node.items)) scan(node.items, path + "[]", seen);
-      var n = refName(node);
-      if (n && defs[n] && seen.indexOf(n) === -1) scan(defs[n], path, seen.concat([n]));
+      var t = refTarget(node);
+      if (t && seen.indexOf(t.key) === -1) scan(t.node, path, seen.concat([t.key]));
     }
 
     // `scan` walks PATHS, not nodes, so on a `$ref` DAG that merely shares
@@ -4766,14 +4841,14 @@
     // its own bound. It FAILS CLOSED -- a truncated enumeration reports fewer
     // blockers than it should, which is a false pass, so the caller turns the
     // truncation itself into a blocker rather than shipping a short list.
-    var anyCycle = Object.keys(defs).some(function (k) {
-      return reachesCycle(defs[k], []);
+    var anyCycle = defs.some(function (d) {
+      return reachesCycle(d.node, []);
     });
     if (!anyCycle) return { paths: [], truncated: false };
 
     scanBudget = REF_INLINE_MAX_NODES;
     scan(s, "root", []);
-    Object.keys(defs).forEach(function (k) { scan(defs[k], "$defs." + k, [k]); });
+    defs.forEach(function (d) { scan(d.node, "$defs." + d.name, [d.key]); });
     return { paths: out, truncated: scanBudget < 0 };
   }
 

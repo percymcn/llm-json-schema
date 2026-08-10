@@ -7595,5 +7595,166 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// ---------------------------------------------------------------------------
+// #378 — a pointer is a token sequence EVERYWHERE, and decoding one can throw.
+//
+// #377 unified the two sites that decide which definitions are still
+// referenced. Three more functions carried the same shape and were missed:
+// the Gemini inliner and the two walks of the Gemini cycle scan each used
+// `/^#\/(?:\$defs|definitions)\/(.+)$/` and consumed the capture RAW. Plus the
+// decode #377 added throws on a malformed escape.
+// ---------------------------------------------------------------------------
+(function () {
+  function conv(sch, p) {
+    try { return E.convert(JSON.parse(JSON.stringify(sch)), p); }
+    catch (e) { return { threw: String(e && e.message), ledger: [], schema: null }; }
+  }
+  function blk(r) {
+    return (r && Array.isArray(r.ledger) ? r.ledger : [])
+      .filter(function (e) { return e && e.op === "!" && !e.advisory; });
+  }
+  function txt(r) {
+    return (r && Array.isArray(r.ledger) ? r.ledger : [])
+      .map(function (e) { return (e && e.msg) || ""; }).join(" ~~ ");
+  }
+  function node(r, path) {
+    var cur = r && r.schema;
+    var parts = path.split(".");
+    for (var i = 0; i < parts.length; i++) {
+      if (!cur || typeof cur !== "object") return null;
+      cur = cur[parts[i]];
+    }
+    return cur && typeof cur === "object" ? cur : null;
+  }
+
+  // The VERBATIM shape zod 3 + zod-to-json-schema@3.24.5 emits for a reused
+  // sub-schema: the documented call form gives a root `$ref`, and reusing any
+  // sub-schema gives a pointer INTO that same definition (#377 measured this).
+  var ZOD3 = {
+    "$ref": "#/definitions/S",
+    definitions: {
+      S: {
+        type: "object",
+        properties: {
+          inner: {
+            type: "object",
+            properties: { one: { type: "string", minLength: 3 }, two: { type: "number" } },
+            required: ["one", "two"], additionalProperties: false
+          },
+          echo: { "$ref": "#/definitions/S/properties/inner/properties/one" }
+        },
+        required: ["inner", "echo"], additionalProperties: false
+      }
+    }
+  };
+
+  // --- 1. the over-block, and the constraint it was destroying -------------
+  ["gemini", "gemini-client"].forEach(function (t) {
+    var r = conv(ZOD3, t);
+    ok("#378 " + t + ": a pointer INTO a definition is inlined, not blocked",
+       blk(r).length === 0);
+    var echo = node(r, "properties.echo");
+    ok("#378 " + t + ": the referenced constraint survives inlining",
+       !!echo && echo.type === "string" && echo.minLength === 3);
+    ok("#378 " + t + ": no `$ref` is left in the output",
+       !!echo && echo.$ref === undefined);
+  });
+
+  // The blocker text was FALSE OF THE INPUT — it said the reference "points
+  // into this document but there is nothing at that location" when the target
+  // was right there and we had dropped the bag ourselves. Same error #377
+  // corrected one function over.
+  ok("#378 no dangling-reference claim is made about a resolvable pointer",
+     txt(conv(ZOD3, "gemini")).indexOf("there is nothing at that location") === -1);
+
+  // --- 2. escaped names: the other spelling the raw capture missed ---------
+  var ESCAPED = {
+    type: "object", required: ["p", "q"],
+    "$defs": { "a/b": { type: "string", minLength: 2 }, "with space": { type: "integer" } },
+    properties: { p: { "$ref": "#/$defs/a~1b" }, q: { "$ref": "#/$defs/with%20space" } }
+  };
+  var rEsc = conv(ESCAPED, "gemini");
+  ok("#378 an RFC 6901 escaped name resolves (`~1` is `/`)",
+     blk(rEsc).length === 0 && !!node(rEsc, "properties.p") &&
+     node(rEsc, "properties.p").type === "string");
+  ok("#378 a URI-escaped name resolves (`%20` is a space)",
+     !!node(rEsc, "properties.q") && node(rEsc, "properties.q").type === "integer");
+
+  // --- 3. THE DISCRIMINATOR ------------------------------------------------
+  // A PAIR describing the same cycle, differing only in how one edge is
+  // spelled. Without it the rule could be firing on any recursive schema at
+  // all and every other assertion here would still pass (#364/#366).
+  var CYC_DIRECT = {
+    "$defs": {
+      T: { type: "object", properties: { x: { "$ref": "#/$defs/U" } }, required: ["x"] },
+      U: { type: "object", properties: { y: { "$ref": "#/$defs/T" } }, required: ["y"] }
+    },
+    type: "object", properties: { u: { "$ref": "#/$defs/U" } }, required: ["u"]
+  };
+  var CYC_PTR = {
+    "$defs": {
+      T: { type: "object", properties: { x: { "$ref": "#/$defs/U" } }, required: ["x"] },
+      U: { type: "object", properties: { y: { "$ref": "#/$defs/T/properties/x" } }, required: ["y"] }
+    },
+    type: "object", properties: { u: { "$ref": "#/$defs/U" } }, required: ["u"]
+  };
+  // The direct half passes BOTH ways — which is exactly what makes the pair
+  // discriminate rather than merely assert.
+  ok("#378 control: a cycle spelled with whole-definition refs is still caught",
+     blk(conv(CYC_DIRECT, "gemini-json")).length > 0);
+  ok("#378 the SAME cycle with one edge as a pointer INTO a definition is caught too",
+     blk(conv(CYC_PTR, "gemini-json")).length > 0);
+
+  // --- 4. the crash: a gate owes a verdict, not a stack trace (#376) -------
+  // `decodeURIComponent` throws on a malformed escape. Shipped in #377's own
+  // helper, this exited **1** with a `URIError` stack trace and no schema —
+  // exit 1 being the code this CLI documents as "commit the output" (#330).
+  var MAL = {
+    "$defs": { T: { type: "string" } },
+    type: "object", properties: { p: { "$ref": "#/$defs/%zz" } }, required: ["p"]
+  };
+  ["openai", "anthropic", "anthropic-json", "anthropic-go", "gemini",
+   "gemini-json", "gemini-client", "openai-nonstrict"].forEach(function (t) {
+    ok("#378 " + t + ": a malformed percent-escape returns a verdict, not a throw",
+       conv(MAL, t).threw === undefined);
+  });
+  // …and it still fails CLOSED: `%zz` names no definition, so the pointer is
+  // genuinely dangling and the strict target says so rather than inventing one.
+  ok("#378 a genuinely unresolvable pointer is still a blocker",
+     blk(conv(MAL, "openai")).length > 0);
+
+  // --- 5. over-block guards: these must hold BOTH ways ---------------------
+  var PLAIN = { type: "object", properties: { a: { type: "string" } },
+                required: ["a"], additionalProperties: false };
+  ok("#378 guard: an ordinary object is untouched on every target",
+     ["openai", "anthropic", "gemini", "gemini-json"].every(function (t) {
+       var r = conv(PLAIN, t);
+       return blk(r).length === 0 && !!node(r, "properties.a");
+     }));
+  var ORPHAN = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    "$defs": { Unused: { type: "number" } }, additionalProperties: false
+  };
+  ok("#378 guard: a genuinely orphaned definition is still pruned",
+     (function () { var r = conv(ORPHAN, "openai");
+       return !!r.schema && r.schema.$defs === undefined; })());
+  ok("#378 guard: a pointer outside a definition bag is not inlined",
+     blk(conv({ type: "object", required: ["p"],
+                properties: { p: { "$ref": "#/properties/p" } } }, "gemini")).length > 0);
+  ok("#378 guard: an absolute-URI $ref is not treated as local",
+     blk(conv({ type: "object", required: ["p"], "$defs": { T: { type: "string" } },
+                properties: { p: { "$ref": "http://x/#/$defs/T" } } }, "gemini")).length > 0);
+  // A pointer into a definition must NOT be read as recursion just because it
+  // shares a first token with the definition being inlined — that is why the
+  // cycle identity is the whole pointer and not the name.
+  ok("#378 guard: a self-contained pointer into the definition being inlined is not recursion",
+     blk(conv({ "$ref": "#/$defs/T",
+                "$defs": { T: { type: "object", required: ["name", "alias"],
+                  properties: { name: { type: "string" },
+                                alias: { "$ref": "#/$defs/T/properties/name" } } } } },
+              "gemini")).length === 0);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
