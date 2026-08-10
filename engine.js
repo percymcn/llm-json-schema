@@ -1444,6 +1444,44 @@
   // draft-07 spelling reached this function untouched, matched nothing, and the
   // root `$ref` was left in place. That is the DEFAULT output of
   // zod-to-json-schema, and `betaTool()` throws on it.
+  // Which definition names does `doc` still point at? THE one implementation of
+  // that question -- both the root inliner and the orphan pruner ask it, and
+  // #372's lesson is that one rule living in two functions drifts: the pruner
+  // was fixed structurally in #342 while the root inliner kept the literal
+  // string match it was fixed FOR, so the two disagreed about the same
+  // document and the root one deleted a live definition.
+  //
+  // Decides what to KEEP, so per #320 it FAILS CLOSED: `bailOut` means "there
+  // is a local pointer here I cannot attribute", and the answer to "is this
+  // referenced?" then has to be yes. "I could not find a reference" is never
+  // "nothing references this."
+  //
+  // A `$ref` fragment is a URI-encoded JSON Pointer, so a token is decoded
+  // (`%20`) and then unescaped (`~1` -> `/`, `~0` -> `~`, RFC 6901) before it
+  // is compared with a definition NAME. Only the FIRST token is taken, which
+  // is what makes a pointer INTO a definition (`#/$defs/T/properties/x`)
+  // count as a reference to `T` -- the case the string match missed, because
+  // the closing quote it searched for is not there.
+  function localDefRefs(doc, bag) {
+    var names = {}, bailOut = false;
+    var head = new RegExp("^#\\/" + bag.replace(/\$/g, "\\$") + "\\/([^/]+)");
+    (function scan(v) {
+      if (bailOut) return;
+      if (Array.isArray(v)) { v.forEach(scan); return; }
+      if (!isPlainObject(v)) return;
+      if (typeof v.$ref === "string") {
+        var m = head.exec(v.$ref);
+        if (m) {
+          names[decodeURIComponent(m[1]).replace(/~1/g, "/").replace(/~0/g, "~")] = true;
+        } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
+          bailOut = true;
+        }
+      }
+      Object.keys(v).forEach(function (k) { scan(v[k]); });
+    })(doc);
+    return { names: names, bailOut: bailOut };
+  }
+
   // Resolve a local pointer against the root document, in BOTH container
   // spellings. Returns null for anything it cannot resolve, so every caller
   // fails closed (#320: a keep-rule that cannot read a reference must not
@@ -1513,7 +1551,20 @@
     // reference themselves, so `name` may need to stay)
     var remaining = {};
     Object.keys(defs).forEach(function (k) { if (k !== name) remaining[k] = defs[k]; });
-    if (JSON.stringify([out, remaining]).indexOf('"#/' + bag + '/' + name + '"') !== -1) {
+    // Structurally, via the SAME helper the orphan pruner uses. This used to be
+    // `JSON.stringify([out, remaining]).indexOf('"#/' + bag + '/' + name + '"')`
+    // -- a literal match that only ever recognised the plain spelling, so a
+    // pointer INTO the definition just inlined (`#/$defs/T/properties/name`)
+    // looked like nothing referenced `T`, and `T` was DELETED while the pointer
+    // to it stayed in the output. Measured on the DEFAULT form of
+    // `zodToJsonSchema(S, "S")` -- a root `$ref` plus a reused sub-schema, which
+    // is what zod 3 emits for `Inner.shape.one` -- that shipped a dangling
+    // reference at ZERO blockers on `anthropic`, `anthropic-json` and
+    // `anthropic-go`, and on `openai` produced a blocker whose text ("there is
+    // nothing at that location") was FALSE of the input: the reference resolved
+    // until we removed what it resolved to.
+    var refs = localDefRefs([out, remaining], bag);
+    if (refs.bailOut || refs.names[name]) {
       remaining[name] = defs[name];
     }
     if (Object.keys(remaining).length) out[bag] = remaining;
@@ -1744,28 +1795,15 @@
     // count against OpenAI's 5000-property budget), so skipping it is free
     // while a wrong deletion is not.
     if (isPlainObject(result.$defs)) {
-      var referenced = {}, bailOut = false;
-      (function scan(v) {
-        if (bailOut) return;
-        if (Array.isArray(v)) { v.forEach(scan); return; }
-        if (!isPlainObject(v)) return;
-        if (typeof v.$ref === "string") {
-          var m = /^#\/\$defs\/([^/]+)/.exec(v.$ref);
-          if (m) {
-            referenced[decodeURIComponent(m[1]).replace(/~1/g, "/").replace(/~0/g, "~")] = true;
-          } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
-            // A local pointer we cannot attribute to a `$defs` entry. Rather
-            // than guess it is unrelated, stop pruning altogether.
-            bailOut = true;
-          }
-        }
-        Object.keys(v).forEach(function (k) { scan(v[k]); });
-      })(result);
-
-      if (!bailOut) {
+      // Same helper as the root inliner (#372: one rule, one implementation --
+      // these two drifted apart once already and the root copy deleted a live
+      // definition). `bailOut` = an unattributable local pointer, so prune
+      // nothing rather than guess it is unrelated.
+      var found = localDefRefs(result, "$defs");
+      if (!found.bailOut) {
         var kept = {};
         Object.keys(result.$defs).forEach(function (k) {
-          if (referenced[k]) kept[k] = result.$defs[k];
+          if (found.names[k]) kept[k] = result.$defs[k];
         });
         if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
       }

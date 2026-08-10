@@ -7434,5 +7434,166 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// ---- #377: a pointer INTO the definition being inlined at the root ---------
+//
+// `inlineRootRef` decided which definitions to KEEP with a literal
+// `JSON.stringify(doc).indexOf('"#/$defs/T"')`. That only ever recognises the
+// PLAIN spelling, so a pointer INTO the definition it had just inlined
+// (`#/$defs/T/properties/name` -- no closing quote after `T`) read as "nothing
+// references T", and T was DELETED while the pointer to it stayed in the
+// output. #342 fixed exactly this in the orphan PRUNER and the root copy of the
+// same rule was left behind; #372's lesson is that one rule in two functions
+// drifts, so both now share `localDefRefs`.
+(function () {
+  // Guarded reads FIRST (#322): with engine.js reverted these must still let the
+  // file REPORT rather than abort, or the revert number is meaningless.
+  function conv(sch, p) {
+    try { return E.convert(JSON.parse(JSON.stringify(sch)), p) || {}; } catch (e) { return { threw: e }; }
+  }
+  function blk(r) {
+    return (r && r.ledger ? r.ledger : []).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function bagOf(r) {
+    var s = r && r.schema;
+    if (!s || typeof s !== "object") return null;
+    if (s.$defs && typeof s.$defs === "object") return s.$defs;
+    if (s.definitions && typeof s.definitions === "object") return s.definitions;
+    return null;
+  }
+  // Does every local `$ref` in the emitted document still resolve inside it?
+  // This is the property that matters -- "bag present" is a proxy, "the pointer
+  // lands on something" is the thing.
+  function danglingRefs(r) {
+    var s = r && r.schema, out = [];
+    if (!s || typeof s !== "object") return out;
+    (function scan(v) {
+      if (Array.isArray(v)) { v.forEach(scan); return; }
+      if (!v || typeof v !== "object") return;
+      if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#" && v.$ref !== "#") {
+        var toks = v.$ref.replace(/^#\//, "").split("/").map(function (t) {
+          return decodeURIComponent(t).replace(/~1/g, "/").replace(/~0/g, "~");
+        });
+        var cur = s;
+        for (var i = 0; i < toks.length; i++) {
+          if (cur == null || typeof cur !== "object") { cur = undefined; break; }
+          cur = cur[toks[i]];
+        }
+        if (cur === undefined) out.push(v.$ref);
+      }
+      Object.keys(v).forEach(function (k) { scan(v[k]); });
+    })(s);
+    return out;
+  }
+
+  var AFFECTED = ["openai", "anthropic", "anthropic-json", "anthropic-go"];
+
+  // VERBATIM `zodToJsonSchema(S, "S")` output, zod 3 + zod-to-json-schema@3.24.5,
+  // captured 2026-08-10 (#311: test against what the generator really emits).
+  // The root `$ref` + a reused sub-schema (`Inner.shape.one`) is the DEFAULT
+  // shape of the documented call form, not an exotic hand-written one.
+  var ZOD3 = {
+    "$ref": "#/definitions/S",
+    "definitions": {
+      "S": {
+        "type": "object",
+        "properties": {
+          "inner": {
+            "type": "object",
+            "properties": { "one": { "type": "string" }, "two": { "type": "number" } },
+            "required": ["one", "two"],
+            "additionalProperties": false
+          },
+          "echo": { "$ref": "#/definitions/S/properties/inner/properties/one" }
+        },
+        "required": ["inner", "echo"],
+        "additionalProperties": false
+      }
+    },
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  };
+
+  AFFECTED.forEach(function (t) {
+    var r = conv(ZOD3, t);
+    ok("#377 zod3 root `$ref` + pointer into that def keeps its bag (" + t + ")",
+       bagOf(r) !== null);
+    ok("#377 zod3 root `$ref` + pointer into that def emits no dangling `$ref` (" + t + ")",
+       danglingRefs(r).length === 0);
+  });
+
+  // The three targets that were SILENT about it: zero blockers AND a dangling
+  // pointer is the false-pass class -- a broken document handed back as "no
+  // changes needed" (#311: a false pass in a CI gate is worse than no gate).
+  ["anthropic", "anthropic-json", "anthropic-go"].forEach(function (t) {
+    var r = conv(ZOD3, t);
+    ok("#377 `" + t + "` must not report success while emitting a dangling `$ref`",
+       !(blk(r).length === 0 && danglingRefs(r).length > 0));
+  });
+
+  // On `openai` the old code produced a BLOCKER whose text was false of the
+  // input: the reference resolved until we deleted what it resolved to.
+  var oai = conv(ZOD3, "openai");
+  ok("#377 zod3 pointer-into is not blocked as \"dangling\" on openai",
+     blk(oai).length === 0);
+
+  // THE DISCRIMINATOR (#364/#366). Two inputs differing ONLY in whether the
+  // reuse points INTO the definition being inlined or at a SIBLING definition.
+  // Both must survive. Without this pair the rule could be firing on any root
+  // `$ref` at all and every other assertion here would still pass.
+  var INTO = { $ref: "#/$defs/T", $defs: { T: { type: "object",
+    properties: { name: { type: "string" }, alias: { $ref: "#/$defs/T/properties/name" } },
+    required: ["name", "alias"], additionalProperties: false } } };
+  var SIBLING = { $ref: "#/$defs/T", $defs: {
+    T: { type: "object", properties: { name: { type: "string" }, alias: { $ref: "#/$defs/N" } },
+         required: ["name", "alias"], additionalProperties: false },
+    N: { type: "string" } } };
+  var rInto = conv(INTO, "openai"), rSib = conv(SIBLING, "openai");
+  ok("#377 DISCRIMINATOR: pointer INTO the inlined def resolves in the output",
+     danglingRefs(rInto).length === 0 && blk(rInto).length === 0);
+  ok("#377 DISCRIMINATOR: pointer at a SIBLING def still resolves too",
+     danglingRefs(rSib).length === 0 && blk(rSib).length === 0);
+
+  // ---- over-block guards: these hold BOTH ways and are not new coverage -----
+
+  // Ordinary self-recursion uses the plain spelling, which the literal match
+  // already handled. It must keep working.
+  var REC = { $ref: "#/$defs/Node", $defs: { Node: { type: "object",
+    properties: { v: { type: "string" }, next: { $ref: "#/$defs/Node" } },
+    required: ["v", "next"], additionalProperties: false } } };
+  var rRec = conv(REC, "openai");
+  ok("#377 ordinary recursive root `$ref` still keeps its definition",
+     bagOf(rRec) !== null && danglingRefs(rRec).length === 0);
+
+  // The pruner was rewritten onto the shared helper, so prove it still PRUNES.
+  // If `localDefRefs` were wrong in the permissive direction this would fail,
+  // and dead `$defs` count against OpenAI's 5000-property budget.
+  var ORPHAN = { type: "object", properties: { a: { type: "string" } },
+    required: ["a"], additionalProperties: false,
+    $defs: { Unused: { type: "string" } } };
+  var rOrph = conv(ORPHAN, "openai");
+  var orphBag = bagOf(rOrph);
+  ok("#377 a genuinely unreferenced definition is still pruned",
+     orphBag === null || !Object.prototype.hasOwnProperty.call(orphBag, "Unused"));
+
+  // Fail closed (#320): a local pointer that cannot be attributed to a `$defs`
+  // entry must stop the pruning, not be guessed to be unrelated.
+  var UNATTRIB = { type: "object", properties: { a: { $ref: "#/properties/b" }, b: { type: "string" } },
+    required: ["a", "b"], additionalProperties: false,
+    $defs: { Keep: { type: "string" } } };
+  var rUn = conv(UNATTRIB, "openai");
+  var unBag = bagOf(rUn);
+  ok("#377 an unattributable local pointer stops pruning (fails closed)",
+     unBag !== null && Object.prototype.hasOwnProperty.call(unBag, "Keep"));
+
+  // A plain object has no bag and no pointers -- nothing here may touch it.
+  var PLAIN = { type: "object", properties: { a: { type: "string" } },
+    required: ["a"], additionalProperties: false };
+  var rPlain = conv(PLAIN, "openai");
+  ok("#377 a plain object is unaffected",
+     blk(rPlain).length === 0 && bagOf(rPlain) === null &&
+     rPlain.schema && rPlain.schema.properties && rPlain.schema.properties.a &&
+     rPlain.schema.properties.a.type === "string");
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

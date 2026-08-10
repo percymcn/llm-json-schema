@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1183 engine + 264 CLI + 44 ESM/library assertions = **1491** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1201 engine + 264 CLI + 44 ESM/library assertions = **1509** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -714,7 +714,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1491 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1509 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1404,6 +1404,48 @@ example is under the bound as input and over it as a schema. A tool that
 The bound is exported as `SCHEMA_MAX_DEPTH`. The probe that enforces it is
 iterative on purpose — a recursive depth-measurer blows the very stack it exists to
 protect, one frame before the walker it is guarding.
+
+## The pointer that was still there and the definition that wasn't
+
+`zodToJsonSchema(S, "S")` — the documented call form — emits a root `$ref` plus a
+definition bag. Reuse a sub-schema anywhere (`Inner.shape.one`, ordinary code) and
+zod 3 points *into* that same definition:
+
+```json
+{
+  "$ref": "#/definitions/S",
+  "definitions": { "S": { "properties": {
+      "inner": { "properties": { "one": { "type": "string" } } },
+      "echo":  { "$ref": "#/definitions/S/properties/inner/properties/one" } } } }
+}
+```
+
+The root `$ref` has to be inlined — `betaTool()` throws on a root with no `type` —
+and inlining then asks which definitions are still needed. That question was
+answered by searching the document for the literal string `"#/$defs/S"`. The
+pointer above does not contain it: after `S` comes `/`, not the closing quote. So
+`S` read as unreferenced, `S` was **deleted**, and the pointer to it was left in
+the output.
+
+Measured on the payload above, that shipped a dangling reference at **zero
+blockers** on `--to anthropic`, `anthropic-json` and `anthropic-go` — a broken
+document handed back as "no changes needed" — and on `--to openai` produced a
+blocker reading *"points into this document but there is nothing at that
+location"*, which was **false of the input**: the reference resolved until we
+removed what it resolved to.
+
+The same rule already existed, already fixed, twelve hundred lines away. The
+orphan-`$defs` pruner had been converted to a structural scan for exactly these
+two spellings — a pointer into a definition, and an RFC 6901 escape (`a/b`
+written `a~1b`) — and the root inliner kept the string match it was fixed *for*.
+Both now call one `localDefRefs`, so they cannot drift again. It decides what to
+**keep**, so it fails closed: a local pointer it cannot attribute stops the
+pruning rather than being guessed to be unrelated.
+
+A `$ref` fragment is a URI-encoded JSON Pointer, so a token is decoded and then
+unescaped before it is compared with a definition name, and only the *first*
+token is taken — which is what makes a pointer into a definition count as a
+reference to it.
 
 ## License
 MIT.
