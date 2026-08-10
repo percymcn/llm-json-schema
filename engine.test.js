@@ -7150,5 +7150,119 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- #374: `$ref` expansion is bounded (DoS on untrusted schemas) ----------
+// A `$ref` DAG that merely SHARES definitions -- `d[i]` referenced from two
+// properties of `d[i+1]` -- expands to 2^depth when inlined. Before this was
+// bounded, a 3.1 KB input killed the process with `FATAL ERROR: JavaScript heap
+// out of memory` (exit 134) on `--to gemini`, i.e. a CI gate that returns no
+// verdict at all. Reachable population is untrusted/hand-authored schemas, which
+// is exactly what an MCP host forwards; `openai-agents` 0.19.4 ships the same
+// bound for the same stated reason.
+function fanoutSchema(depth, cyclic) {
+  var defs = cyclic
+    ? { d0: { type: "object", properties: { loop: { $ref: "#/$defs/d" + depth } }, required: ["loop"] } }
+    : { d0: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } };
+  for (var i = 1; i <= depth; i++) {
+    defs["d" + i] = { type: "object", required: ["x", "y"], properties: {
+      x: { $ref: "#/$defs/d" + (i - 1) }, y: { $ref: "#/$defs/d" + (i - 1) } } };
+  }
+  return { type: "object", required: ["root"],
+    properties: { root: { $ref: "#/$defs/d" + depth } }, $defs: defs };
+}
+
+(function () {
+  // Depth 14 is deliberately modest: it is over the budget, and it is also small
+  // enough that the PRE-FIX code terminates (~3s) rather than hanging, so a
+  // reverted run REPORTS these failures instead of wedging the suite (#322).
+  var deep = fanoutSchema(14, false);
+  var g = E.toGemini(JSON.parse(JSON.stringify(deep)), false);
+  ok("#374 narrow gemini bounds `$ref` expansion instead of exhausting the heap",
+     has(g.ledger, "exceeds 100,000 nodes"));
+  ok("#374 the expansion blocker is a blocker, not an advisory",
+     (g.ledger || []).some(function (l) {
+       return l.op === "!" && l.msg.indexOf("exceeds 100,000 nodes") !== -1 && !l.advisory;
+     }));
+  // No repair is invented (#329) and the remedy is the one measured to work.
+  ok("#374 the expansion blocker names `--to gemini-json` as the remedy",
+     has(g.ledger, "--to gemini-json"));
+  // The property that actually matters, and the one I got wrong on the first
+  // pass: no PARTIALLY expanded document may escape. `$defs` is still stripped
+  // downstream (measured from a consumer install; the pre-existing recursive-
+  // `$ref` blocker does the same), so the assertion is on size, not visibility.
+  ok("#374 the expansion blocker emits no partially-expanded document",
+     g.schema && JSON.stringify(g.schema).length < 5000);
+
+  // THE DISCRIMINATOR: the same input on the permissive path. `responseJsonSchema`
+  // accepts `$ref`/`$defs` as written, so nothing is expanded and nothing is
+  // bounded. Without this pair the rule could be firing on any `$ref` at all and
+  // every other assertion here would still pass (#364/#366).
+  var j = E.toGemini(JSON.parse(JSON.stringify(deep)), true);
+  ok("#374 gemini-json does NOT bound: it never inlines, so there is nothing to bound",
+     !has(j.ledger, "exceeds 100,000 nodes"));
+  ok("#374 gemini-json emits no blocker for a shared acyclic `$ref` DAG",
+     !(j.ledger || []).some(function (l) { return l.op === "!"; }));
+})();
+
+(function () {
+  // The cycle scan walked PATHS, not nodes, so it was 2^depth on the same shape
+  // even though it can only report something when a cycle exists. This is the
+  // memo + short-circuit discriminator: a generous wall-clock bound that the
+  // pre-fix code cannot meet (measured ~10s at this depth) and the fixed code
+  // clears by two orders of magnitude (~40ms).
+  var t0 = Date.now();
+  var j = E.toGemini(fanoutSchema(18, false), true);
+  var ms = Date.now() - t0;
+  ok("#374 gemini-json handles a depth-18 shared `$ref` DAG in well under 2s (was exponential)",
+     ms < 2000 && !!j.schema);
+})();
+
+(function () {
+  // Over-block guard, holding both ways: an ORDINARY schema that reuses one
+  // definition twice is the commonest `$ref` DAG there is (two address fields of
+  // the same model). It must be completely untouched by any of this.
+  var ordinary = { type: "object", required: ["billing", "shipping"], properties: {
+      billing: { $ref: "#/$defs/Address" }, shipping: { $ref: "#/$defs/Address" } },
+    $defs: { Address: { type: "object", required: ["city"], properties: { city: { type: "string" } } } } };
+  var g = E.toGemini(JSON.parse(JSON.stringify(ordinary)), false);
+  ok("#374 an ordinary shared-definition schema is not bounded or blocked",
+     !has(g.ledger, "exceeds 100,000 nodes") &&
+     !has(g.ledger, "would take exponential time"));
+  ok("#374 an ordinary shared-definition schema still inlines normally",
+     has(g.ledger, "Inlined"));
+})();
+
+(function () {
+  // The cycle rule still WORKS -- the short-circuit must not have disabled it.
+  // This is the assertion that stops the optimisation from becoming a false pass.
+  var cyc = { type: "object", required: ["node"], properties: { node: { $ref: "#/$defs/N" } },
+    $defs: { N: { type: "object", required: ["child"], properties: { child: { $ref: "#/$defs/N" } } } } };
+  var j = E.toGemini(JSON.parse(JSON.stringify(cyc)), true);
+  ok("#374 a cyclic `required` property is still reported after the acyclic short-circuit",
+     has(j.ledger, "its type is cyclic"));
+})();
+
+(function () {
+  // Cyclic AND heavily shared: enumerating every offending path is exponential,
+  // so the scan stops -- and a SHORT list would be a false pass, so the
+  // truncation itself is reported as a blocker (fail closed).
+  // Depth 10, chosen so a REVERTED run still terminates and REPORTS rather than
+  // wedging the suite (#322). Pre-fix has neither the memo nor the acyclic
+  // short-circuit, so cost here is 2^depth twice over; depth 14 did not come
+  // back inside 400s when I actually tried it, which is why this is 10.
+  var t0 = Date.now();
+  var j = E.toGemini(fanoutSchema(10, true), true);
+  var ms = Date.now() - t0;
+  ok("#374 a cyclic + heavily-shared schema terminates instead of running forever",
+     ms < 3000);
+  ok("#374 truncated cycle enumeration fails CLOSED with its own blocker",
+     has(j.ledger, "may be incomplete"));
+})();
+
+(function () {
+  ok("#374 the expansion bound is exported so it can be diffed against the corpus",
+     E.REF_INLINE_MAX_NODES === 100000);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

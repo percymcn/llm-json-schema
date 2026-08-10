@@ -126,6 +126,17 @@ export const DOCS: Record<Provider, string>;
 export const GEMINI_ALLOWED_KEYS: string[];
 
 /**
+ * Ceiling on how many nodes `$ref` inlining may expand to before `--to gemini`
+ * and `--to gemini-client` stop and report a blocker. Inlining turns a `$ref`
+ * DAG into a tree, so a definition referenced twice per level costs 2^depth
+ * nodes; without a bound a 3 KB schema can exhaust the heap. The largest schema
+ * in this project's 597-input corpus is 21 nodes, so the bound is ~5,000x any
+ * real input. The permissive `--to gemini-json` path never inlines and is
+ * therefore unaffected.
+ */
+export const REF_INLINE_MAX_NODES: number;
+
+/**
  * Keys `@ai-sdk/google`'s `convertJSONSchemaToOpenAPISchema` destructures, i.e.
  * everything that can reach Gemini's narrow `responseSchema` path through that
  * client. Snapshot of @ai-sdk/google 4.0.39 — re-measure after a version bump.
@@ -246,6 +257,7 @@ declare const api: {
   toGemini: typeof toGemini;
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
+  REF_INLINE_MAX_NODES: typeof REF_INLINE_MAX_NODES;
   AI_SDK_GOOGLE_FORWARDED_KEYS: typeof AI_SDK_GOOGLE_FORWARDED_KEYS;
   GEMINI_CLIENT_CARRIED_KEYS: typeof GEMINI_CLIENT_CARRIED_KEYS;
   GEMINI_CLIENT_MEMBERS: typeof GEMINI_CLIENT_MEMBERS;

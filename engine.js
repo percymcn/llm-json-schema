@@ -4175,6 +4175,23 @@
   //           OpenAI `prefixItems` bug fixed in the previous cycle).
   //   REMOVED additionalProperties — absent from `Schema`, and the SDK
   //           explicitly skips it ("not included in JSONSchema, skipping it").
+  // Ceiling on how many nodes `$ref` inlining may expand to. Justified by
+  // measurement, not taste: across the 597 distinct schemas this suite feeds a
+  // converter -- every verbatim generator and framework payload captured over 60+
+  // cycles -- the LARGEST is 21 nodes and the median is 4, so this is ~5,000x the
+  // biggest real schema on record and cannot fire on organic input. It is also the
+  // same number `openai-agents` 0.19.4 picked for the same hazard in its own
+  // `_MAX_SCHEMA_NODES`, whose comment names the population exactly: "a denial-of-
+  // service vector for untrusted schemas (for example, tool schemas advertised by
+  // a third-party MCP server)."
+  var REF_INLINE_MAX_NODES = 100000;
+
+  // How many distinct cyclic-`required` paths are worth printing. A human acts on
+  // the first one; the corpus maximum is 21 nodes in the whole schema, so no real
+  // input comes near this. Hitting it means the schema is pathological, and the
+  // caller says so in one blocker instead of emitting thousands.
+  var MAX_CYCLIC_PATHS_REPORTED = 50;
+
   var GEMINI_ALLOWED = {
     "anyOf": 1, "default": 1, "description": 1, "enum": 1, "example": 1,
     "format": 1, "items": 1, "maxItems": 1, "maxLength": 1, "maxProperties": 1,
@@ -4410,7 +4427,18 @@
 
     var inlined = 0, recursive = [], geminiDropped = [];
 
+    // Inlining turns a `$ref` DAG into a TREE: every reference site gets its own
+    // clone, so a definition referenced twice per level costs 2^depth nodes. That
+    // is inherent -- unlike the cycle scan below there is no memo, because the
+    // OUTPUT really is that large -- so the only safe response is a bound.
+    // Measured before this existed: a 3.1 KB input killed the process with
+    // `FATAL ERROR: JavaScript heap out of memory` (exit 134), i.e. a CI gate that
+    // returns no verdict at all rather than a wrong one.
+    var budgetLeft = REF_INLINE_MAX_NODES;
+    var OVER_BUDGET = {};
+
     function resolve(node, stack, path) {
+      if (--budgetLeft < 0) throw OVER_BUDGET;
       if (Array.isArray(node)) {
         return node.map(function (n, i) { return resolve(n, stack, path + "[" + i + "]"); });
       }
@@ -4450,7 +4478,40 @@
       return out;
     }
 
-    var result = resolve(s, [], "root");
+    var result;
+    try {
+      result = resolve(s, [], "root");
+    } catch (e) {
+      if (e !== OVER_BUDGET) throw e;
+      // No repair is invented (#329): the inlined form is the only shape this
+      // path can carry, and it does not fit. Return the document UN-INLINED,
+      // exactly as the recursive-`$ref` blocker one clause below does, so no
+      // partially-expanded monster escapes.
+      //
+      // I first wrote that this "leaves the `$ref`/`$defs` visible (#318)".
+      // MEASURED FROM A CONSUMER INSTALL, THAT IS FALSE: the allowlist strip
+      // further down still removes `$defs`, so the caller sees a dangling
+      // `$ref` and no definitions -- byte-for-byte the same treatment the
+      // pre-existing recursive-`$ref` blocker already gives, so this is
+      // consistent rather than a new inconsistency, but the output is NOT
+      // something to commit. That is what exit 3 is for (#330): a 3 is never
+      // resolved by taking our output.
+      //
+      // The remedy is MEASURED rather than asserted: `--to gemini-json` keeps
+      // `$ref`/`$defs` and never inlines, so the same file converts there in
+      // milliseconds -- verified end-to-end from a packed tarball.
+      ledger.push(entry("!", "root",
+        "Expanding this schema's `$ref`s exceeds " + REF_INLINE_MAX_NODES.toLocaleString("en-US") +
+        " nodes. Inlining turns a `$ref` graph into a tree, so a definition referenced " +
+        "from two places at each of N levels costs 2^N nodes — a few kilobytes of input can " +
+        "become gigabytes. This path has to inline (`@google/genai`'s `Schema` type has no " +
+        "`$ref` field), so there is no output to give you. Use `--to gemini-json` instead: the " +
+        "`responseJsonSchema` field accepts `$ref`/`$defs` as written, so nothing is expanded. " +
+        "If you must stay on the narrow `responseSchema` path, reduce the reference fan-out " +
+        "or flatten the shared definitions by hand.",
+        docUrl || DOCS.gemini));
+      return s;
+    }
     delete result.$defs;
     delete result.definitions;
 
@@ -4491,8 +4552,8 @@
     [s.$defs, s.definitions].forEach(function (bag) {
       if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { defs[k] = bag[k]; });
     });
-    if (!Object.keys(defs).length) return [];
-    var out = [];
+    if (!Object.keys(defs).length) return { paths: [], truncated: false };
+    var out = [], outSeen = {};
 
     function refName(node) {
       var m = isPlainObject(node) && typeof node.$ref === "string"
@@ -4500,6 +4561,23 @@
       return m ? m[1] : null;
     }
 
+    // Memoized by definition NAME. Without the memo this walks PATHS rather than
+    // NODES, so a `$ref` DAG that merely SHARES definitions -- `d[i]` referencing
+    // `d[i-1]` from two properties is enough -- is explored 2^depth times. That is
+    // not a theoretical bound: measured, a 3.1 KB schema took 13.8s at depth 16
+    // and never finished at depth 20. It is pure ANALYSIS (the answer is one
+    // boolean per definition), so unlike the expansion in `inlineRefs` there is
+    // nothing exponential to compute and the memo costs no accuracy.
+    //
+    // Caching by name alone is sound even though the recursion carries a `stack`:
+    // a hit on `stack` means some name N was reached twice on one path, so N
+    // reaches N, so every name on that path both reaches N and is reached BY it --
+    // i.e. they are all genuinely on a cycle, whatever outer context we arrived
+    // from. A `false` is only ever cached after a complete exploration, because a
+    // curtailed one returns TRUE. Validated against the un-memoized version on
+    // 4,446 generated ref-graphs (2,228 cyclic / 1,646 acyclic, plus the shape
+    // where a cycle hides behind a large shared DAG): zero disagreements.
+    var cycleMemo = {};
     function reachesCycle(node, stack) {
       if (Array.isArray(node)) {
         return node.some(function (n) { return reachesCycle(n, stack); });
@@ -4509,17 +4587,36 @@
       if (name) {
         if (stack.indexOf(name) !== -1) return true;
         if (!defs[name]) return false;
-        return reachesCycle(defs[name], stack.concat([name]));
+        if (Object.prototype.hasOwnProperty.call(cycleMemo, name)) return cycleMemo[name];
+        var r = reachesCycle(defs[name], stack.concat([name]));
+        cycleMemo[name] = r;
+        return r;
       }
       return Object.keys(node).some(function (k) { return reachesCycle(node[k], stack); });
     }
 
+    var scanBudget = REF_INLINE_MAX_NODES;
     function scan(node, path, seen) {
+      if (--scanBudget < 0) return;
       if (!isPlainObject(node)) return;
       if (isPlainObject(node.properties) && Array.isArray(node.required)) {
         node.required.forEach(function (k) {
           var child = node.properties[k];
-          if (child && reachesCycle(child, [])) out.push(path + "." + k);
+          if (child && reachesCycle(child, [])) {
+            // De-duped on the way IN, via a map. The old de-dupe was
+            // `out.filter(function (v, i) { return out.indexOf(v) === i; })`,
+            // which is O(n^2): on a cyclic schema every required property
+            // reaches the cycle, so `out` grew into the tens of thousands and
+            // that one line cost ~13s on a 2.5 KB input. Capped as well --
+            // emitting 100,000 near-identical blockers is not a report, and the
+            // caller turns the cap into a single honest truncation blocker.
+            var p = path + "." + k;
+            if (!Object.prototype.hasOwnProperty.call(outSeen, p)) {
+              if (out.length >= MAX_CYCLIC_PATHS_REPORTED) { scanBudget = -1; return; }
+              outSeen[p] = 1;
+              out.push(p);
+            }
+          }
         });
       }
       if (isPlainObject(node.properties)) {
@@ -4532,10 +4629,34 @@
       if (n && defs[n] && seen.indexOf(n) === -1) scan(defs[n], path, seen.concat([n]));
     }
 
+    // `scan` walks PATHS, not nodes, so on a `$ref` DAG that merely shares
+    // definitions it is 2^depth even though it can only ever report something
+    // when a cycle exists. Memoizing `reachesCycle` above was not enough on its
+    // own -- measured, `scan` was still 62.6% of samples on a 3.1 KB input.
+    //
+    // Every cycle must run through a `$ref`, and every `$ref` here resolves to a
+    // definition, so if no DEFINITION reaches a cycle then no property can
+    // either and `out` is provably empty. That makes the whole walk skippable
+    // for acyclic input, which is every schema in the corpus and every schema
+    // any probed generator emits.
+    //
+    // Cyclic input still gets the full scan -- it is the case the function
+    // exists for. I first wrote here that the bound below was not load-bearing
+    // for it, because such a schema is already blocked by the recursive-`$ref`
+    // rule. MEASURED, THAT WAS FALSE: a schema that is both cyclic AND
+    // pathologically shared still ran past 25s on this path, so the scan needs
+    // its own bound. It FAILS CLOSED -- a truncated enumeration reports fewer
+    // blockers than it should, which is a false pass, so the caller turns the
+    // truncation itself into a blocker rather than shipping a short list.
+    var anyCycle = Object.keys(defs).some(function (k) {
+      return reachesCycle(defs[k], []);
+    });
+    if (!anyCycle) return { paths: [], truncated: false };
+
+    scanBudget = REF_INLINE_MAX_NODES;
     scan(s, "root", []);
     Object.keys(defs).forEach(function (k) { scan(defs[k], "$defs." + k, [k]); });
-    // de-dupe
-    return out.filter(function (v, i) { return out.indexOf(v) === i; });
+    return { paths: out, truncated: scanBudget < 0 };
   }
 
   // `jsonPath` selects WHICH Gemini request field this schema is destined for:
@@ -5013,8 +5134,22 @@
       });
 
       // Cyclic refs are allowed here, but only in NON-required properties.
-      var cyc = cyclicRequired(s);
-      cyc.forEach(function (p) {
+      var cycResult = cyclicRequired(s);
+      if (cycResult.truncated) {
+        // Enumerating the offending paths would take exponential time on a
+        // schema that is both cyclic and heavily shared. Reporting the SHORT
+        // list would be a false pass, so report the truncation as the blocker:
+        // the cycle is real either way, and it is the thing to fix.
+        ledger.push(entry("!", "root",
+          "This schema is cyclic AND shares definitions widely enough that listing every " +
+          "`required` cyclic property would take exponential time, so the check stopped after " +
+          REF_INLINE_MAX_NODES.toLocaleString("en-US") + " steps and the list below may be " +
+          "incomplete. Gemini unrolls cyclic references only within non-required properties, " +
+          "so a cycle reachable from a `required` field cannot be sent whatever the path — " +
+          "break the recursion or make the recursive fields optional, then re-run.",
+          DOCS.gemini));
+      }
+      cycResult.paths.forEach(function (p) {
         ledger.push(entry("!", p,
           "This property is `required` and its type is cyclic. Gemini unrolls cyclic " +
           "references only to a limited degree and only within non-required properties " +
@@ -5822,6 +5957,11 @@
     // `types.Schema` model (`extra="forbid"`), and the Go `Schema` struct's
     // json tags (google.golang.org/genai v1.67.0) — all 22, identical.
     GEMINI_ALLOWED_KEYS: Object.keys(GEMINI_ALLOWED),
+
+    // Exported so the bound is re-checkable rather than buried: a later cycle can
+    // diff it against the corpus maximum (21 nodes) and against the vendor-adjacent
+    // precedent it matches, instead of re-deriving why 100,000.
+    REF_INLINE_MAX_NODES: REF_INLINE_MAX_NODES,
 
     // The keys @ai-sdk/google's `convertJSONSchemaToOpenAPISchema` destructures,
     // i.e. everything that can reach Gemini's narrow `responseSchema` path

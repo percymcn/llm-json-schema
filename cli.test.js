@@ -1432,7 +1432,6 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
 })();
 
 
-console.log("\n" + pass + " passed, " + fail + " failed");
 // --- #363: exit codes for shapes the walk MANUFACTURED --------------------
 // A blocker is exit 3 and a fixable schema is exit 1, and the distinction is the
 // whole point for a CI caller (#330): a 1 is resolved by committing our output, a
@@ -1567,6 +1566,49 @@ console.log("\n" + pass + " passed, " + fail + " failed");
     gcOut.stdout + " || " + gnOut.stdout);
   ok("#368 CLI: the fork never fails the gate",
     gc.status === 0, "status " + gc.status);
+})();
+
+
+// --- #374: the gate must ANSWER on an adversarial `$ref` fan-out ------------
+// Pre-fix this exact invocation died with `FATAL ERROR: JavaScript heap out of
+// memory` and exit 134 -- an exit code the CLI does not document, i.e. a CI gate
+// that crashes rather than returning a verdict. Exit codes are the actual
+// contract for a gate, so they are asserted here and not only in-process.
+function fanout(depth) {
+  var defs = { d0: { type: "object", properties: { a: { type: "string" } }, required: ["a"] } };
+  for (var i = 1; i <= depth; i++) {
+    defs["d" + i] = { type: "object", required: ["x", "y"], properties: {
+      x: { $ref: "#/$defs/d" + (i - 1) }, y: { $ref: "#/$defs/d" + (i - 1) } } };
+  }
+  return JSON.stringify({ type: "object", required: ["root"],
+    properties: { root: { $ref: "#/$defs/d" + depth } }, $defs: defs });
+}
+
+(function () {
+  var deep = fanout(14);
+  var g = run(["--to", "gemini", "--check", "-"], deep);
+  ok("#374 CLI: adversarial `$ref` fan-out exits 3, not 134", g.status === 3,
+     "status=" + g.status);
+  ok("#374 CLI: the blocker reaches the installed binary",
+     (g.stderr + g.stdout).indexOf("exceeds 100,000 nodes") !== -1);
+
+  // Same bytes, other target: the two genuinely disagree, which is what makes
+  // the blocker's remedy real rather than a suggestion.
+  var j = run(["--to", "gemini-json", "--check", "-"], deep);
+  ok("#374 CLI: the same file passes on `--to gemini-json` (the named remedy)",
+     j.status === 0, "status=" + j.status);
+})();
+
+(function () {
+  // Over-block guard: the seven targets that never inline were always safe and
+  // must stay untouched by the bound.
+  var deep = fanout(14);
+  ["openai", "anthropic", "anthropic-go"].forEach(function (t) {
+    var r = run(["--to", t, "--check", "-"], deep);
+    ok("#374 CLI: `--to " + t + "` is unaffected by the expansion bound",
+       r.status !== 3 && (r.stderr + r.stdout).indexOf("exceeds 100,000 nodes") === -1,
+       "status=" + r.status);
+  });
 })();
 
 

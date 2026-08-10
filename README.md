@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1152 engine + 258 CLI + 42 ESM/library assertions = **1452** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1165 engine + 264 CLI + 43 ESM/library assertions = **1472** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -714,7 +714,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1452 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1472 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1293,6 +1293,57 @@ An empty `type: []` is deliberately **not** this rule: that is a list-valued
 `type` with zero members, which the live endpoint rejects with a proto *shape*
 error rather than the enum-value error, so it belongs to the union-`type`
 handling instead. It is pinned by a scope test.
+
+## A 3 KB schema that killed the process
+
+Every rule above is about what a provider *accepts*. This one is about whether the
+gate answers at all.
+
+`--to gemini` has to inline `$ref`s — `@google/genai`'s `Schema` type has no `$ref`
+field — and inlining turns a reference **graph** into a **tree**. A definition
+referenced from two properties at each of N levels costs 2^N nodes. Measured, on a
+**3.1 KB** input:
+
+| depth | `--to gemini` (before) | `--to gemini` (now) |
+|---|---|---|
+| 12 | ~1 s | 0.3 s, exit 3 |
+| 16 | 13.8 s | 0.3 s, exit 3 |
+| 20 | **`FATAL ERROR: JavaScript heap out of memory`, exit 134** | 0.3 s, exit 3 |
+
+Exit 134 is not one of this tool's documented exit codes. A CI gate that crashes
+does not return a wrong verdict — it returns *no* verdict, which is why this is
+worth a section of its own.
+
+Two independent mechanisms were involved, and they needed **opposite** fixes:
+
+- **Inlining** genuinely produces 2^N nodes. Nothing can compute that cheaply, so
+  it is now **bounded** (`REF_INLINE_MAX_NODES`, exported). Over the budget you get
+  a blocker naming the remedy rather than a repair (there is none — the inlined
+  form is the only shape the narrow path can carry).
+- **The cycle scan** produced one boolean per definition and was exponential purely
+  because it walked *paths* instead of *nodes*. That needed **memoization**, not a
+  bound: the answer was always small, only the traversal was large. It is also
+  skipped outright when no definition reaches a cycle, which is provably safe
+  (every cycle runs through a `$ref`, and every `$ref` resolves to a definition).
+  A third fix removed an `O(n²)` de-duplication that cost ~13 s by itself.
+
+The remedy the blocker names is measured, not asserted: **`--to gemini-json`** puts
+the schema in the `responseJsonSchema` field, which accepts `$ref`/`$defs` as
+written, so nothing is expanded — the same file converts there in **39 ms**.
+
+**Who this affects.** Not ordinary generator output: across the 597 distinct schemas
+this project's suite feeds a converter — every verbatim `pydantic` / `zod` /
+framework payload captured to date — the largest is **21 nodes** and the median is
+**4**. The bound is ~5,000× that and cannot fire on organic input. The population it
+protects is *untrusted* schemas: an MCP host forwards tool schemas advertised by
+third-party servers, and this tool ships as a library (`convert()`) that such a host
+can call. `openai-agents` 0.19.4 ships the same bound for the same stated reason —
+its comment calls an exponential `$ref` fan-out "a denial-of-service vector for
+untrusted schemas (for example, tool schemas advertised by a third-party MCP
+server)."
+
+The other seven targets never inline and were never affected (~40 ms at depth 26);
+that is asserted, not assumed.
 
 ## License
 MIT.
