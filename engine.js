@@ -1563,6 +1563,58 @@
       disjointClosedObjects(l, r);
   }
 
+  // OpenAI strict mode refuses `anyOf` on a node that ALSO has object shape:
+  // "Object anyOf schema at `X` cannot be represented in strict Structured
+  // Outputs without changing Draft 7 validation." Mirrored from
+  // openai@7.4.0 lib/transform.js clause for clause, INCLUDING its escape hatch,
+  // because a blanket rule here would be the over-strictness class this project
+  // has shipped repeatedly: when the node is a bare `{"type": "object"}` wrapper
+  // carrying no object keywords of its own and every branch is object-only, the
+  // vendor deletes the redundant `type` and accepts (its own comment: the union
+  // already excludes null and every non-object value). Measured both ways —
+  // adding `additionalProperties: false`, adding `properties`, or making one
+  // branch a scalar each flips it back to a throw.
+  var OPENAI_OBJECT_KEYWORDS = ["additionalProperties", "dependencies", "maxProperties",
+    "minProperties", "patternProperties", "properties", "propertyNames", "required"];
+
+  function hasOpenAIObjectShape(node) {
+    var t = node.type;
+    if (t === "object") return true;
+    if (Array.isArray(t) && t.indexOf("object") !== -1) return true;
+    if (t === undefined) {
+      return OPENAI_OBJECT_KEYWORDS.some(function (k) { return k in node; });
+    }
+    return false;
+  }
+
+  // Would giving this node an `anyOf` of `branches` make the vendor throw?
+  function openaiObjectUnionThrows(node, branches, root) {
+    // No union on this node, nothing for the vendor to refuse. This guard is
+    // load-bearing: without it the function reports "throws" for every ordinary
+    // object node, and the sweep measured 26 corpus schemas over-blocked that
+    // the vendor accepts as written. An empty `anyOf: []` still counts as a
+    // union — the vendor tests `Array.isArray`, not length (#347).
+    if (!Array.isArray(branches)) return false;
+    if (!hasOpenAIObjectShape(node)) return false;
+    var t = node.type;
+    // The hatch needs `type` to be a redundant object wrapper — exactly "object",
+    // or a union of nothing but "object"/"null".
+    var redundant = t === "object" ||
+      (Array.isArray(t) && t.indexOf("object") !== -1 &&
+        t.every(function (x) { return x === "object" || x === "null"; }));
+    if (!redundant) return true;
+    if (OPENAI_OBJECT_KEYWORDS.some(function (k) { return k in node; })) return true;
+    // Every branch must be object-only. Unresolvable branches count as NOT
+    // object-only: guessing "safe" here manufactures a vendor rejection, while
+    // guessing "unsafe" only costs a note on a schema that would have worked.
+    return !branches.every(function (b) {
+      var r = isPlainObject(b) && typeof b.$ref === "string" ? resolveLocalDef(root, b.$ref) : b;
+      if (!isPlainObject(r)) return false;
+      if (r.type === "object") return true;
+      return Array.isArray(r.type) && r.type.length && r.type.every(function (x) { return x === "object"; });
+    });
+  }
+
   function oneOfProvablyExclusive(branches, root) {
     if (!Array.isArray(branches)) return false;
     // `false` can never validate, so it cannot overlap anything.
@@ -1701,9 +1753,28 @@
         "Root must be an object. OpenAI strict mode rejects a non-object root — wrap your schema in an object.",
         DOCS.openai));
     }
-    if (s.anyOf) {
+    // BOTH spellings, and the `oneOf` half is not hypothetical: this blocker used
+    // to read `if (s.anyOf)` and runs BEFORE the walk, where `oneOf` is rewritten
+    // to `anyOf` — so a root `oneOf` sailed past the check and the walk then
+    // manufactured exactly the `anyOf` root this rule exists to catch. The two
+    // are one keyword apart in the real generator: pydantic 2.13.4 emits a root
+    // `anyOf` for `RootModel[Union[A, B]]` and a root `oneOf` for the SAME union
+    // once you add `Field(discriminator=...)`, so adding a discriminator — the
+    // more precise, recommended form — was what turned a correct blocker into a
+    // "fix" whose output openai@7.4.0 rejects.
+    //
+    // Fatal in either spelling, measured: left as `oneOf` the root has no `type`
+    // (`Root schema must have type: 'object' but got type: undefined`); rewritten
+    // to `anyOf` it hits `Root schema must not use \`anyOf\``. There is no root
+    // form of a union, which is why this names a remodelling instead of a repair.
+    if (s.anyOf || s.oneOf) {
       ledger.push(entry("!", "root",
-        "Root schema cannot use anyOf. Move the anyOf under a named property.",
+        "Root schema cannot use `" + (s.anyOf ? "anyOf" : "oneOf") + "`. OpenAI strict mode has no " +
+        "union root at all: as `oneOf` the root carries no `type` (`Root schema must have type: " +
+        "'object'`), and as `anyOf` it is refused outright (`Root schema must not use \`anyOf\``). " +
+        "Move the union under a named property — `{\"type\": \"object\", \"properties\": " +
+        "{\"result\": <your union>}, \"required\": [\"result\"], \"additionalProperties\": false}` — " +
+        "which keeps every branch intact.",
         DOCS.openai));
     }
 
@@ -1859,6 +1930,33 @@
             "in an OpenAI strict schema\"). Merge them into a single `anyOf` yourself — we will not " +
             "guess which one you meant, because either guess changes what the schema accepts.",
             DOCS.openai));
+        } else if (openaiObjectUnionThrows(node, node.oneOf, s)) {
+          // Keep it: the strip below would delete the "exactly one" constraint,
+          // and the whole point here is that the vendor's zod helpers accept
+          // this node BYTE-IDENTICAL. Without this flag the note said "Kept
+          // `oneOf`" while the next rule removed it -- and the vendor then
+          // "accepted" our output only because the constraint was gone.
+          oneOfBlocked = true;
+          // The rewrite is right in general and WRONG here: this node also has
+          // object shape, and `{type: "object", ..., anyOf: [...]}` is exactly
+          // what the vendor throws on. Measured on openai@7.4.0: the input as
+          // written is ACCEPTED VERBATIM by `toStrictJsonSchema()` (the five zod
+          // helpers), so rewriting it took a schema OpenAI accepts and produced
+          // one it rejects. Leave the `oneOf` alone and say what the other helper
+          // family does — advisory, never a gate failure, because the schema IS
+          // valid on the path most callers are on.
+          ledger.push(entry("!", path,
+            "Kept `oneOf` here rather than rewriting it to `anyOf`, and which OpenAI helper you " +
+            "call decides whether that is enough. This node declares object shape, and " +
+            "`toStrictJsonSchema()` — what the five `helpers/zod` builders use — accepts this node " +
+            "BYTE-IDENTICAL, so on `zodResponseFormat`/`zodTextFormat`/`zodFunction` you are fine. " +
+            "The `helpers/standard-schema` builders are not: they run " +
+            "`normalizeStructuredOutputSchema()` first, which performs this very `oneOf` -> `anyOf` " +
+            "rewrite, and then their own `toStrictJsonSchema()` throws \"Object anyOf schema at `" +
+            path + "` cannot be represented in strict Structured Outputs\". The vendor's two helper " +
+            "families contradict each other on this one shape and no single document satisfies both " +
+            "— so if you are on `standardResponseFormat`, move the union to its own property.",
+            DOCS.openai, true));
         } else if (oneOfProvablyExclusive(node.oneOf, s)) {
           node.anyOf = node.oneOf;
           delete node.oneOf;
@@ -1877,6 +1975,46 @@
             "acceptable, or add a discriminator property with distinct literal values to each branch.",
             DOCS.openai));
         }
+      }
+
+      // A node that ALREADY carries `anyOf` beside object shape. Unlike the
+      // `oneOf` case above there is no helper family that takes it: measured on
+      // openai@7.4.0, BOTH `toStrictJsonSchema()` and the standard-schema
+      // pipeline throw. So this is a blocker, not a change we can make — we used
+      // to report "1 change" and hand back output the vendor rejects, which is
+      // the one thing a gate must never do. `oneOf` siblings are owned by the
+      // branch above, so this never double-reports (#359).
+      if (path !== "root" && node.oneOf === undefined &&
+          openaiObjectUnionThrows(node, node.anyOf, s)) {
+        ledger.push(entry("!", path,
+          "This node declares object shape AND an `anyOf`. OpenAI strict mode refuses that " +
+          "combination outright (\"Object anyOf schema at `" + path + "` cannot be represented in " +
+          "strict Structured Outputs without changing Draft 7 validation\") and there is no edit " +
+          "we can make that keeps the meaning — dropping `type: \"object\"` would let a non-object " +
+          "match, and dropping the object keywords would delete constraints you wrote. Move the " +
+          "union under its own property, or drop the object keywords from THIS node so it becomes " +
+          "a bare `{\"type\": \"object\"}` wrapper — the vendor has an explicit escape hatch for " +
+          "that form (no object keywords of its own, every branch object-only) and accepts it.",
+          DOCS.openai));
+      }
+
+      // The vendor's escape hatch survives only if we do not destroy it, and by
+      // default we do: the rule below sets `additionalProperties: false` on every
+      // object, which is an object keyword, which is exactly what closes the
+      // hatch. Two individually correct edits composing into a vendor rejection
+      // (#348). Do here what the vendor does — drop the redundant `type` — which
+      // is lossless for the same reason the vendor gives (every branch is
+      // object-only, so the union already excludes null and every non-object
+      // value) and leaves output the vendor takes BYTE-IDENTICAL.
+      if (path !== "root" && node.type !== undefined && Array.isArray(node.anyOf) &&
+          hasOpenAIObjectShape(node) && !openaiObjectUnionThrows(node, node.anyOf, s)) {
+        delete node.type;
+        ledger.push(entry("~", path,
+          "Dropped the redundant `type` beside this `anyOf`. Every branch is already object-only, " +
+          "so the `type` constrained nothing — and leaving it would force `additionalProperties: " +
+          "false` onto this node, which is an object keyword, which is what makes OpenAI refuse an " +
+          "object-shaped `anyOf`. This is the same edit openai@7.4.0 makes internally.",
+          DOCS.openai));
       }
 
       // `$id` is retained at the ROOT (it is in the SDK's own rootMetadata set),

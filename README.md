@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 913 engine + 222 CLI + 36 ESM/library assertions = **1171** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 936 engine + 222 CLI + 36 ESM/library assertions = **1194** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -580,7 +580,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1171 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1194 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -771,6 +771,48 @@ error. And the last row above stays ❌ after `--to openai` on purpose: strict m
 has no optional fields, so `b` is forced required-and-nullable, which the ledger
 says in as many words.
 
+
+## A union has two spellings, and the node it sits on decides whether the rewrite is safe
+
+`oneOf` is not representable in OpenAI strict mode, so this tool rewrites it to `anyOf`
+whenever the branches are provably exclusive. That rewrite is right in general and wrong
+in two places, and both were found by asking a question the test suite had never asked:
+**is our own output a fixed point of the vendor's transform?** Being *accepted* is not the
+same as being *unchanged*, and a gate that says "commit my output" owes you both.
+
+Measured against `openai@7.4.0`:
+
+| shape | before | after |
+|---|---|---|
+| root `anyOf` union | blocker (exit 3) | unchanged |
+| root `oneOf` union | **exit 1, and the vendor rejected our output** | blocker (exit 3) |
+| `{type: "object", …, oneOf: […]}` | **rewritten to `anyOf`, which the vendor then rejected** | `oneOf` kept; advisory, exit 0 |
+| `{type: "object", …, anyOf: […]}` | **exit 1, and the vendor rejected our output** | blocker (exit 3) |
+| `{type: "object", anyOf: [obj, obj]}` (bare wrapper) | closed, which broke it | redundant `type` dropped, accepted |
+
+Two things make this worth knowing beyond this tool:
+
+**The root check was keyed on one spelling.** It read `if (s.anyOf)` and ran *before* the
+walk that turns `oneOf` into `anyOf` — so a root `oneOf` slipped past the check and the walk
+then manufactured exactly the root the check exists to catch. In `pydantic` 2.13.4 the two
+spellings are one keyword apart: `RootModel[Union[A, B]]` emits a root `anyOf`, and the same
+union with `Field(discriminator="kind")` emits a root `oneOf`. Adding a discriminator — the
+more precise form, and the one the docs recommend — was what broke the gate.
+
+**OpenAI's two helper families contradict each other.** `toStrictJsonSchema()`, which the five
+`helpers/zod` builders use, accepts `{type: "object", …, oneOf: […]}` byte-identical. The
+`helpers/standard-schema` builders run `normalizeStructuredOutputSchema()` first, which performs
+this very `oneOf` → `anyOf` rewrite, and then their own `toStrictJsonSchema()` throws
+*"Object anyOf schema … cannot be represented"*. No single document satisfies both, so the tool
+keeps the `oneOf` (valid on the zod path) and says which path it is not valid on, rather than
+picking one and calling it fixed.
+
+The vendor's refusal has an escape hatch, mirrored here clause for clause: a bare
+`{"type": "object"}` wrapper with no object keywords of its own, whose branches are all
+object-only, is accepted — the vendor deletes the redundant `type`. That hatch is easy to close
+by accident, because "set `additionalProperties: false` on every object" adds an object keyword.
+Two individually correct edits, one rejection. This tool drops the redundant `type` instead,
+which is the same edit the vendor makes.
 
 ## An empty collection usually means the opposite, not "less"
 

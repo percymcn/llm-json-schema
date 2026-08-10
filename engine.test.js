@@ -5453,11 +5453,19 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
       return !!(d && d.D && d.D.properties && d.D.properties.a);
     })());
 
+  // #362: this used `nested()`, which hangs the keyword off an OBJECT-shaped
+  // node -- the one position where the rewrite is NOT safe, because
+  // `{type: "object", ..., anyOf: [...]}` is what openai@7.4.0 throws on. The
+  // property #360 meant to pin is strip-vs-rewrite (a strip would silently widen
+  // the union), and that is orthogonal to position, so the fixture moves to a
+  // bare union node where the rewrite genuinely happens and the vendor accepts
+  // the result. The object-shaped position is pinned separately below.
   ok("#360 openai: `oneOf` is rewritten to `anyOf`, not stripped (#318)",
     (function () {
-      var r = conv(nested("oneOf", [{ type: "string" }, { type: "number" }]), "openai");
+      var r = conv({ type: "object", required: ["f"], additionalProperties: false,
+        properties: { f: { oneOf: [{ type: "string" }, { type: "number" }] } } }, "openai");
       var f = r.schema && r.schema.properties && r.schema.properties.f;
-      return !!(f && Array.isArray(f.anyOf) && f.anyOf.length === 2);
+      return !!(f && Array.isArray(f.anyOf) && f.anyOf.length === 2 && f.oneOf === undefined);
     })());
 
   // The ONE measured divergence, recorded as deliberate rather than left to
@@ -5648,6 +5656,135 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(conv361({ oneOf: [A, B] }).ledger, "oneOf"));
   ok("#361 go: `anyOf` + `oneOf` siblings are reported as a silent discard",
     has(conv361({ anyOf: [A, B], oneOf: [C] }).ledger, "DISCARDS"));
+})();
+
+// ---------------------------------------------------------------------------
+// #362 -- a union keyword's SPELLING and its node's SHAPE both decide whether
+// the `oneOf` -> `anyOf` rewrite is safe, and neither was being read.
+//
+// Found by a property nobody had run: is OUR OUTPUT a FIXED POINT of the vendor
+// transform? Over the captured corpus (494 inputs) two `--to openai` rows came
+// back with the vendor REJECTING what we hand the user while `--check` exited 1
+// ("commit my output") -- the #330 class. Both are pinned here.
+// ---------------------------------------------------------------------------
+(function () {
+  var engine = require("./engine.js");
+  function conv(sch, p) { return engine.convert(JSON.parse(JSON.stringify(sch)), p); }
+  function blockers(r) {
+    return (r.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function blocked(sch, p) { var r = conv(sch, p); return !r.ok || blockers(r).length > 0; }
+  var OBJ = function (k, t) {
+    return { type: "object", properties: (function () { var o = {}; o[k] = { type: t }; return o; })(),
+             required: [k], additionalProperties: false };
+  };
+  var wrap = function (n) {
+    return { type: "object", properties: { f: n }, required: ["f"], additionalProperties: false };
+  };
+
+  // --- (1) THE ROOT UNION, BOTH SPELLINGS -------------------------------
+  // The blocker read `if (s.anyOf)` and runs BEFORE the walk, where `oneOf`
+  // becomes `anyOf` -- so the walk manufactured the very root this rule exists
+  // to catch. Measured on openai@7.4.0: both spellings throw, by different
+  // messages, so there is no root form of a union.
+  ok("#362 openai: a root `anyOf` union is still a blocker",
+    blocked({ anyOf: [OBJ("a", "string"), OBJ("b", "integer")] }, "openai"));
+  ok("#362 openai: a root `oneOf` union is a blocker TOO (was exit 1, vendor rejected our output)",
+    blocked({ oneOf: [OBJ("a", "string"), OBJ("b", "integer")] }, "openai"));
+  ok("#362 openai: the root-union blocker names the spelling the caller wrote",
+    has(conv({ oneOf: [OBJ("a", "string"), OBJ("b", "integer")] }, "openai").ledger, "cannot use `oneOf`"));
+
+  // Reachability, verbatim from pydantic 2.13.4 (#311's rule -- real generator
+  // output, not a hand-written fixture). These two models differ by exactly
+  // `Field(discriminator="kind")`, which is the RECOMMENDED, more precise form,
+  // and it was the one that broke: plain -> root `anyOf` (blocked, correct),
+  // discriminated -> root `oneOf` (exit 1, output rejected by the vendor).
+  var PYD_DEFS = {
+    Cat: { type: "object", title: "Cat", required: ["kind", "meows"],
+      properties: { kind: { const: "cat", type: "string", title: "Kind" },
+                    meows: { type: "integer", title: "Meows" } } },
+    Dog: { type: "object", title: "Dog", required: ["kind", "barks"],
+      properties: { kind: { const: "dog", type: "string", title: "Dog" },
+                    barks: { type: "integer", title: "Barks" } } }
+  };
+  ok("#362 openai: pydantic `RootModel[Union[A,B]]` (root anyOf) blocks",
+    blocked({ $defs: PYD_DEFS, title: "PlainRoot",
+      anyOf: [{ $ref: "#/$defs/Cat" }, { $ref: "#/$defs/Dog" }] }, "openai"));
+  ok("#362 openai: the same union with `Field(discriminator=...)` (root oneOf) blocks",
+    blocked({ $defs: PYD_DEFS, title: "PetRoot",
+      discriminator: { propertyName: "kind", mapping: { cat: "#/$defs/Cat", dog: "#/$defs/Dog" } },
+      oneOf: [{ $ref: "#/$defs/Cat" }, { $ref: "#/$defs/Dog" }] }, "openai"));
+
+  // --- (2) COMBINATOR BESIDE OBJECT SHAPE -------------------------------
+  // `{type: "object", ..., anyOf: [...]}` is refused by openai@7.4.0. The raw
+  // `oneOf` form is ACCEPTED VERBATIM, so rewriting it took a schema the vendor
+  // accepts and produced one it rejects -- worse than a fix that does not fix.
+  var objOneOf = wrap(mix(OBJ("a", "string"), { oneOf: [{ type: "string" }, { type: "number" }] }));
+  var objAnyOf = wrap(mix(OBJ("a", "string"), { anyOf: [{ type: "string" }, { type: "number" }] }));
+  function mix(a, b) {
+    var o = JSON.parse(JSON.stringify(a));
+    Object.keys(b).forEach(function (k) { o[k] = b[k]; });
+    return o;
+  }
+  ok("#362 openai: `oneOf` on an object-shaped node is NOT rewritten (the rewrite is what breaks it)",
+    (function () {
+      var f = conv(objOneOf, "openai").schema.properties.f;
+      return Array.isArray(f.oneOf) && f.anyOf === undefined;
+    })());
+  ok("#362 openai: ...and it is advisory, so it cannot fail a gate the vendor would pass",
+    !blocked(objOneOf, "openai"));
+  ok("#362 openai: ...and the note names the helper family that DOES throw",
+    has(conv(objOneOf, "openai").ledger, "standard-schema"));
+  ok("#362 openai: an object-shaped node already carrying `anyOf` is a blocker",
+    blocked(objAnyOf, "openai"));
+
+  // --- OVER-BLOCK GUARDS ------------------------------------------------
+  // Being stricter than the vendor is this project's most repeated bug, and the
+  // first draft of this rule over-blocked 26 corpus schemas the vendor accepts
+  // -- it reported "throws" for nodes with NO union at all. This is the control
+  // that catches that, and it has to sit in the position under test: my first
+  // control's nested property was a scalar, so it passed while the rule was
+  // firing on every ordinary nested object.
+  ok("#362 openai GUARD: an ordinary NESTED object schema is not blocked",
+    !blocked(wrap(OBJ("a", "string")), "openai"));
+  ok("#362 openai GUARD: a bare union at a property is still rewritten to `anyOf`",
+    (function () {
+      var f = conv(wrap({ oneOf: [{ type: "string" }, { type: "number" }] }), "openai").schema.properties.f;
+      return Array.isArray(f.anyOf) && f.oneOf === undefined;
+    })());
+  // The vendor's own escape hatch, mirrored clause for clause: a bare
+  // `{type: "object"}` wrapper with no object keywords of its own and none but
+  // object-only branches is ACCEPTED (the vendor deletes the redundant `type`).
+  // Blanket-blocking object+anyOf would have been over-strict here.
+  ok("#362 openai GUARD: the vendor's wrapper escape hatch is not blocked",
+    !blocked(wrap({ type: "object", anyOf: [OBJ("a", "string"), OBJ("b", "integer")] }), "openai"));
+  // ...and not blocking it is not enough: our own `additionalProperties: false`
+  // rule would CLOSE the hatch, because that is an object keyword. Two correct
+  // edits composing into a rejection (#348). We drop the redundant `type` the
+  // way the vendor does, so the node stays acceptable.
+  ok("#362 openai: the wrapper's redundant `type` is dropped, so the hatch survives our own close",
+    (function () {
+      var f = conv(wrap({ type: "object", anyOf: [OBJ("a", "string"), OBJ("b", "integer")] }),
+        "openai").schema.properties.f;
+      return f.type === undefined && Array.isArray(f.anyOf) && f.anyOf.length === 2 &&
+        f.additionalProperties === undefined;
+    })());
+  ok("#362 openai GUARD: ...but adding an object keyword to that wrapper IS blocked",
+    blocked(wrap({ type: "object", additionalProperties: false,
+      anyOf: [OBJ("a", "string"), OBJ("b", "integer")] }), "openai"));
+  ok("#362 openai GUARD: ...and so is a wrapper with a non-object branch",
+    blocked(wrap({ type: "object", anyOf: [OBJ("a", "string"), { type: "string" }] }), "openai"));
+
+  // --- PER-TARGET SCOPE, MEASURED NOT PORTED (rule 0-bis) ---------------
+  // All three break rows were `--to openai` only. Anthropic ACCEPTS every one of
+  // these shapes -- raw and converted, on both the tools and output_format paths
+  // -- so firing there would be the over-strictness class again.
+  ["anthropic", "anthropic-json", "anthropic-json-python", "anthropic-go"].forEach(function (t) {
+    ok("#362 " + t + ": an object-shaped node with `anyOf` is NOT blocked (vendor accepts it)",
+      !blocked(objAnyOf, t));
+    ok("#362 " + t + ": a root `oneOf` union is NOT blocked by openai's root rule",
+      !blocked({ oneOf: [OBJ("a", "string"), OBJ("b", "integer")] }, t));
+  });
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");
