@@ -4623,7 +4623,28 @@
     // pre-auth oracle here — Anthropic authenticates before validating — so the
     // service itself has NOT been asked, and this list is only a claim about
     // what the clients forward.
-    ANTHROPIC_STRING_FORMATS_KEPT: Object.keys(ANTHROPIC_STRING_FORMATS)
+    ANTHROPIC_STRING_FORMATS_KEPT: Object.keys(ANTHROPIC_STRING_FORMATS),
+
+    // #361. The two tables that decide a keyword's FATE on the Go SDK, exported
+    // so the diff against the vendor is a test rather than a sentence (#351).
+    // Both were transcribed by hand — `supportedSchemaKeys` in #332, the invopop
+    // struct in #358 — and until now neither appeared anywhere in the suite, so
+    // nothing would have noticed a typo or a vendor bump.
+    //
+    // They are read TOGETHER, and that is what makes the diff load-bearing in
+    // both directions. #360's corollary is that agreeing with a vendor blocklist
+    // is nearly free for an allowlist; here the derived quantity is three-valued,
+    // so each table can be wrong in a way the other cannot mask:
+    //
+    //   in ANTHROPIC_GO_SUPPORTED          -> KEPT      (enforced)
+    //   else in GO_INVOPOP_MODELLED        -> DEMOTED   (prose, unenforced)
+    //   else                               -> DROPPED   (no trace at all)
+    //
+    // Get the first table wrong and we promise enforcement that is not there, or
+    // warn about a keyword the vendor keeps. Get the second wrong and we call a
+    // silent deletion a demotion, which is the severity users act on.
+    ANTHROPIC_GO_SUPPORTED_KEYS: Object.keys(ANTHROPIC_GO_SUPPORTED),
+    GO_INVOPOP_MODELLED_KEYS: Object.keys(GO_INVOPOP_MODELLED)
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;

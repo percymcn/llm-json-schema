@@ -132,6 +132,24 @@ export const GEMINI_ALLOWED_KEYS: string[];
  */
 export const ANTHROPIC_STRING_FORMATS_KEPT: string[];
 
+/**
+ * The keys `anthropic-sdk-go` keeps verbatim — its `supportedSchemaKeys`
+ * (schemautil.go), transcribed and diffed against the vendor in both
+ * directions. Anything outside this set is at best demoted to `description`
+ * prose; see {@link GO_INVOPOP_MODELLED_KEYS} for which of the two it is.
+ */
+export const ANTHROPIC_GO_SUPPORTED_KEYS: string[];
+
+/**
+ * The keys `invopop/jsonschema`'s `Schema` struct gives a field. A keyword
+ * outside this set never survives the round-trip inside `transformSchemaMap`
+ * at all: `Schema.UnmarshalJSON` is a plain alias unmarshal, so unknown keys
+ * are discarded before Anthropic's transform runs and never reach the
+ * extras-to-description path. Two severities hide behind one "unsupported" —
+ * modelled keys become prose, unmodelled keys vanish without a trace.
+ */
+export const GO_INVOPOP_MODELLED_KEYS: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -142,6 +160,8 @@ declare const api: {
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
   ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
+  ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
+  GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;
 };
 
 export default api;

@@ -5469,5 +5469,186 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(conv(nested("$vocabulary", { "https://x": true }), "openai").ledger, "$vocabulary"));
 })();
 
+// ---------------------------------------------------------------------------
+// #361 — the two Go tables, diffed against the vendor and against MEASURED
+// vendor behaviour. Both were transcribed by hand (#332, #358) and neither
+// appeared anywhere in this suite, which is #351's tell: a rule derived from a
+// vendor artifact that the suite never names is documentation. #360 executed
+// that for OpenAI's blocklist; this is the same thing for the target it left.
+//
+// What makes this diff load-bearing rather than free (#360's corollary): the
+// two tables are read TOGETHER to produce a THREE-valued fate, so neither can
+// mask the other's error. Wrong in the first table and we promise enforcement
+// that is not there; wrong in the second and we call a silent deletion a
+// demotion, which is the severity a reader actually acts on.
+(function () {
+  // Vendor literal 1, transcribed verbatim from `supportedSchemaKeys`
+  // (anthropic-sdk-go@v1.62.0, schemautil.go:303). Restated locally rather
+  // than iterated off the export, so a missing export fails one assertion
+  // instead of aborting the file (#322's trap, hit in #345).
+  var VENDOR_GO_SUPPORTED = [
+    "$ref", "$defs", "type", "anyOf", "oneOf", "allOf", "description", "title",
+    "enum", "const", "properties", "additionalProperties", "required",
+    "items", "minItems", "format", "pattern"
+  ];
+
+  // Vendor literal 2: every `json:"..."` tag on invopop/jsonschema@v0.14.0's
+  // `Schema` struct (schema.go:16-76). `Extras` is tagged `json:"-"` and is
+  // deliberately NOT a member — that is the whole mechanism, verified this
+  // cycle: `UnmarshalJSON` is a plain alias unmarshal (reflect.go:1094), so
+  // Extras is never populated on the way IN and an unmodelled key is gone
+  // before Anthropic's transform can demote it.
+  var VENDOR_INVOPOP_MODELLED = [
+    "$schema", "$id", "$anchor", "$ref", "$dynamicRef", "$defs", "$comment",
+    "allOf", "anyOf", "oneOf", "not", "if", "then", "else", "dependentSchemas",
+    "prefixItems", "items", "contains", "properties", "patternProperties",
+    "additionalProperties", "propertyNames", "type", "enum", "const",
+    "multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum",
+    "maxLength", "minLength", "pattern", "maxItems", "minItems", "uniqueItems",
+    "maxContains", "minContains", "maxProperties", "minProperties", "required",
+    "dependentRequired", "format", "contentEncoding", "contentMediaType",
+    "contentSchema", "title", "description", "default", "deprecated",
+    "readOnly", "writeOnly", "examples"
+  ];
+
+  function diff(a, b) {
+    var seen = {}, out = [], i;
+    for (i = 0; i < b.length; i++) seen[b[i]] = 1;
+    for (i = 0; i < a.length; i++) if (!seen[a[i]]) out.push(a[i]);
+    return out;
+  }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+
+  var ours1 = arr(E.ANTHROPIC_GO_SUPPORTED_KEYS);
+  var ours2 = arr(E.GO_INVOPOP_MODELLED_KEYS);
+
+  ok("#361 go: our supported-key table is exported as an array",
+    Array.isArray(E.ANTHROPIC_GO_SUPPORTED_KEYS) && ours1.length === 17);
+  ok("#361 go: our invopop-modelled table is exported as an array",
+    Array.isArray(E.GO_INVOPOP_MODELLED_KEYS) && ours2.length === 53);
+
+  // Both directions. The FORWARD direction (vendor -> ours) is the cheap half;
+  // the COMPLEMENT (ours -> vendor) is the one that catches a key we invented.
+  ok("#361 go: no supported key the vendor lists is missing from our table",
+    diff(VENDOR_GO_SUPPORTED, ours1).length === 0);
+  ok("#361 go: no key in our table is absent from the vendor's list",
+    diff(ours1, VENDOR_GO_SUPPORTED).length === 0);
+  ok("#361 go: no invopop field is missing from our modelled table",
+    diff(VENDOR_INVOPOP_MODELLED, ours2).length === 0);
+  ok("#361 go: no key in our modelled table is absent from invopop's struct",
+    diff(ours2, VENDOR_INVOPOP_MODELLED).length === 0);
+
+  // `Extras` is tagged `json:"-"`. If it ever became a modelled member the
+  // DROPPED class would collapse into DEMOTED, so pin its absence explicitly.
+  ok("#361 go: `Extras` is not a modelled key (it is tagged json:\"-\")",
+    ours2.indexOf("Extras") === -1 && ours2.indexOf("extras") === -1);
+
+  // The fate each keyword ACTUALLY met, measured 2026-08-10 by running every
+  // row through `anthropic.BetaJSONSchemaOutputFormat` on anthropic-sdk-go
+  // @v1.62.0 and reading the output: present verbatim = kept, named in the
+  // node's `description` = demoted, gone with no trace = dropped. Two controls
+  // are in the table and they discriminate: `description` must be kept and
+  // `x-vendor-ext` must be dropped. (My first harness built the param struct
+  // instead of calling the helper, and EVERY row including both controls came
+  // back "kept" — the control is what caught it.)
+  var MEASURED = {
+    description: "kept", title: "kept", enum: "kept", const: "kept",
+    pattern: "kept", format: "kept", minItems: "kept", required: "kept",
+
+    not: "demoted", if: "demoted", then: "demoted", else: "demoted",
+    dependentSchemas: "demoted", prefixItems: "demoted", contains: "demoted",
+    patternProperties: "demoted", propertyNames: "demoted",
+    multipleOf: "demoted", maximum: "demoted", exclusiveMaximum: "demoted",
+    minimum: "demoted", exclusiveMinimum: "demoted", maxLength: "demoted",
+    minLength: "demoted", maxItems: "demoted", uniqueItems: "demoted",
+    maxContains: "demoted", minContains: "demoted", maxProperties: "demoted",
+    minProperties: "demoted", dependentRequired: "demoted",
+    contentEncoding: "demoted", contentMediaType: "demoted",
+    contentSchema: "demoted", default: "demoted", deprecated: "demoted",
+    readOnly: "demoted", writeOnly: "demoted", examples: "demoted",
+    $comment: "demoted", $anchor: "demoted", $id: "demoted",
+    $schema: "demoted", $dynamicRef: "demoted",
+
+    "x-vendor-ext": "dropped", unevaluatedProperties: "dropped",
+    unevaluatedItems: "dropped", additionalItems: "dropped",
+    dependencies: "dropped", $vocabulary: "dropped",
+    $dynamicAnchor: "dropped", definitions: "dropped",
+    discriminator: "dropped"
+  };
+
+  function fateFromTables(k) {
+    if (ours1.indexOf(k) !== -1) return "kept";
+    if (ours2.indexOf(k) !== -1) return "demoted";
+    return "dropped";
+  }
+
+  var mismatched = [], kinds = {}, n = 0;
+  for (var k in MEASURED) {
+    if (!Object.prototype.hasOwnProperty.call(MEASURED, k)) continue;
+    n++;
+    kinds[MEASURED[k]] = 1;
+    if (fateFromTables(k) !== MEASURED[k]) mismatched.push(k);
+  }
+
+  // Guard against a vacuous pass (#340): the oracle must be non-trivial and
+  // must exercise all three branches, or "0 mismatches" proves nothing.
+  ok("#361 go: the measured oracle is non-trivial and covers all three fates",
+    n === 53 && kinds.kept && kinds.demoted && kinds.dropped);
+  ok("#361 go: our two tables predict the vendor's fate for all 53 keywords",
+    mismatched.length === 0);
+
+  // Scope, stated rather than implied: 9 of the 17 supported keys ($ref, $defs,
+  // type, anyOf, oneOf, allOf, properties, additionalProperties, items) are
+  // structural and are not probed as a leaf-node keyword here; they are
+  // exercised by the conversion tests above. This table covers the other 8 plus
+  // every unsupported keyword.
+  ok("#361 go: the fate table omits exactly the 9 structural supported keys",
+    diff(VENDOR_GO_SUPPORTED, Object.keys(MEASURED)).length === 9);
+
+  // The two VALUE-level rules in `anthropicGoRecognises`, which a keyword-level
+  // table cannot test. My own battery used `minItems: 1` -- the one value the
+  // rule special-cases -- so it passed either way (#323's pattern, in my own
+  // probe). These rows discriminate. Vendor: schemautil.go's array branch
+  // demotes minItems unless *s.MinItems is 0 or 1, and its string branch
+  // demotes `format` only when the node's type is "string".
+  function conv361(sch) { return E.convert(JSON.stringify(sch), "anthropic-go"); }
+  function arrWith(min) {
+    return { type: "object", required: ["f"], additionalProperties: false,
+             properties: { f: { type: "array", items: { type: "string" }, minItems: min } } };
+  }
+  function fmt(t, f) {
+    return { type: "object", required: ["f"], additionalProperties: false,
+             properties: { f: { type: t, format: f } } };
+  }
+  ok("#361 go: minItems 0 is kept (vendor keeps it) -- no advisory",
+    !has(conv361(arrWith(0)).ledger, "minItems"));
+  ok("#361 go: minItems 1 is kept (vendor keeps it) -- no advisory",
+    !has(conv361(arrWith(1)).ledger, "minItems"));
+  ok("#361 go: minItems 2 is demoted (vendor demotes it) -- advisory",
+    has(conv361(arrWith(2)).ledger, "minItems"));
+  ok("#361 go: minItems 3 is demoted (vendor demotes it) -- advisory",
+    has(conv361(arrWith(3)).ledger, "minItems"));
+  ok("#361 go: a supported format on a string node is kept -- no advisory",
+    !has(conv361(fmt("string", "email")).ledger, "format"));
+  ok("#361 go: an unsupported format on a string node is demoted -- advisory",
+    has(conv361(fmt("string", "frobnicate")).ledger, "format"));
+  ok("#361 go: an unsupported format on a NON-string node is kept -- no advisory",
+    !has(conv361(fmt("integer", "frobnicate")).ledger, "format"));
+
+  // `oneOf` is IN supportedSchemaKeys, so the fate table says "kept" -- and the
+  // vendor still does not leave it alone. `transformSchema` copies oneOf into
+  // anyOf only when anyOf is empty, then clears oneOf UNCONDITIONALLY. So the
+  // keyword survives as a rewrite in one case and is deleted outright in the
+  // other, and both were measured this cycle. This is why the fate table is a
+  // claim about the KEY and not about the constraint.
+  var A = { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false };
+  var B = { type: "object", properties: { b: { type: "integer" } }, required: ["b"], additionalProperties: false };
+  var C = { type: "object", properties: { c: { type: "boolean" } }, required: ["c"], additionalProperties: false };
+  ok("#361 go: a lone `oneOf` is reported as the rewrite the vendor performs",
+    has(conv361({ oneOf: [A, B] }).ledger, "oneOf"));
+  ok("#361 go: `anyOf` + `oneOf` siblings are reported as a silent discard",
+    has(conv361({ anyOf: [A, B], oneOf: [C] }).ledger, "DISCARDS"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
