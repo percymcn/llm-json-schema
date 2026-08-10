@@ -7755,6 +7755,181 @@ function fanoutSchema(depth, cyclic) {
               "gemini")).length === 0);
 })();
 
+/* ------------------------------------------------------------------ #379
+   A definition NAME may contain "/" — zod-to-json-schema passes the caller's
+   name through unescaped — so a `$ref` tail is ambiguous between "one name
+   with slashes" and "a pointer into a definition", and BOTH spellings come out
+   of ONE `zodToJsonSchema(S, "v1/User")` call. Five readers each picked one
+   reading. Resolution must be document-driven: longest literal key, then walk.
+   Every read is routed through guarded helpers first, because a reverted
+   engine must REPORT these as failures rather than abort the file (#322). */
+(function () {
+  function conv(sch, p) { return E.convert(JSON.parse(JSON.stringify(sch)), p); }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function blk(r) { return led(r).filter(function (l) { return l.op === "!" && !l.advisory; }); }
+  function sch(r) { return (r && r.schema && typeof r.schema === "object") ? r.schema : {}; }
+  function txt(r) { return led(r).map(function (l) { return String(l.msg); }).join(" | "); }
+  function at(o, path) {
+    var cur = o;
+    for (var i = 0; i < path.length; i++) {
+      if (!cur || typeof cur !== "object") return undefined;
+      if (!Object.prototype.hasOwnProperty.call(cur, path[i])) return undefined;
+      cur = cur[path[i]];
+    }
+    return cur;
+  }
+
+  // VERBATIM `zod-to-json-schema@3.24.5` output for
+  //   const Inner = z.object({ one: z.string().min(3) });
+  //   zodToJsonSchema(z.object({ inner: Inner, echo: Inner.shape.one }), NAME)
+  // measured 2026-08-10 on zod 3. Note the definition key and the two `$ref`s:
+  // the name is reproduced EXACTLY as passed, slash and all.
+  function zodOut(name) {
+    return {
+      "$ref": "#/definitions/" + name,
+      "definitions": {
+        [name]: {
+          "type": "object",
+          "properties": {
+            "inner": { "type": "object",
+              "properties": { "one": { "type": "string", "minLength": 3 } },
+              "required": ["one"], "additionalProperties": false },
+            "echo": { "$ref": "#/definitions/" + name + "/properties/inner/properties/one" }
+          },
+          "required": ["inner", "echo"], "additionalProperties": false
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    };
+  }
+
+  // THE DISCRIMINATOR. The two documents describe the SAME schema and differ
+  // only in whether the definition name contains a "/". Before the fix the
+  // slash form was exit 3 on `openai`/`gemini` (a FALSE dangling blocker) while
+  // the plain form was exit 1. A test on the plain name alone passes either way.
+  ["openai", "anthropic-json", "anthropic-go", "gemini"].forEach(function (t) {
+    var plain = conv(zodOut("S"), t), slash = conv(zodOut("v1/User"), t);
+    ok("#379 " + t + ": a definition name containing `/` does not change the verdict",
+       blk(plain).length === blk(slash).length);
+  });
+  // RECOGNISING THE NAME IS NOT ENOUGH — THE POINTER MUST RESOLVE FOR SOMEBODY
+  // ELSE. `toStrictJsonSchema()` (openai@7.4.0) is a strict RFC 6901 reader and
+  // THROWS on `#/$defs/v1/User`; measured, it ACCEPTS `#/$defs/v1~1User`, and
+  // the definition KEY may stay as it is. So the repair is an escape, and
+  // without it we would emit a document the vendor still rejects while telling
+  // the user to commit it (#330).
+  (function () {
+    var out = sch(conv(zodOut("v1/User"), "openai"));
+    var echo = at(out, ["$defs", "v1/User", "properties", "echo", "$ref"]) ||
+               at(out, ["properties", "echo", "$ref"]);
+    ok("#379 a pointer through a slash-containing name is ESCAPED, not left broken",
+       typeof echo === "string" && echo.indexOf("~1") !== -1);
+    ok("#379 ...and the definition KEY is left exactly as the generator wrote it",
+       !!at(out, ["$defs", "v1/User"]));
+    ok("#379 guard: a name needing no escape is not rewritten",
+       String(at(sch(conv(zodOut("S"), "openai")), ["$defs", "S", "properties", "echo", "$ref"]) ||
+              at(sch(conv(zodOut("S"), "openai")), ["properties", "echo", "$ref"]) || "")
+         .indexOf("~1") === -1);
+  })();
+  ok("#379 a slash-named definition is not reported as dangling",
+     txt(conv(zodOut("v1/User"), "openai")).indexOf("nothing at that location") === -1);
+  ok("#379 control: the same reader still reports a GENUINELY dangling pointer",
+     txt(conv({ type: "object", additionalProperties: false, required: ["a"],
+                properties: { a: { "$ref": "#/$defs/Gone" } } }, "openai"))
+       .indexOf("nothing at that location") !== -1);
+
+  // The pruner attributed the surviving pointer to a definition called "v1"
+  // (the first token), so the definition actually called "v1/User" looked
+  // unreferenced and was DELETED — leaving the pointer to it in the output, at
+  // exit 1, and re-checking that output returned 0. #320's inversion.
+  (function () {
+    var out = sch(conv(zodOut("v1/User"), "anthropic-json"));
+    ok("#379 the slash-named definition SURVIVES conversion",
+       !!at(out, ["$defs", "v1/User"]));
+    ok("#379 the surviving pointer still RESOLVES in our own output",
+       at(out, ["$defs", "v1/User", "properties", "inner", "properties", "one", "type"]) === "string");
+  })();
+
+  // A pointer INTO a definition, at the ROOT. `rootRefTarget` carried the
+  // greedy regex and used the capture raw as a key, so it read this as a
+  // definition literally named "T/properties/one", found none, and left the
+  // root uninlined — then blamed the caller with "nothing left to inline",
+  // which is false of a document whose pointer resolves.
+  (function () {
+    var doc = { "$ref": "#/$defs/T/properties/one",
+      "$defs": { T: { type: "object", additionalProperties: false, required: ["one"],
+        properties: { one: { type: "object", additionalProperties: false,
+          required: ["x"], properties: { x: { type: "string" } } } } } } };
+    var r = conv(doc, "openai");
+    ok("#379 a ROOT pointer into a definition is inlined", sch(r).type === "object");
+    ok("#379 ...and its content arrives", at(sch(r), ["properties", "x", "type"]) === "string");
+    ok("#379 ...and the false 'nothing left to inline' blocker is gone",
+       txt(r).indexOf("nothing left to inline") === -1);
+  })();
+
+  // Escaped and percent-encoded names at the root, both ordinary RFC 6901.
+  ["a~1b", "with%20space"].forEach(function (spelling) {
+    var name = spelling === "a~1b" ? "a/b" : "with space";
+    var doc = { "$ref": "#/$defs/" + spelling,
+      "$defs": {} };
+    doc.$defs[name] = { type: "object", additionalProperties: false,
+      required: ["x"], properties: { x: { type: "string" } } };
+    ok("#379 root `$ref` `" + spelling + "` resolves to the definition it names",
+       sch(conv(doc, "openai")).type === "object");
+  });
+
+  // `__proto__` is not a definition. A plain `bag[name]` lookup answers with
+  // `Object.prototype` — an object, so it passes every shape test — and the
+  // root inliner replaced the whole document with it, reporting "Inlined the
+  // root `$ref`" and emitting `{}`. The NESTED position, which already used
+  // `hasOwnProperty`, said "there is nothing at that location" about the SAME
+  // pointer: two positions, one reference, opposite verdicts (#372's tell).
+  (function () {
+    var doc = { "$ref": "#/$defs/__proto__",
+      "$defs": { T: { type: "object", properties: { x: { type: "string" } } } } };
+    var r = conv(doc, "openai");
+    ok("#379 a `$ref` at an inherited name is NOT reported as inlined",
+       txt(r).indexOf("Inlined the root `$ref`") === -1);
+    ok("#379 ...it is reported as dangling, as the nested position always did",
+       txt(r).indexOf("nothing at that location") !== -1);
+    ok("#379 ...and the document is not replaced by `Object.prototype`",
+       !!at(sch(r), ["$defs", "T"]));
+    var nested = conv({ type: "object", additionalProperties: false, required: ["p"],
+      properties: { p: { "$ref": "#/$defs/__proto__" } },
+      "$defs": { T: { type: "object" } } }, "openai");
+    ok("#379 the ROOT and NESTED positions now agree about the same pointer",
+       (txt(r).indexOf("nothing at that location") !== -1) ===
+       (txt(nested).indexOf("nothing at that location") !== -1));
+  })();
+
+  // An `allOf` member pointing INTO a definition: #371's merge resolves a bare
+  // `$ref` member before deciding mergeability, and could not read this one, so
+  // the flatten lifted a raw `$ref` up beside `type`/`properties` and blocked —
+  // offering a remedy ("write the `$ref` without the `allOf` wrapper and we
+  // will inline it") that used the SAME unreadable function.
+  (function () {
+    var doc = { type: "object", required: ["a"], properties: { a: { type: "string" } },
+      "allOf": [{ "$ref": "#/$defs/B/properties/inner" }],
+      "$defs": { B: { type: "object", properties: { inner: { type: "object",
+        required: ["b"], properties: { b: { type: "string" } } } } } } };
+    ok("#379 an `allOf` member pointing into a definition is resolved",
+       txt(conv(doc, "openai")).indexOf("Resolved 1 `$ref` member") !== -1);
+  })();
+
+  // OVER-BLOCK GUARDS — these hold both before and after, and are stated as
+  // guards rather than counted as new coverage.
+  ok("#379 guard: a whole-definition root `$ref` still inlines",
+     sch(conv({ "$ref": "#/$defs/T", "$defs": { T: { type: "object",
+       additionalProperties: false, required: ["x"],
+       properties: { x: { type: "string" } } } } }, "openai")).type === "object");
+  ok("#379 guard: an ordinary closed object is untouched on openai",
+     blk(conv({ type: "object", additionalProperties: false, required: ["a"],
+                properties: { a: { type: "string" } } }, "openai")).length === 0);
+  ok("#379 guard: a pointer at a name that exists nowhere still fails closed",
+     conv({ "$ref": "#/$defs/Nope", "$defs": { T: { type: "object" } } }, "openai").schema.$ref
+       === "#/$defs/Nope");
+})();
+
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

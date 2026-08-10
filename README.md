@@ -10,9 +10,41 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1226 engine + 264 CLI + 44 ESM/library assertions = **1534** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1250 engine + 270 CLI + 44 ESM/library assertions = **1564** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
+
+
+### A definition name may contain `/`, and the pointer to it may not
+
+`zod-to-json-schema` reproduces the name you give it verbatim. So
+`zodToJsonSchema(schema, "v1/User")` — an ordinary thing to write — emits a
+definition keyed `v1/User` **and**, from the same call, two pointers to it:
+
+```json
+{ "$ref": "#/definitions/v1/User",
+  "definitions": { "v1/User": { "properties": {
+      "echo": { "$ref": "#/definitions/v1/User/properties/inner/properties/one" } } } } }
+```
+
+Those two spellings are indistinguishable by syntax: `v1/User` is either one
+name containing a slash or a pointer into a definition called `v1`. Only the
+document can tell you which, so resolution here takes the **longest leading run
+of tokens that is an own key of the bag** and walks whatever is left. A
+`hasOwnProperty` check throughout, because a plain lookup answers
+`#/$defs/__proto__` with `Object.prototype` — an object, so it passes every
+shape test — i.e. it resolves a reference to something that is not in the
+document at all.
+
+Recognising the name is not sufficient. `toStrictJsonSchema()` (openai@7.4.0) is
+a strict RFC 6901 reader and **throws** on `#/$defs/v1/User`; measured, it
+**accepts** `#/$defs/v1~1User`, and the definition *key* may stay exactly as the
+generator wrote it — keys are arbitrary strings, only the pointer is a grammar.
+So the pointer is escaped and nothing is lost. Before this, the same document
+had its `$defs` bag **deleted** (the pruner attributed the pointer to a
+definition called `v1`), shipped the dangling pointer at exit 1, and re-checked
+as clean.
+
 
 ## Quick start
 
@@ -714,7 +746,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1534 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1564 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

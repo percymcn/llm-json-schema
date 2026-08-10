@@ -1611,6 +1611,47 @@ function fanout(depth) {
   });
 })();
 
+/* #379 — the CLI contract: an unescaped `/` in a definition name must not
+   change the exit code. Real `zod-to-json-schema@3.24.5` output; the two
+   documents describe the same schema. */
+(function () {
+  function zodOut(name) {
+    return JSON.stringify({
+      "$ref": "#/definitions/" + name,
+      "definitions": {
+        [name]: { "type": "object",
+          "properties": {
+            "inner": { "type": "object", "properties": { "one": { "type": "string", "minLength": 3 } },
+                       "required": ["one"], "additionalProperties": false },
+            "echo": { "$ref": "#/definitions/" + name + "/properties/inner/properties/one" } },
+          "required": ["inner", "echo"], "additionalProperties": false } },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    });
+  }
+  ["openai", "gemini", "anthropic-json"].forEach(function (t) {
+    var a = run(["--to", t, "--check", "-"], zodOut("S"));
+    var b = run(["--to", t, "--check", "-"], zodOut("v1/User"));
+    ok("#379 CLI: `--to " + t + "` gives the same exit code whatever the definition is named",
+       a.status === b.status, "plain=" + a.status + " slash=" + b.status);
+  });
+  // The definition must still be in the output the user is told to commit, and
+  // the pointer to it must still resolve — before the fix the bag was deleted
+  // and the dangling result re-checked as 0.
+  var fixed = run(["--to", "anthropic-json", "-"], zodOut("v1/User"));
+  var doc = {};
+  try { doc = JSON.parse(fixed.stdout); } catch (e) {}
+  ok("#379 CLI: the slash-named definition reaches the emitted document",
+     !!(doc && doc.$defs && doc.$defs["v1/User"]));
+  var recheck = run(["--to", "anthropic-json", "--check", "-"], fixed.stdout || "{}");
+  ok("#379 CLI: our own output re-checks clean and is not a dangling document",
+     recheck.status === 0);
+  // `__proto__` is not a definition: the CLI must not claim to have inlined it.
+  var proto = run(["--to", "openai", "--check", "-"],
+    JSON.stringify({ "$ref": "#/$defs/__proto__", "$defs": { T: { type: "object" } } }));
+  ok("#379 CLI: a `$ref` at an inherited name is not reported as inlined",
+     (proto.stdout + proto.stderr).indexOf("Inlined the root `$ref`") === -1);
+})();
+
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

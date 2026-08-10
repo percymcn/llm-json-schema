@@ -1290,6 +1290,52 @@
   // exists locally. A `/$defs/X` with no local `X` really is external, and no
   // provider resolves those — that gets named as a blocker instead of quietly
   // rewritten into a pointer at something that was never there.
+  // #379: RECOGNISING THE NAME IS NOT ENOUGH — THE POINTER STILL HAS TO RESOLVE
+  // FOR SOMEBODY ELSE. `zodToJsonSchema(S, "v1/User")` writes the name into the
+  // pointer verbatim, so `#/definitions/v1/User` means "definitions → v1 → User"
+  // to every RFC 6901 reader, and `toStrictJsonSchema()` (openai@7.4.0) THROWS
+  // on it. Measured: the same document with the pointer escaped
+  // (`#/definitions/v1~1User`) is ACCEPTED, and the `$defs` KEY may stay exactly
+  // as it is — keys are arbitrary strings, only the pointer is a grammar.
+  //
+  // So this is a lossless REPAIR, not a blocker (#329: ask what the node has
+  // left — here, everything). Deliberately narrow: it fires only when the name
+  // the pointer resolved to contains a `/`, i.e. only where the reference could
+  // not have resolved as written. A `%20` or a space needs no escaping and the
+  // vendor accepts both, so rewriting those would be churn.
+  function escapePointerToken(t) {
+    return t.replace(/~/g, "~0").replace(/\//g, "~1");
+  }
+  function normalizeRefEscaping(s, ledger, docUrl, why) {
+    var fixed = [];
+    (function visit(v) {
+      if (Array.isArray(v)) { v.forEach(visit); return; }
+      if (!isPlainObject(v)) return;
+      if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#") {
+        var r = defBagRef(s, v.$ref);
+        if (r && r.name.indexOf("/") !== -1) {
+          var canon = "#/" + r.bag + "/" + escapePointerToken(r.name) +
+            (r.rest.length ? "/" + r.rest.map(escapePointerToken).join("/") : "");
+          if (canon !== v.$ref) { fixed.push(v.$ref); v.$ref = canon; }
+        }
+      }
+      Object.keys(v).forEach(function (k) { visit(v[k]); });
+    })(s);
+    if (fixed.length) {
+      ledger.push(entry("~", "root",
+        "Escaped " + fixed.length + " `$ref` whose definition name contains a `/` (e.g. `" +
+        fixed[0] + "`). A JSON Pointer splits on `/`, so a name containing one has to be " +
+        "written `~1` (RFC 6901) or the reference means a different location and resolves " +
+        "nowhere. " + (why || "") + " `zod-to-json-schema` reproduces the name you pass it " +
+        "verbatim, so `zodToJsonSchema(schema, \"v1/User\")` emits both the definition key " +
+        "`v1/User` and pointers that cannot reach it; measured, `toStrictJsonSchema()` throws " +
+        "on the unescaped form and accepts the escaped one. The definition KEY is left alone — " +
+        "keys are arbitrary strings, only the pointer is a grammar — so nothing is lost.",
+        docUrl || DOCS.openai));
+    }
+    return s;
+  }
+
   function normalizeRefSpelling(s, ledger, docUrl, why) {
     var bags = ["$defs", "definitions"];
     var rewritten = 0, external = [];
@@ -1297,9 +1343,11 @@
       if (Array.isArray(v)) { v.forEach(visit); return; }
       if (!isPlainObject(v)) return;
       if (typeof v.$ref === "string" && v.$ref.charAt(0) !== "#") {
-        var m = /^\/(\$defs|definitions)\/(.+)$/.exec(v.$ref);
-        var name = m ? m[2] : null;
-        if (m && isPlainObject(s[m[1]]) && isPlainObject(s[m[1]][name])) {
+        // Resolved with the same document-driven reader as every other site
+        // (#379), so a LiteLLM-spelled pointer INTO a definition, or one whose
+        // name carries a `/` or an escape, is recognised as local instead of
+        // being reported as "points outside this document" — which is false.
+        if (defBagRef(s, "#" + v.$ref)) {
           v.$ref = "#" + v.$ref;
           rewritten++;
         } else if (external.indexOf(v.$ref) === -1) {
@@ -1375,12 +1423,21 @@
     return isPlainObject(cur) || typeof cur === "boolean";
   }
 
+  // The strict walk above is right for every pointer whose producer escaped its
+  // definition names, and zod does not escape them (#379). Fall back to the
+  // document-driven reader, or an ordinary `zodToJsonSchema(S, "v1/User")` is
+  // reported as a DANGLING reference — a blocker at exit 3, with text that is
+  // false of the input, on output the tool is supposed to fix.
+  function resolvesLocallyOrByName(root, ref) {
+    return resolvesLocally(root, ref) || defBagRef(root, ref) !== null;
+  }
+
   function findDanglingLocalRefs(root) {
     var out = [];
     (function visit(v, path) {
       if (Array.isArray(v)) { v.forEach(function (x, i) { visit(x, path + "[" + i + "]"); }); return; }
       if (!isPlainObject(v)) return;
-      if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#" && !resolvesLocally(root, v.$ref)) {
+      if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#" && !resolvesLocallyOrByName(root, v.$ref)) {
         out.push({ ref: v.$ref, path: path });
       }
       Object.keys(v).forEach(function (k) {
@@ -1489,7 +1546,15 @@
     });
   }
 
-  function localDefRefs(doc, bag) {
+  // `defs` is optional and is what makes the attribution CORRECT rather than
+  // merely plausible: without it the definition a pointer names is guessed as
+  // `toks[1]`, which for `#/$defs/v1/User/properties/one` is `"v1"` -- so the
+  // definition actually called `"v1/User"` looks unreferenced and the pruner
+  // DELETES it while the pointer to it stays in the output (#320's inversion,
+  // measured on plain `zodToJsonSchema(S, "v1/User")` output). With `defs` the
+  // longest literal key wins, and a local pointer that matches no key at all
+  // fails CLOSED -- keep everything rather than delete on a guess.
+  function localDefRefs(doc, bag, defs) {
     var names = {}, bailOut = false;
     (function scan(v) {
       if (bailOut) return;
@@ -1498,7 +1563,17 @@
       if (typeof v.$ref === "string") {
         var toks = pointerTokens(v.$ref);
         if (toks && toks.length >= 2 && toks[0] === bag) {
-          names[toks[1]] = true;
+          var name = null;
+          if (isPlainObject(defs)) {
+            for (var n = toks.length - 1; n >= 1 && name === null; n--) {
+              var cand = toks.slice(1, 1 + n).join("/");
+              if (Object.prototype.hasOwnProperty.call(defs, cand)) name = cand;
+            }
+            if (name === null) bailOut = true;
+          } else {
+            name = toks[1];
+          }
+          if (name !== null) names[name] = true;
         } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
           bailOut = true;
         }
@@ -1513,11 +1588,8 @@
   // fails closed (#320: a keep-rule that cannot read a reference must not
   // conclude the reference is absent).
   function resolveLocalDef(root, ref) {
-    if (typeof ref !== "string") return null;
-    var m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
-    if (!m) return null;
-    var bag = root[m[1]];
-    return isPlainObject(bag) && isPlainObject(bag[m[2]]) ? bag[m[2]] : null;
+    var r = defBagRef(root, ref);
+    return r && isPlainObject(r.node) ? r.node : null;
   }
 
   // Resolve a `$ref` that points AT OR INTO a definition bag, as a POINTER
@@ -1537,32 +1609,65 @@
   // literally named `T/properties/x` and missed; and with no decode, a name
   // carrying an RFC 6901 escape or a `%20` missed too. Both misses read as
   // "this reference is not to a definition", which is the fail-open direction.
+  // #379: THE TAIL IS AMBIGUOUS, AND THE DOCUMENT IS THE ONLY DISAMBIGUATOR.
+  // `zod-to-json-schema@3.24.5` passes the caller's name through UNESCAPED, so
+  // `zodToJsonSchema(S, "v1/User")` -- an ordinary thing to write -- emits a
+  // definition literally KEYED `"v1/User"` and, from the same call, both
+  // `#/definitions/v1/User` and
+  // `#/definitions/v1/User/properties/inner/properties/one`. Those two spellings
+  // are indistinguishable by syntax: `v1/User` is either one name containing a
+  // slash or a pointer into a definition called `v1`. A strict RFC 6901 walk
+  // (what this function did after #378) misses the NAME; a greedy
+  // `/^#\/(\$defs|definitions)\/(.+)$/` (what `resolveLocalDef` and
+  // `rootRefTarget` still did) misses the POINTER. Both halves fire on one zod
+  // call, and each produced its own defect -- a false dangling blocker at exit 3
+  // on ordinary generator output, and a DELETED definition bag shipped with the
+  // pointer still in it at exit 1.
+  //
+  // So resolve against the DOCUMENT rather than against the spelling: take the
+  // LONGEST leading run of tokens that is an own key of the bag, then walk what
+  // is left as a pointer. Longest-first because the literal name is the more
+  // specific reading, and `hasOwnProperty` throughout because a plain lookup
+  // answers `__proto__` with `Object.prototype` -- an object, which passes every
+  // shape test here -- i.e. it resolves a reference to something that is not in
+  // the document at all.
   function defBagRef(root, ref) {
     var toks = pointerTokens(ref);
     if (!toks || toks.length < 2) return null;
-    if (toks[0] !== "$defs" && toks[0] !== "definitions") return null;
-    if (!isPlainObject(root[toks[0]])) return null;
-    var cur = root[toks[0]];
-    for (var i = 1; i < toks.length; i++) {
-      if (!isPlainObject(cur) && !Array.isArray(cur)) return null;
-      if (!Object.prototype.hasOwnProperty.call(cur, toks[i])) return null;
-      cur = cur[toks[i]];
+    var bag = toks[0];
+    if (bag !== "$defs" && bag !== "definitions") return null;
+    var defs = root[bag];
+    if (!isPlainObject(defs)) return null;
+    for (var n = toks.length - 1; n >= 1; n--) {
+      var name = toks.slice(1, 1 + n).join("/");
+      if (!Object.prototype.hasOwnProperty.call(defs, name)) continue;
+      var cur = defs[name], rest = toks.slice(1 + n), ok = true;
+      for (var i = 0; i < rest.length; i++) {
+        if (Array.isArray(cur)) {
+          if (!/^\d+$/.test(rest[i]) || Number(rest[i]) >= cur.length) { ok = false; break; }
+          cur = cur[Number(rest[i])];
+        } else if (isPlainObject(cur)) {
+          if (!Object.prototype.hasOwnProperty.call(cur, rest[i])) { ok = false; break; }
+          cur = cur[rest[i]];
+        } else { ok = false; break; }
+      }
+      if (!ok) continue;
+      // Deliberately the same acceptance test as `resolvesLocally`, which decides
+      // whether a surviving `$ref` is reported as dangling. If the two disagreed,
+      // one rule would refuse to inline a pointer the other calls resolvable --
+      // and the document would be blocked for dangling at a location that is not.
+      if (!isPlainObject(cur) && typeof cur !== "boolean") continue;
+      return { key: "#/" + toks.join("/"), name: name, node: cur, bag: bag,
+               rest: rest, into: rest.length > 0 };
     }
-    // Deliberately the same acceptance test as `resolvesLocally`, which decides
-    // whether a surviving `$ref` is reported as dangling. If the two disagreed,
-    // one rule would refuse to inline a pointer the other calls resolvable --
-    // and the document would be blocked for dangling at a location that is not.
-    if (!isPlainObject(cur) && typeof cur !== "boolean") return null;
-    return { key: "#/" + toks.join("/"), name: toks[1], node: cur };
+    return null;
   }
 
   function rootRefTarget(s) {
     if (typeof s.$ref !== "string") return null;
-    var m = /^#\/(\$defs|definitions)\/(.+)$/.exec(s.$ref);
-    if (!m) return null;
-    var bag = m[1], name = m[2];
-    if (!isPlainObject(s[bag]) || !isPlainObject(s[bag][name])) return null;
-    return { bag: bag, name: name };
+    var r = defBagRef(s, s.$ref);
+    if (!r || !isPlainObject(r.node)) return null;
+    return { bag: r.bag, name: r.name, node: r.node, into: r.into };
   }
 
   function inlineRootRef(s, ledger, docUrl, why, blockedOut) {
@@ -1592,7 +1697,7 @@
       // references, not a structural snapshot: the pipeline mutates this node
       // in between (#371).
       if (Array.isArray(blockedOut) && blockedOut.indexOf(s) !== -1) return s;
-      merged = intersectRef(clone(defs[name]), s, constraining, "root", ledger, docUrl);
+      merged = intersectRef(clone(t.node), s, constraining, "root", ledger, docUrl);
       if (!merged) {
         // No merge preserves the meaning, so the remodelling is NAMED and the
         // shape is left exactly as written for the reader to see (#318/#329).
@@ -1601,7 +1706,7 @@
       }
       out = merged.schema;
     } else {
-      out = clone(defs[name]);
+      out = clone(t.node);
     }
 
     // carry over any sibling keys the generator left next to `$ref`
@@ -1625,7 +1730,7 @@
     // `anthropic-go`, and on `openai` produced a blocker whose text ("there is
     // nothing at that location") was FALSE of the input: the reference resolved
     // until we removed what it resolved to.
-    var refs = localDefRefs([out, remaining], bag);
+    var refs = localDefRefs([out, remaining], bag, defs);
     if (refs.bailOut || refs.names[name]) {
       remaining[name] = defs[name];
     }
@@ -1861,7 +1966,7 @@
       // these two drifted apart once already and the root copy deleted a live
       // definition). `bailOut` = an unattributable local pointer, so prune
       // nothing rather than guess it is unrelated.
-      var found = localDefRefs(result, "$defs");
+      var found = localDefRefs(result, "$defs", result.$defs);
       if (!found.bailOut) {
         var kept = {};
         Object.keys(result.$defs).forEach(function (k) {
@@ -2061,7 +2166,10 @@
     for (var i = 0; i < parts.length; i++) {
       var key = parts[i];
       if (!isPlainObject(cur) && !Array.isArray(cur)) return undefined;
-      if (!(key in cur)) return undefined;
+      // `in` walks the PROTOTYPE CHAIN, so `#/$defs/__proto__` "resolved" to
+      // `Object.prototype` — an object, which passes every shape test — i.e. a
+      // reference to something not in the document at all (#379).
+      if (!Object.prototype.hasOwnProperty.call(cur, key)) return undefined;
       cur = cur[key];
     }
     return cur;
@@ -2263,7 +2371,9 @@
     var bagAtEntry = isPlainObject(schema.$defs) ? "$defs"
       : (isPlainObject(schema.definitions) ? "definitions" : null);
 
+
     s = normalizeRefSpelling(s, ledger);
+    s = normalizeRefEscaping(s, ledger);
     s = normalizeDefs(s, ledger);
     var refIntersectBlocked = [];
     s = inlineRootRef(s, ledger, undefined, undefined, refIntersectBlocked);
@@ -3590,6 +3700,7 @@
         "so a mis-spelled pointer reaches the model dangling rather than erroring."
       : "This path sends the schema verbatim — nothing resolves or validates a `$ref` — so a pointer " +
         "in a spelling that does not resolve locally reaches the model dangling, with no error.");
+    s = normalizeRefEscaping(s, ledger, url);
 
     // A boolean subschema is the FOURTH thing this vendor's three SDKs disagree
     // about, and the disagreement is measured, not ported:
@@ -5136,6 +5247,7 @@
     s = normalizeRefSpelling(s, ledger, DOCS.gemini,
       "Gemini resolves `$ref` only on the `responseJsonSchema` path, and only for genuine local " +
       "pointers.");
+    s = normalizeRefEscaping(s, ledger, DOCS.gemini);
 
     // Measured 2026-08-09 over the whole corpus: all 14 shapes that empty on the
     // narrow proto or through a converting client survive `--to gemini-json`.
