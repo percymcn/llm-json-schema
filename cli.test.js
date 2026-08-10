@@ -1026,9 +1026,33 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
   ok("the advisory reaches stderr and names the per-client outcome",
     run(["--to", "gemini"], PET).stderr.indexOf("depends on YOUR client") !== -1);
 
-  // The two Gemini targets genuinely disagree about this one file.
-  var cc = JSON.parse(run(["--to", "gemini-client"], PET).stdout);
-  ok("gemini-client still strips it", !("oneOf" in cc), JSON.stringify(cc));
+  // #365: this used to assert the two targets disagree about this file, with
+  // `gemini-client` stripping the union. That strip was the defect — measured
+  // 2026-08-10, `@ai-sdk/google` 4.0.39 forwards `oneOf` verbatim — so the
+  // targets now AGREE here, and the disagreement they genuinely have is about
+  // the union `type` spelling, pinned separately below.
+  var ccRun = run(["--to", "gemini-client"], PET);
+  var cc = JSON.parse(ccRun.stdout);
+  ok("gemini-client KEEPS the union too", Array.isArray(cc.oneOf) && cc.oneOf.length === 2,
+    JSON.stringify(cc));
+  ok("gemini-client --check still passes (advisory, never a gate failure)",
+    ccRun.status === 0, "status=" + ccRun.status);
+  ok("and the advisory names both clients by name",
+    ccRun.stderr.indexOf("@ai-sdk/google") !== -1 &&
+    ccRun.stderr.indexOf("google-adk") !== -1);
+
+  // The real, measured disagreement between the two targets, on one file: the
+  // narrow path rewrites a nullable union to the proto spelling, the converting
+  // path must leave it alone because BOTH measured clients drop a hand-written
+  // `nullable` (#336/#365) and do the rewrite themselves.
+  var NULLABLE = JSON.stringify({ type: "object",
+    properties: { a: { type: ["string", "null"] } }, required: ["a"] });
+  var narrow = JSON.parse(run(["--to", "gemini"], NULLABLE).stdout);
+  var client = JSON.parse(run(["--to", "gemini-client"], NULLABLE).stdout);
+  ok("gemini rewrites the nullable union to the proto spelling",
+    narrow.properties.a.nullable === true, JSON.stringify(narrow));
+  ok("gemini-client leaves the union spelling alone",
+    Array.isArray(client.properties.a.type), JSON.stringify(client));
 
   // Guard: a keyword the endpoint really rejects must still fail the gate.
   var bad = run(["--to", "gemini", "--check"],

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 988 engine + 228 CLI + 38 ESM/library assertions = **1254** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 997 engine + 232 CLI + 39 ESM/library assertions = **1268** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -263,7 +263,7 @@ it pins a **measured snapshot**, and re-measuring is a manual step.
 
   The narrow-path allowlist was built from three *client* artifacts — the JS `.d.ts`, the Python `types.Schema`, and the Go struct's json tags — which agreed exactly on 22 keys. That agreement was read as "this is the proto". It is not. Measured 2026-08-09 against the live `v1beta` `generateContent` endpoint, which validates the payload **before** auth and so returns a real verdict with a dummy key: eleven keywords this tool strips come back `Unknown name "…" at 'generation_config.response_schema': Cannot find field` (`$ref`, `$schema`, `const`, `uniqueItems`, `exclusiveMinimum`, `patternProperties`, `propertyNames`, `if`, `contains`, `dependentRequired`, `multipleOf`), and a bogus `type` control is rejected too — so the oracle is live and discriminating. `oneOf`, `allOf` and `not` are **not** rejected, at the root or nested. The proto has those fields.
 
-  So the previous behaviour deleted a constraint the destination would have accepted, and for a discriminated union the node is often *nothing but* the union — `{"title":"Pet","oneOf":[…]}` came out as `{"title":"Pet"}`, which the backend then accepts happily while constraining nothing. `--to gemini` now **keeps** all three and says what happens next, because that depends on your client and not on your schema: `@google/genai` (JS) forwards them verbatim and the call goes through; `google-genai` (Python) raises locally, since `types.Schema` is `extra="forbid"`; the Go client has no such field, so `encoding/json` **drops it with `err == nil`** — `{"oneOf":[…]}` unmarshals to `{}`. It is an advisory, never a gate failure: the destination accepts the document, so failing CI on it would be wrong. `--to gemini-client` still strips them, because a converting client rebuilds the request from its own `Schema` type and no client declares them — the two targets genuinely disagree about the same file.
+  So the previous behaviour deleted a constraint the destination would have accepted, and for a discriminated union the node is often *nothing but* the union — `{"title":"Pet","oneOf":[…]}` came out as `{"title":"Pet"}`, which the backend then accepts happily while constraining nothing. `--to gemini` now **keeps** all three and says what happens next, because that depends on your client and not on your schema: `@google/genai` (JS) forwards them verbatim and the call goes through; `google-genai` (Python) raises locally, since `types.Schema` is `extra="forbid"`; the Go client has no such field, so `encoding/json` **drops it with `err == nil`** — `{"oneOf":[…]}` unmarshals to `{}`. It is an advisory, never a gate failure: the destination accepts the document, so failing CI on it would be wrong. `--to gemini-client` **also keeps them** — it used to strip them on the premise that "a converting client rebuilds the request from its own `Schema` type and no client declares them", which is false for `@ai-sdk/google` (it declares no `Schema` type at all and forwards `oneOf`/`allOf` explicitly); see the Gemini-targets section below.
 
   The general lesson is a bound on this project's own rule that a vendor SDK outranks a vendor doc. It still does — but an SDK is a statement about **what that client can carry**, never about what the service accepts, and a static type is the strongest form of that statement *and still only that statement*. When several independent clients agree, that is evidence they were generated from one shared subset, not evidence the subset is the whole API. Ask the service.
 
@@ -606,7 +606,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1254 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1268 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -625,9 +625,43 @@ Organic search (targets error-message long-tails first, e.g. *"additionalPropert
 `--to gemini` and `--to gemini-json` split by **which request field** you use.
 `--to gemini-client` splits by something else entirely: **who performs the
 JSON-Schema-to-`Schema` conversion.** If you hand JSON Schema to a library that
-converts it for you — `google-adk` is the case measured here — the proto's
-*constraints* still apply, because that library cannot send what the proto has
-no field for, but its *spellings* are the JSON Schema ones.
+converts it for you, the proto's *constraints* still apply, because that library
+cannot send what the proto has no field for, but its *spellings* are the JSON
+Schema ones.
+
+**"Converting client" is a class, and its members disagree.** That is worth
+saying out loud, because for several releases this target was named for the
+class and encoded exactly one member of it — `google-adk`. Measured 2026-08-10,
+each keyword on a node of the right shape and beside a `description` control
+that must survive, `@ai-sdk/google` read from the real wire payload via an
+intercepting `fetch` rather than from its source:
+
+| keyword | `google-adk` 2.6.3 | `@ai-sdk/google` 4.0.39 |
+|---|---|---|
+| `oneOf` | dropped — node emptied | **forwarded verbatim**, recursed |
+| `allOf` | dropped — node emptied | **forwarded verbatim**, recursed |
+| `not` | dropped | dropped |
+| `{"type":["string","null"]}` | → `{STRING, nullable}` | → `{anyOf:[string], nullable}` |
+| `{"type":["string","integer"]}` | → `STRING`, **integer branch lost** | → `anyOf`, both kept |
+| hand-written `nullable: true` | **dropped** | **dropped** |
+
+The union rows are a genuine **intersection**: both clients do the `nullable`
+rewrite themselves and both drop a hand-written `nullable`, so leaving the union
+spelling alone is right for both; and the multi-member rewrite to `anyOf` is
+required by one and a no-op for the other. Those rules were correct and are now
+verified against a second member.
+
+The `oneOf`/`allOf` rows are where the members disagree, and this target used to
+**delete** those keywords for everyone. The asymmetry is what makes that wrong
+rather than merely debatable: for `google-adk` the strip bought *nothing* — its
+output is byte-identical whether we strip the keyword or hand it over intact,
+because it drops the keyword itself — while for `@ai-sdk/google` it destroyed a
+union that client forwards and the live `v1beta` proto accepts. A `--check` on
+an ordinary discriminated union therefore **failed CI (exit 1)** and offered, as
+the fix, an edit that reduced the property to `{"description": "..."}`. It now
+exits 0, keeps all three keywords, and reports the fate per client — neither
+client *errors* on them, they ignore them, and ignore-means-keep-and-flag is the
+same error policy this tool applies everywhere else.
 
 Nullability is where that stops being cosmetic. Measured against the live
 `v1beta` endpoint and `google-adk==2.6.3` (control-checked with

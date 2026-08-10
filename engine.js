@@ -551,7 +551,8 @@
   // #352. Every keyword rule in this file decides one keyword's fate, and each
   // of them is individually defensible: the narrow proto has no field for `if`,
   // `contains`, `propertyNames`, `patternProperties`, `dependentRequired` or
-  // `unevaluatedProperties`, and a converting client cannot carry `oneOf`. The
+  // `unevaluatedProperties`, and some converting clients cannot carry `oneOf`
+  // (google-adk drops it; @ai-sdk/google forwards it — #365). The
   // outcome none of them can see is the node consisting of NOTHING BUT the
   // keyword being removed — #329's tell, asked here about the DOCUMENT ROOT for
   // the first time. Measured across the whole test corpus: 14 ordinary inputs
@@ -3685,6 +3686,39 @@
   // So this is #334's three-client split again, and Go is again the silent one.
   var GEMINI_PROTO_ONLY = { "oneOf": 1, "allOf": 1, "not": 1 };
 
+  // #365. `--to gemini-client` is named for a CLASS — "the caller hands JSON
+  // Schema to a layer that rebuilds the request" — and until now it encoded
+  // exactly ONE member of that class, `google-adk`. The members DISAGREE about
+  // these very three keywords, so deciding for all of them was a guess wearing a
+  // measurement's clothes.
+  //
+  // Measured 2026-08-10, each keyword on a node of the type it belongs to and
+  // beside a `description` CONTROL that must survive, so a DROPPED verdict
+  // cannot be an artifact of an unreached node (#364's method). `@ai-sdk/google`
+  // read from the REAL wire payload via an intercepting `fetch` (#316), not from
+  // its source; `google-adk` from `_to_gemini_schema` directly.
+  //
+  //   keyword | google-adk 2.6.3 | @ai-sdk/google 4.0.39
+  //   oneOf   | DROPPED, node emptied | forwarded verbatim, recursed
+  //   allOf   | DROPPED, node emptied | forwarded verbatim, recursed
+  //   not     | DROPPED               | DROPPED
+  //
+  // The decisive part is not that they disagree, it is the ASYMMETRY of the
+  // strip we used to do. For google-adk, stripping bought NOTHING: its output is
+  // byte-identical whether we strip the keyword or hand it over intact, because
+  // it drops the keyword itself. For @ai-sdk/google it cost everything — that
+  // client forwards `oneOf` and the live v1beta proto accepts it (#343), so we
+  // were deleting a union that would have been enforced. A strip that is a no-op
+  // for the client it was written for and a deletion for the client it was not.
+  //
+  // And neither client ERRORS on any of the three; both ignore what they cannot
+  // carry. #314's error policy has one answer for that and it is the same answer
+  // `--to gemini` already gives: ignore -> KEEP and flag, never strip.
+  //
+  // Snapshot, like the Go tables (#361) and #364's AI-SDK table: this suite is
+  // dependency-free and cannot run either client, so re-measure on a version bump.
+  var GEMINI_CLIENT_CARRIED = { "oneOf": 1, "allOf": 1 };
+
   // The OTHER path. `google-genai` (Python) 2.17.0 documents the backend's
   // accepted set for `response_json_schema` verbatim on the field itself:
   //   "While the full JSON Schema may be sent, not all features are supported.
@@ -4310,20 +4344,47 @@
             // the strip did not narrow the schema, it emptied it: a `{"title":
             // "Pet"}` that constrains nothing, which the backend then accepts.
             //
-            // A converting client is the one case where it genuinely cannot
-            // survive: that layer rebuilds the request from its own Schema
-            // type, and no client declares these. So `--to gemini-client`
-            // still strips, and only the reason changes.
+            // A converting client was treated as the one case where it
+            // genuinely cannot survive — "that layer rebuilds the request from
+            // its own Schema type, and no client declares these." Measured
+            // FALSE for @ai-sdk/google, which declares no `Schema` type at all
+            // and forwards `oneOf`/`allOf` explicitly (see GEMINI_CLIENT_CARRIED).
+            // So this keeps too, and reports the fate per client.
             if (clientConverts) {
-              ledger.push(entry("x", path,
-                "Removed `" + k + "` — the v1beta proto DOES have this field, but a " +
-                "converting client rebuilds the request from its own `Schema` type and no " +
-                "client declares it (JS `.d.ts`, Python `types.Schema`, Go struct all lack " +
-                "it), so it cannot survive that layer. If you send the proto directly, or " +
-                "via `@google/genai` (which forwards it verbatim), use `--to gemini` and " +
-                "keep it.",
-                DOCS.gemini));
-              delete node[k];
+              // Does the node survive its own repair? If the keyword is all it
+              // had, a client that drops it leaves a property constraining
+              // nothing — #329's question asked about the layer downstream.
+              var withoutKw = {};
+              Object.keys(node).forEach(function (kk) { if (kk !== k) withoutKw[kk] = node[kk]; });
+              var emptied = !constrainsSomething(withoutKw);
+              ledger.push(entry("=", path,
+                GEMINI_CLIENT_CARRIED[k]
+                  ? "Kept `" + k + "` — whether it survives depends on WHICH converting " +
+                    "client you use, and that is the one fact only you have. Measured " +
+                    "2026-08-10: `@ai-sdk/google` 4.0.39 forwards `" + k + "` verbatim and " +
+                    "recurses into its branches, and the live v1beta proto accepts it " +
+                    "(no `Cannot find field`), so there it is carried end to end. " +
+                    "`google-adk` 2.6.3's `_to_gemini_schema` DROPS it with no error" +
+                    (emptied
+                      ? " — and `" + k + "` is the only constraint on this node, so on that " +
+                        "client this property ends up asserting nothing about the data " +
+                        "while the call still succeeds."
+                      : ".") +
+                    " Deleting it here would have destroyed a constraint the first client " +
+                    "enforces while changing nothing for the second, which drops it either " +
+                    "way. If you are on google-adk, remodel it as `anyOf` — both clients " +
+                    "carry that."
+                  : "Kept `" + k + "` — BOTH measured converting clients drop it " +
+                    "(`google-adk` 2.6.3 and `@ai-sdk/google` 4.0.39, 2026-08-10), so on " +
+                    "this target expect it to be unenforced" +
+                    (emptied
+                      ? ", and since it is the only constraint on this node the property " +
+                        "will assert nothing about the data while the call still succeeds."
+                      : ".") +
+                    " It is left in the file rather than deleted because neither client " +
+                    "ERRORS on it — they ignore it — and because this list is a snapshot " +
+                    "of two members of an open class, not a fact about every client.",
+                DOCS.gemini, true));
             } else {
               // Advisory, never a gate failure: the destination accepts this,
               // so failing CI on it would be #317's mistake. Which client you
@@ -4930,6 +4991,12 @@
     // a table transcribed from a vendor artifact has no expiry date on it, so
     // make re-diffing it one command rather than a re-derivation.
     AI_SDK_GOOGLE_FORWARDED_KEYS: Object.keys(AI_SDK_GOOGLE_FORWARDED),
+
+    // The subset of GEMINI_PROTO_ONLY that at least one MEASURED converting
+    // client carries. Exported because it is the discriminator `--to
+    // gemini-client` used to decide by itself: the two members of that class
+    // disagree here, so the rule reports instead of choosing (#365).
+    GEMINI_CLIENT_CARRIED_KEYS: Object.keys(GEMINI_CLIENT_CARRIED),
 
     // The `format` VALUES Anthropic's transformer keeps on a string. Exported
     // for the same reason as GEMINI_ALLOWED_KEYS: so "all three SDKs agree" is a

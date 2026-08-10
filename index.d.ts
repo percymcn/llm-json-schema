@@ -131,6 +131,15 @@ export const GEMINI_ALLOWED_KEYS: string[];
 export const AI_SDK_GOOGLE_FORWARDED_KEYS: string[];
 
 /**
+ * The keywords Gemini's proto has but no client type declares, which at least
+ * one MEASURED converting client nevertheless carries. `--to gemini-client`
+ * used to strip all of these; the members of that class disagree, so it now
+ * keeps them and reports the fate per client. Snapshot of google-adk 2.6.3 and
+ * @ai-sdk/google 4.0.39 — re-measure after a version bump.
+ */
+export const GEMINI_CLIENT_CARRIED_KEYS: string[];
+
+/**
  * The `format` VALUES Anthropic's transformer keeps on a string node.
  * Confirmed against three independent vendor artifacts, each a literal in
  * code: the JS `SUPPORTED_STRING_FORMATS`, the Python `SupportedStringFormats`
@@ -176,6 +185,7 @@ declare const api: {
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
   AI_SDK_GOOGLE_FORWARDED_KEYS: typeof AI_SDK_GOOGLE_FORWARDED_KEYS;
+  GEMINI_CLIENT_CARRIED_KEYS: typeof GEMINI_CLIENT_CARRIED_KEYS;
   ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
   ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;

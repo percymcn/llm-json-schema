@@ -3610,13 +3610,52 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     !!E.convert({ type: "string", not: { type: "string", pattern: "^x" } },
       "gemini").schema.not);
 
-  // A converting client rebuilds the request from its own Schema type, and no
-  // client declares these — so there the strip is right, and only the reason
-  // changes. The two targets genuinely disagree about the same document.
+  // #365. These two assertions used to read "still strips `oneOf`" on the
+  // premise, stated in this comment, that "no client declares these — so there
+  // the strip is right." MEASURED FALSE: `@ai-sdk/google` 4.0.39 declares no
+  // `Schema` type at all and forwards `oneOf`/`allOf` verbatim, recursing into
+  // the branches, and the live v1beta proto accepts them (#343). The strip was
+  // a no-op for the client it was written for (google-adk drops the keyword
+  // itself, so its output is byte-identical either way) and a deletion for the
+  // client it was not. The tests were pinning the defect, so they are corrected
+  // rather than deleted.
   var GC = E.convert(PET, "gemini-client");
-  ok("gemini-client: still strips `oneOf`", !("oneOf" in GC.schema));
-  ok("gemini-client: and no longer claims the PROTO cannot carry it",
-    has(GC.ledger, "the v1beta proto DOES have this field"));
+  ok("gemini-client: KEEPS `oneOf` — @ai-sdk/google forwards it", !!GC.schema.oneOf);
+  ok("gemini-client: and the branches survive with their own properties",
+    !!(GC.schema.oneOf && GC.schema.oneOf[0] && GC.schema.oneOf[0].properties));
+  ok("gemini-client: names the client that carries it",
+    has(GC.ledger, "@ai-sdk/google"));
+  ok("gemini-client: and names the client that drops it",
+    has(GC.ledger, "google-adk"));
+  // Advisory, never a gate failure: neither measured client ERRORS on it, they
+  // ignore it, so failing CI here would be #317's mistake.
+  ok("gemini-client: keeping it is ADVISORY, never a gate failure",
+    GC.ledger.some(function (l) {
+      return l.advisory && l.msg.indexOf("Kept `oneOf`") !== -1;
+    }));
+  // The over-block guard in the other direction: `not` is dropped by BOTH
+  // measured clients, so it must NOT be described as carried. Without this the
+  // rule could be firing blanket and every assertion above would still pass.
+  var GCnot = E.convert({ type: "string", not: { type: "string", pattern: "^x" } },
+    "gemini-client");
+  ok("gemini-client: `not` is kept too (neither client errors on it)",
+    !!GCnot.schema.not);
+  ok("gemini-client: ...but is reported as dropped by BOTH clients",
+    has(GCnot.ledger, "BOTH measured converting clients drop it"));
+  // #329's question asked about the layer downstream: if the keyword was the
+  // node's only constraint, the client that drops it leaves a property
+  // asserting nothing. That clause must fire here and NOT on a node that has
+  // something else to stand on.
+  ok("gemini-client: names the emptying when the union is the only constraint",
+    has(GC.ledger, "asserting nothing about the data"));
+  var GCrich = E.convert({
+    type: "object",
+    properties: { a: { type: "string" } },
+    required: ["a"],
+    allOf: [{ type: "object", properties: { b: { type: "string" } } }]
+  }, "gemini-client");
+  ok("gemini-client: ...and does NOT claim emptying when the node has more",
+    !has(GCrich.ledger, "asserting nothing about the data"));
 
   // OVER-BLOCK GUARDS. The eleven keywords the endpoint really does reject
   // must still be stripped — widening the allowlist wholesale would be the
@@ -4606,11 +4645,17 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 
   // The discriminator that proves the rule is keyed on the OUTCOME and not on a
-  // keyword list: ONE input, two targets, opposite verdicts. #343 measured that
-  // the live v1beta endpoint accepts `oneOf` in `responseSchema`, so `--to
-  // gemini` KEEPS it and the document still constrains something; a converting
-  // client rebuilds the request from its own `Schema` type, which has no such
-  // field, so `--to gemini-client` empties the same file.
+  // keyword list: ONE input, two targets, opposite verdicts.
+  //
+  // #365 re-cut this. It used to run `gemini` vs `gemini-client` on a `oneOf`
+  // union, because `gemini-client` STRIPPED `oneOf` and so emptied the file.
+  // That strip was the defect #365 fixed — `@ai-sdk/google` forwards `oneOf`
+  // verbatim — so after the fix the union is emptied on NO target and the pair
+  // no longer discriminates anything. The property being proved is orthogonal
+  // to which pair demonstrates it, so it moves to `gemini` vs `gemini-json`,
+  // which is the pair #352's own remedy names (it measured that 13 of its 14
+  // emptied shapes survive `--to gemini-json`). Verified 2026-08-10 on three
+  // separate shapes; `patternProperties` is the one below.
   var pet = {
     title: "Pet",
     oneOf: [
@@ -4620,8 +4665,16 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   };
   ok("#352 a union kept by the narrow proto is not reported as emptied",
     note(E.toGemini(pet).ledger).length === 0);
-  ok("#352 the same union IS reported when a converting client strips it",
-    note(E.toGemini(pet, false, true).ledger).length === 1);
+  // #365's fix, pinned where it would regress: the converting-client target
+  // must not empty this file either.
+  ok("#365 ...nor when a converting client is the target",
+    note(E.toGemini(pet, false, true).ledger).length === 0 &&
+    !!E.toGemini(pet, false, true).schema.oneOf);
+  var patterned = { title: "M", patternProperties: { "^a": { type: "string" } } };
+  ok("#352 a shape the narrow proto cannot carry IS reported as emptied",
+    note(E.convert(patterned, "gemini").ledger).length === 1);
+  ok("#352 ...and the SAME file is not emptied on the JSON-Schema path",
+    note(E.convert(patterned, "gemini-json").ledger).length === 0);
 
   // Exit 0 was the worst of the two: the orphan-`$defs` pruner removes a bag
   // nothing points into WITHOUT a ledger entry, so a document consisting only of
