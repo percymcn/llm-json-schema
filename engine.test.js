@@ -7931,5 +7931,89 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// ---------------------------------------------------------------------------
+// #380 — a property name is an arbitrary string, and `k in obj` walks the
+// prototype chain. Every "does this already declare k?" test answered YES for
+// `toString`/`constructor`/`valueOf`, so the tool invented collisions that the
+// document does not contain and blocked on them, and the narrow Gemini strip
+// treated such a key as an allowlist member and leaked it onto the wire.
+// Reachability measured on pydantic==2.13.4: a field named `toString` or
+// `constructor` is emitted verbatim. Helpers are re-declared and GUARDED so a
+// reverted engine REPORTS rather than aborting the file (#322).
+(function () {
+  function conv(sch, p) {
+    try { return E.convert(JSON.parse(JSON.stringify(sch)), p); } catch (e) { return { ledger: [], schema: {} }; }
+  }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function blk(r) { return led(r).filter(function (l) { return l.op === "!" && !l.advisory; }); }
+  function sch(r) { return (r && r.schema && typeof r.schema === "object") ? r.schema : {}; }
+  function propsOf(o) { return (o && isObj(o.properties)) ? Object.keys(o.properties) : []; }
+  function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
+  function outer(r) {
+    var s = sch(r);
+    return (isObj(s.properties) && isObj(s.properties.outer)) ? s.properties.outer : {};
+  }
+  var allOfCase = function (p) {
+    return { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+      type: "object", required: ["own"], properties: { own: { type: "string" } },
+      allOf: [{ type: "object", required: [p], properties: (function () { var o = {}; o[p] = { type: "integer" }; return o; })() }] } } };
+  };
+  var refCase = function (p) {
+    var props = {}; props[p] = { type: "string" };
+    return { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+      type: "object", required: [p], properties: props, "$ref": "#/$defs/Base" } },
+      "$defs": { Base: { type: "object", required: ["b"], properties: { b: { type: "integer" } } } } };
+  };
+
+  // THE DISCRIMINATOR: the `zzz` row passes both before and after, which is
+  // exactly what makes the prototype-named rows discriminate rather than assert.
+  ["zzz", "toString", "constructor", "valueOf", "hasOwnProperty"].forEach(function (p) {
+    var r = conv(allOfCase(p), "openai");
+    ok("#380 allOf: a member property named `" + p + "` merges, not a false clash",
+       blk(r).length === 0 && propsOf(outer(r)).indexOf(p) !== -1 &&
+       propsOf(outer(r)).indexOf("own") !== -1);
+    var r2 = conv(refCase(p), "openai");
+    ok("#380 $ref: a node property named `" + p + "` merges with the referent",
+       blk(r2).length === 0 && propsOf(outer(r2)).indexOf(p) !== -1 &&
+       propsOf(outer(r2)).indexOf("b") !== -1);
+  });
+
+  // OVER-BLOCK GUARDS — a GENUINE duplicate with different shapes must still
+  // block on both paths. Without these the fix could be "never clash at all".
+  var gAll = { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+    type: "object", required: ["dup"], properties: { dup: { type: "string" } },
+    allOf: [{ type: "object", required: ["dup"], properties: { dup: { type: "integer" } } }] } } };
+  ok("#380 guard: a genuine allOf clash still blocks", blk(conv(gAll, "openai")).length > 0);
+  var gRef = { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+    type: "object", required: ["dup"], properties: { dup: { type: "string" } }, "$ref": "#/$defs/Base" } },
+    "$defs": { Base: { type: "object", required: ["dup"], properties: { dup: { type: "integer" } } } } };
+  ok("#380 guard: a genuine $ref clash still blocks", blk(conv(gRef, "openai")).length > 0);
+
+  // The narrow Gemini path is a proto with a closed field set, so a leaked key
+  // is a hard 400 -- measured live, and handed back at exit 1 ("commit this").
+  var unknownKw = function (k) {
+    var o = { type: "object", additionalProperties: false, required: ["a"], properties: { a: { type: "string" } } };
+    o[k] = { bogus: true }; return o;
+  };
+  ["frobnicate", "toString", "constructor", "valueOf"].forEach(function (k) {
+    var out = sch(conv(unknownKw(k), "gemini"));
+    ok("#380 gemini: unknown keyword `" + k + "` is stripped from the proto payload",
+       Object.keys(out).indexOf(k) === -1);
+  });
+
+  // The `definitions` -> `$defs` rename used the same `in` test, so a
+  // definition named `toString` was never copied and its pointers dangled.
+  var ren = { type: "object", required: ["a"], properties: { a: { "$ref": "#/definitions/toString" } },
+    definitions: { toString: { type: "string", minLength: 3 } } };
+  var renOut = sch(conv(ren, "openai"));
+  ok("#380 rename: a definition named `toString` survives definitions -> $defs",
+     JSON.stringify(renOut).indexOf("minLength") !== -1);
+
+  // Control: an ordinary schema must be untouched by all of the above.
+  var plain = conv({ type: "object", additionalProperties: false, required: ["a"],
+                     properties: { a: { type: "string" } } }, "openai");
+  ok("#380 control: an ordinary closed object is still clean", blk(plain).length === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1250 engine + 270 CLI + 44 ESM/library assertions = **1564** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1268 engine + 275 CLI + 44 ESM/library assertions = **1587** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -746,7 +746,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1564 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1587 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1513,6 +1513,58 @@ All five sites now share one `pointerTokens`. Recursion is identified by the
 into one definition are different nodes, so keying on the name reports a cycle
 where there is none. That equivalence was validated against an un-memoized
 walk on 4,000 generated ref-graphs containing 3,129 pointer-into edges.
+
+## A property may be called `toString`
+
+Property names in JSON Schema are arbitrary strings, and `k in obj` walks the
+prototype chain — so `"toString" in {b: 1}` is **true**. Fourteen rules across
+this engine asked "does this object already declare `k`?" with `in`, and every
+one of them answered *yes* for `toString`, `constructor`, `valueOf`,
+`hasOwnProperty` and `__proto__`, none of which the document declares.
+
+Reachability is not exotic. Measured on `pydantic==2.13.4`:
+
+```python
+class M(BaseModel):
+    toString: str
+    constructor: int
+```
+
+is emitted verbatim, with no complaint.
+
+Three families of damage, each measured against the vendor:
+
+| shape | before | after | vendor (`toStrictJsonSchema`) |
+|---|---|---|---|
+| `allOf` member declares `toString` | **exit 3**, invented clash, property deleted | exit 1, merged | ACCEPTS, keeps `["own","toString"]` |
+| `$ref` sibling node declares `toString` | **exit 3**, invented clash | exit 1, merged | our merged output ACCEPTED |
+| genuinely duplicated `dup`, different shapes | exit 3 | exit 3 *(unchanged)* | THROWS — so the block is correct |
+
+The blocker's own text was false of the input: it said *"this node and the
+schema its `$ref` points at **both declare** a property `toString`"* about a
+referent that declares only `b`. The tool invented a collision and then told
+the reader to "declare `toString` once, with the shape you actually mean."
+
+The same hole is in every keyword allowlist, because those tables are looked up
+with keys taken from **your** document. On `--to openai` that is cosmetic — the
+vendor ignores unknown keywords — but the narrow Gemini path is a proto with a
+closed field set, so the leaked key is a hard 400, measured on the live
+`v1beta` endpoint with both controls discriminating:
+
+```
+CONTROL bogus-type : Invalid value at '…response_schema.type'   (oracle is live)
+CONTROL plain      : API key not valid                          (payload accepted)
+our old output     : Unknown name "toString" … Cannot find field  ← handed back at exit 1
+our new output     : API key not valid                          (payload accepted)
+```
+
+Exit 1 is this tool's *"here are your changes, commit the output"*, so that was
+a document we told you to commit and the service refuses.
+
+Membership is now a question about the object, never about `Object.prototype`:
+one `hasOwn` and one `inTable`, used at all fourteen sites. The `definitions` →
+`$defs` rename was one of them, so a definition named `toString` was never
+copied and its pointers dangled.
 
 ## License
 MIT.

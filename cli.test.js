@@ -1653,5 +1653,40 @@ function fanout(depth) {
 })();
 
 
+// #380 — the exit-code contract. A property named `toString` used to make the
+// gate invent a collision and exit 3 ("needs a human fix") on a schema the
+// vendor merges and ACCEPTS; and the narrow Gemini strip leaked such a key onto
+// a proto that rejects unknown fields, at exit 1 ("commit my output").
+(function () {
+  var fs = require("fs"), os = require("os"), pth = require("path");
+  var tmp = fs.mkdtempSync(pth.join(os.tmpdir(), "cli380-"));
+  function w(name, obj) { var f = pth.join(tmp, name); fs.writeFileSync(f, JSON.stringify(obj)); return f; }
+  var allOfCase = function (p) {
+    var mp = {}; mp[p] = { type: "integer" };
+    return { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+      type: "object", required: ["own"], properties: { own: { type: "string" } },
+      allOf: [{ type: "object", required: [p], properties: mp }] } } };
+  };
+  // THE DISCRIMINATOR: identical schemas, only the property NAME differs.
+  var plain = run(["--to", "openai", "--check", w("p.json", allOfCase("zzz"))]);
+  var proto = run(["--to", "openai", "--check", w("q.json", allOfCase("toString"))]);
+  ok("#380 CLI: an ordinary property name exits 1 (mergeable)", plain.status === 1);
+  ok("#380 CLI: a property named `toString` exits 1 too, not a false blocker", proto.status === 1);
+  ok("#380 CLI: no invented clash is reported",
+     (proto.stdout + proto.stderr).indexOf("both declare a property") === -1);
+  // A GENUINE duplicate must still block -- guards against "never clash".
+  var dup = { type: "object", additionalProperties: false, required: ["outer"], properties: { outer: {
+    type: "object", required: ["dup"], properties: { dup: { type: "string" } },
+    allOf: [{ type: "object", required: ["dup"], properties: { dup: { type: "integer" } } }] } } };
+  ok("#380 CLI: a genuine clash still exits 3",
+     run(["--to", "openai", "--check", w("d.json", dup)]).status === 3);
+  // Gemini narrow proto: the leaked key is a measured hard 400.
+  var unk = { type: "object", additionalProperties: false, required: ["a"],
+              properties: { a: { type: "string" } }, toString: { bogus: true } };
+  var gem = run(["--to", "gemini", w("g.json", unk)]);
+  ok("#380 CLI: unknown keyword `toString` is stripped from the gemini payload",
+     gem.stdout.indexOf("toString") === -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

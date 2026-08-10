@@ -114,6 +114,31 @@
     return v && typeof v === "object" && !Array.isArray(v);
   }
 
+  // Property names in JSON Schema are ARBITRARY STRINGS, and `k in obj` walks
+  // the prototype chain -- so `"toString" in {b:1}` is TRUE. Every rule that
+  // asks "does this object already declare k?" with `in` therefore answers yes
+  // for `toString`, `constructor`, `valueOf`, `hasOwnProperty`, `__proto__` and
+  // the rest of Object.prototype, none of which the document declares. Measured
+  // on `pydantic==2.13.4`: a field named `toString` or `constructor` is emitted
+  // verbatim with no complaint, so this is ordinary input, not a hostile one.
+  // Always ask the OBJECT, never the chain (#379's `hasOwnProperty` rule, which
+  // was applied to `derefLocal` and left in six other places).
+  function hasOwn(o, k) {
+    return o != null && Object.prototype.hasOwnProperty.call(o, k);
+  }
+
+  // Every keyword allowlist below is consulted with a key taken from the
+  // CALLER'S document, so `TABLE[k]` has the same prototype hole: an unknown
+  // keyword named `toString` reads as a truthy member of every table and is
+  // therefore treated as SUPPORTED. On `--to openai` that is cosmetic (the
+  // vendor ignores unknown keywords), but the narrow Gemini path is a proto
+  // with a closed field set, and the leaked key is a hard 400 measured on the
+  // live v1beta endpoint -- handed back at exit 1, i.e. "commit my output".
+  // Membership is a question about the TABLE, never about Object.prototype.
+  function inTable(t, k) {
+    return hasOwn(t, k) && !!t[k];
+  }
+
   // A node is an "object schema" if it declares type:object or carries properties.
   function isObjectSchema(node) {
     if (!isPlainObject(node)) return false;
@@ -868,7 +893,7 @@
     var sawSubstantive = false;
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
-      if (ANNOTATION_KEYWORDS[k]) continue;   // legal, but proves nothing.
+      if (inTable(ANNOTATION_KEYWORDS, k)) continue;   // legal, but proves nothing.
       var shape = Object.prototype.hasOwnProperty.call(SCHEMA_KEYWORD_SHAPE, k)
         ? SCHEMA_KEYWORD_SHAPE[k] : null;
       if (!shape || !shape(obj[k])) return false;  // a non-keyword, or a keyword
@@ -1218,7 +1243,7 @@
   // definition bag as a constraint is the mistake to avoid — `{$ref, $defs}` is
   // the canonical shape every generator emits and the vendor accepts it.
   function toleratedRefSibling(k, atRoot, node) {
-    if (OPENAI_ANNOTATION_KEYWORDS[k] === 1) return true;
+    if (hasOwn(OPENAI_ANNOTATION_KEYWORDS, k) && OPENAI_ANNOTATION_KEYWORDS[k] === 1) return true;
     if ((k === "$defs" || k === "definitions") && isPlainObject(node[k])) return true;
     if (atRoot && (k === "$schema" || k === "$id")) return true;
     return false;
@@ -1454,7 +1479,7 @@
     if (isPlainObject(s.$defs)) {
       // both present — merge `definitions` in without clobbering `$defs`
       Object.keys(s.definitions).forEach(function (k) {
-        if (!(k in s.$defs)) s.$defs[k] = s.definitions[k];
+        if (!hasOwn(s.$defs, k)) s.$defs[k] = s.definitions[k];
       });
     } else {
       s.$defs = s.definitions;
@@ -1486,9 +1511,15 @@
   // with no local target is dead everywhere, so it never qualifies.
   function rootRefResolvesInDefs(s) {
     if (typeof s.$ref !== "string") return false;
-    var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
-    if (!m) return false;
-    return isPlainObject(s.$defs) && isPlainObject(s.$defs[m[1]]);
+    // Was `/^#\/\$defs\/(.+)$/` with the capture used RAW as an object key --
+    // #379's shape, still here in two more readers after that sweep stopped
+    // short. It knew one container spelling, could not decode an RFC 6901 or
+    // URI escape, and looked the name up with a plain `[]`, so
+    // `#/$defs/__proto__` resolved to `Object.prototype` (an object, so it
+    // passes every shape test) and this said "resolves" about a pointer the
+    // dangling-detector calls dead. Route through the one document-driven
+    // resolver so the two cannot disagree about the same pointer (#372).
+    return defBagRef(s, s.$ref) !== null;
   }
 
   // The container has TWO spellings and so does the pointer into it, and this
@@ -1711,7 +1742,7 @@
 
     // carry over any sibling keys the generator left next to `$ref`
     Object.keys(s).forEach(function (k) {
-      if (k !== "$ref" && k !== bag && !(k in out)) out[k] = s[k];
+      if (k !== "$ref" && k !== bag && !hasOwn(out, k)) out[k] = s[k];
     });
 
     // keep only the definitions something still points at (recursive schemas
@@ -1834,7 +1865,7 @@
     if (tProps && nProps) {
       var clash = null;
       Object.keys(nProps).forEach(function (k) {
-        if (clash === null && k in tProps && canonical(tProps[k]) !== canonical(nProps[k])) clash = k;
+        if (clash === null && hasOwn(tProps, k) && canonical(tProps[k]) !== canonical(nProps[k])) clash = k;
       });
       if (clash !== null) {
         ledger.push(entry("!", path,
@@ -1852,7 +1883,7 @@
     if (nProps) {
       if (!isPlainObject(out.properties)) out.properties = {};
       Object.keys(nProps).forEach(function (k) {
-        if (!(k in out.properties)) out.properties[k] = clone(nProps[k]);
+        if (!hasOwn(out.properties, k)) out.properties[k] = clone(nProps[k]);
       });
     }
     if (req.length) out.required = req.slice();
@@ -1895,19 +1926,26 @@
       var siblings = Object.keys(node).filter(function (k) {
         return k !== "$ref" && k !== "$defs";
       });
-      var m = typeof node.$ref === "string" ? /^#\/\$defs\/(.+)$/.exec(node.$ref) : null;
+      // Same replacement as `rootRefResolvesInDefs`: one resolver, so a pointer
+      // this function agrees to merge is exactly one `resolvesLocally` agrees
+      // is live. `t.name` (not the raw capture) keys the recursion stack, which
+      // keeps today's name-based cycle semantics while making the LOOKUP sound.
+      var t = typeof node.$ref === "string" ? defBagRef(s, node.$ref) : null;
 
       // `inlineRootRef` owns the root and may already have blocked this exact
       // object. Compare REFERENCES (#371): re-reporting it here would print the
       // same finding twice, and the two functions build paths differently, so a
       // path-string agreement is not available to key on.
       var alreadyBlocked = Array.isArray(blockedOut) && blockedOut.indexOf(node) !== -1;
-      if (m && siblings.length && isPlainObject(defs[m[1]]) && !alreadyBlocked) {
-        var name = m[1];
+      if (t && siblings.length && isPlainObject(t.node) && !alreadyBlocked) {
+        var name = t.name;
         if (stack.indexOf(name) !== -1) {
           if (unresolved.indexOf(name) === -1) unresolved.push(name);
         } else {
-          var target = visit(clone(defs[name]), stack.concat([name]), path);
+          // `t.node`, not `defs[name]`: a pointer INTO a definition resolves to
+          // the sub-node, and re-reading the bag by name would silently merge
+          // the whole definition instead of the part the caller pointed at.
+          var target = visit(clone(t.node), stack.concat([name]), path);
           var visited = {};
           siblings.forEach(function (k) { visited[k] = visit(node[k], stack, path); });
           var merged = intersectRef(target, visited, siblings, path, ledger, docUrl);
@@ -1970,7 +2008,7 @@
       if (!found.bailOut) {
         var kept = {};
         Object.keys(result.$defs).forEach(function (k) {
-          if (found.names[k]) kept[k] = result.$defs[k];
+          if (hasOwn(found.names, k) && found.names[k]) kept[k] = result.$defs[k];
         });
         if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
       }
@@ -2145,7 +2183,7 @@
     seen = seen || {};
     if (node.$ref !== undefined) {
       if (typeof node.$ref !== "string" || !hasOnlyRefAndAnnotations(node)) return undefined;
-      if (seen[node.$ref]) return undefined;
+      if (hasOwn(seen, node.$ref) && seen[node.$ref]) return undefined;
       var target = derefLocal(root, node.$ref);
       if (target === undefined) return undefined;
       var next = {};
@@ -2472,13 +2510,13 @@
           node.allOf = node.allOf.map(function (m) {
             if (!isPlainObject(m) || typeof m.$ref !== "string") return m;
             var extra = Object.keys(m).filter(function (k) { return k !== "$ref"; });
-            if (!extra.every(function (k) { return OPENAI_ANNOTATION_KEYWORDS[k]; })) return m;
+            if (!extra.every(function (k) { return inTable(OPENAI_ANNOTATION_KEYWORDS, k); })) return m;
             var tgt = resolveLocalDef(s, m.$ref);
             if (!tgt || typeof tgt.$ref === "string") return m;
             if (!(tgt.type === "object" || isPlainObject(tgt.properties))) return m;
             if (JSON.stringify(tgt).indexOf(m.$ref) !== -1) return m; // recursive
             var res = clone(tgt);
-            extra.forEach(function (k) { if (!(k in res)) res[k] = clone(m[k]); });
+            extra.forEach(function (k) { if (!hasOwn(res, k)) res[k] = clone(m[k]); });
             refMembersResolved++;
             return res;
           });
@@ -2605,7 +2643,7 @@
           var clash = null;
           if (onlyProps && isPlainObject(node.properties)) {
             Object.keys(onlyProps).forEach(function (k) {
-              if (clash === null && k in node.properties &&
+              if (clash === null && hasOwn(node.properties, k) &&
                   canonical(node.properties[k]) !== canonical(onlyProps[k])) clash = k;
             });
           }
@@ -2623,7 +2661,7 @@
               // Merge, do not overwrite. Union of `properties` and of `required`.
               if (!node.properties) node.properties = {};
               Object.keys(onlyProps).forEach(function (k) {
-                if (!(k in node.properties)) node.properties[k] = clone(onlyProps[k]);
+                if (!hasOwn(node.properties, k)) node.properties[k] = clone(onlyProps[k]);
               });
               var oneReq = Array.isArray(only.required) ? only.required : [];
               var baseReq = Array.isArray(node.required) ? node.required : [];
@@ -2638,7 +2676,7 @@
               // `$ref` beside metadata, the form the vendor accepts.
               Object.keys(only).forEach(function (k) {
                 if (k === "properties" || k === "required") return;
-                if (!(k in node)) node[k] = clone(only[k]);
+                if (!hasOwn(node, k)) node[k] = clone(only[k]);
               });
             }
             delete node.allOf;
@@ -2654,7 +2692,7 @@
           var mergedProps = {}, mergedReq = [];
           members.forEach(function (m) {
             Object.keys(m.properties).forEach(function (k) {
-              if (!(k in mergedProps)) mergedProps[k] = clone(m.properties[k]);
+              if (!hasOwn(mergedProps, k)) mergedProps[k] = clone(m.properties[k]);
             });
             (Array.isArray(m.required) ? m.required : []).forEach(function (k) {
               if (mergedReq.indexOf(k) === -1) mergedReq.push(k);
@@ -2662,7 +2700,7 @@
           });
           Object.keys(mergedProps).forEach(function (k) {
             if (!node.properties) node.properties = {};
-            if (!(k in node.properties)) node.properties[k] = mergedProps[k];
+            if (!hasOwn(node.properties, k)) node.properties[k] = mergedProps[k];
           });
           var nodeReq = Array.isArray(node.required) ? node.required : [];
           mergedReq.forEach(function (k) { if (nodeReq.indexOf(k) === -1) nodeReq.push(k); });
@@ -2890,7 +2928,7 @@
 
       // strip every keyword outside the supported set (unsupported => API error)
       Object.keys(node).forEach(function (k) {
-        if (OPENAI_SUPPORTED[k]) return;
+        if (inTable(OPENAI_SUPPORTED, k)) return;
         // A map keyword whose removal would empty the object stays VISIBLE, for
         // the same reason as the blocked `not`/`prefixItems`/`oneOf` above:
         // deleting it hides the very thing the reader has to remodel, and here
@@ -3394,12 +3432,12 @@
   };
 
   function anthropicGoRecognises(node, key) {
-    if (!ANTHROPIC_GO_SUPPORTED[key]) return false;
+    if (!inTable(ANTHROPIC_GO_SUPPORTED, key)) return false;
     // `supportedSchemaKeys` is consulted before the per-type switch, so a key in
     // the set survives on a node of any type. Only two get a second, type-gated
     // demotion afterwards.
     if (key === "format") {
-      return node.type !== "string" || !!ANTHROPIC_STRING_FORMATS[node.format];
+      return node.type !== "string" || inTable(ANTHROPIC_STRING_FORMATS, node.format);
     }
     if (key === "minItems") {
       return node.type !== "array" || node.minItems === 0 || node.minItems === 1;
@@ -3421,7 +3459,7 @@
       case "properties": case "required": case "additionalProperties":
         return node.type === "object";
       case "format":
-        return node.type === "string" && !!ANTHROPIC_STRING_FORMATS[node.format];
+        return node.type === "string" && inTable(ANTHROPIC_STRING_FORMATS, node.format);
       case "items":
         return node.type === "array";
       case "minItems":
@@ -4330,7 +4368,7 @@
       // one is invisible: a keyword `invopop/jsonschema` does not model is
       // dropped by `Schema.UnmarshalJSON` before `transformSchema` runs, so it
       // never reaches the extras-to-description path at all.
-      if (goSdk && !GO_INVOPOP_MODELLED[d.key]) {
+      if (goSdk && !inTable(GO_INVOPOP_MODELLED, d.key)) {
         ledger.push(entry("=", d.path,
           "`" + d.key + "` is DELETED without a trace by the Go SDK — not demoted to prose like the " +
           "keywords below it. `transformSchemaMap` round-trips your map through " +
@@ -4367,7 +4405,7 @@
           url, true));
         return;
       }
-      if (goSdk && GO_POINTER_FORMATTED[d.key]) {
+      if (goSdk && inTable(GO_POINTER_FORMATTED, d.key)) {
         ledger.push(entry("=", d.path,
           "`" + d.key + "` is not enforced by the Go SDK — and it does not even arrive as readable " +
           "prose. `formatExtraValue` (schemautil.go) dereferences pointers with reflect but then " +
@@ -4399,7 +4437,7 @@
       }
       ledger.push(entry("=", d.path,
         "`" + d.key + "` is NOT enforced" + (goSdk
-          ? " by the Go SDK — " + (ANTHROPIC_GO_SUPPORTED[d.key]
+          ? " by the Go SDK — " + (inTable(ANTHROPIC_GO_SUPPORTED, d.key)
               ? "`supportedSchemaKeys` lists it, but `transformSchema`'s per-type branch demotes this " +
                 "particular value anyway, so"
               : "it is not in `supportedSchemaKeys`, so")
@@ -5367,7 +5405,7 @@
             // The remedy above is a claim about GEMINI. Whether it reaches Gemini
             // is a claim about the CLIENT, and only the caller knows which one
             // they are on — so name the fork rather than inferring it.
-            if (GEMINI_NARROW_ENFORCED[k]) {
+            if (inTable(GEMINI_NARROW_ENFORCED, k)) {
               remedy += AI_SDK_GOOGLE_FORWARDED[k]
                 ? " That switch does survive a converting client: @ai-sdk/google's " +
                   "`convertJSONSchemaToOpenAPISchema` forwards `" + k + "` — the only one of " +
@@ -5546,8 +5584,8 @@
         // A blocked (heterogeneous) tuple stays visible so the reader can see
         // the shape they have to remodel.
         if (tupleBlocked && (k === "prefixItems" || k === "items")) return;
-        if (!GEMINI_ALLOWED[k]) {
-          if (GEMINI_PROTO_ONLY[k]) {
+        if (!inTable(GEMINI_ALLOWED, k)) {
+          if (inTable(GEMINI_PROTO_ONLY, k)) {
             // The proto has the field (see GEMINI_PROTO_ONLY). Deleting it
             // would be the error policy mistake of #314 in its purest form —
             // stripping something the destination accepts — and for `oneOf` on
@@ -5957,7 +5995,7 @@
 
     walk(schema, "root", function (node, path) {
       Object.keys(node).forEach(function (k) {
-        if (OPENAI_SUPPORTED[k] || kept.indexOf(k) !== -1) return;
+        if (inTable(OPENAI_SUPPORTED, k) || kept.indexOf(k) !== -1) return;
         if (k === "properties" || k === "$defs" || k === "definitions") return;
         kept.push(k);
         ledger.push(entry("=", path,
