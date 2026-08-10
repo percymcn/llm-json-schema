@@ -1367,4 +1367,44 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");
+// --- #363: exit codes for shapes the walk MANUFACTURED --------------------
+// A blocker is exit 3 and a fixable schema is exit 1, and the distinction is the
+// whole point for a CI caller (#330): a 1 is resolved by committing our output, a
+// 3 never is. These pairs are the same logical schema one `allOf` wrapper apart.
+(function () {
+  var WRAPPED = JSON.stringify({
+    type: "object", properties: { c: { minLength: 3, allOf: [{ $ref: "#/$defs/S" }] } },
+    required: ["c"], additionalProperties: false, $defs: { S: { type: "string" } }
+  });
+  var DIRECT = JSON.stringify({
+    type: "object", properties: { c: { minLength: 3, $ref: "#/$defs/S" } },
+    required: ["c"], additionalProperties: false, $defs: { S: { type: "string" } }
+  });
+  var SCALAR_ROOT = JSON.stringify({ allOf: [{ type: "string", minLength: 3 }] });
+  var HOISTED_ROOT = JSON.stringify({
+    allOf: [{ $ref: "#/$defs/S" }],
+    $defs: { S: { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false } }
+  });
+
+  var w = run(["--to", "openai", "--check"], WRAPPED);
+  ok("#363 CLI: a `$ref` hoisted next to a constraint is a BLOCKER (exit 3)", w.status === 3);
+  ok("#363 CLI: ...and the remedy reaches the binary",
+    /WITHOUT the `allOf` wrapper/.test(w.stdout + w.stderr));
+
+  var d = run(["--to", "openai", "--check"], DIRECT);
+  ok("#363 CLI: the at-entry twin is merely FIXABLE (exit 1), not a blocker", d.status === 1);
+
+  var sr = run(["--to", "openai", "--check"], SCALAR_ROOT);
+  ok("#363 CLI: a manufactured non-object root is a BLOCKER (exit 3)", sr.status === 3);
+  ok("#363 CLI: ...and says the caller did not write that root",
+    /did not write/.test(sr.stdout + sr.stderr));
+
+  // The over-block that used to fire here: the vendor ACCEPTS this, so it must
+  // not be a blocker.
+  var hr = run(["--to", "openai", "--check"], HOISTED_ROOT);
+  ok("#363 CLI: a bare `$ref` hoisted to the root is NOT a blocker", hr.status !== 3);
+})();
+
+
+console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

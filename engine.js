@@ -1011,6 +1011,36 @@
   // OpenAI's own SDK sends verbatim, i.e. on any Zod `.describe()` / `.min()` /
   // `.default()` or Pydantic `Field(description=..., default=...)`, which is
   // most real generator output. Verified against openai@7.4.0.
+  // Transcribed from `JSON_SCHEMA_ANNOTATION_KEYWORDS` in openai@7.4.0's
+  // lib/transform.js — a `new Set([...])` literal with no "and others" escape, so
+  // per #344 this list is genuinely CLOSED and an allowlist is the right shape.
+  // It is load-bearing twice over in the vendor: `hasOnlyAnnotationSiblings()`
+  // gates whether a single-member `allOf` may be flattened at all, and the same
+  // set decides whether a `$ref`'s siblings are tolerated. Exported and diffed
+  // against the vendor in both directions (#360: agreeing with a blocklist is
+  // nearly free — the load-bearing diff is the complement).
+  //
+  // Note `deprecated` is NOT here even though it reads like an annotation, and
+  // `readOnly`/`writeOnly` ARE — both measured, both surprising, and getting
+  // either wrong silently changes which schemas we flatten.
+  var OPENAI_ANNOTATION_KEYWORDS = {
+    $comment: 1, "default": 1, description: 1, examples: 1,
+    readOnly: 1, title: 1, writeOnly: 1
+  };
+
+  // Mirrors the vendor's `hasOnlyAnnotationSiblings()`: a sibling is tolerated if
+  // it is an annotation, or an OBJECT-VALUED `$defs`/`definitions` bag
+  // ("Definition maps do not add sibling validation constraints"), and at the ROOT
+  // the vendor's variant additionally tolerates `$schema`/`$id`. Counting the
+  // definition bag as a constraint is the mistake to avoid — `{$ref, $defs}` is
+  // the canonical shape every generator emits and the vendor accepts it.
+  function toleratedRefSibling(k, atRoot, node) {
+    if (OPENAI_ANNOTATION_KEYWORDS[k] === 1) return true;
+    if ((k === "$defs" || k === "definitions") && isPlainObject(node[k])) return true;
+    if (atRoot && (k === "$schema" || k === "$id")) return true;
+    return false;
+  }
+
   var OPENAI_SUPPORTED = {
     // structural
     type: 1, properties: 1, required: 1, additionalProperties: 1,
@@ -1748,7 +1778,14 @@
     s = inlineRootRef(s, ledger);
     s = resolveRefSiblings(s, ledger);
 
+    // These two entry-side blockers are kept for their PROVENANCE: they can say
+    // "you wrote this", and the union one names the spelling the caller actually
+    // used (#362). They cannot be the only root checks, because the walk below
+    // MANUFACTURES both of these shapes out of a flattened `allOf` — see the
+    // exit-side pass after the walk, which is what finally decides.
+    var rootShapeBlocked = false;
     if (s.type && s.type !== "object") {
+      rootShapeBlocked = true;
       ledger.push(entry("!", "root",
         "Root must be an object. OpenAI strict mode rejects a non-object root — wrap your schema in an object.",
         DOCS.openai));
@@ -1768,6 +1805,7 @@
     // to `anyOf` it hits `Root schema must not use \`anyOf\``. There is no root
     // form of a union, which is why this names a remodelling instead of a repair.
     if (s.anyOf || s.oneOf) {
+      rootShapeBlocked = true;
       ledger.push(entry("!", "root",
         "Root schema cannot use `" + (s.anyOf ? "anyOf" : "oneOf") + "`. OpenAI strict mode has no " +
         "union root at all: as `oneOf` the root carries no `type` (`Root schema must have type: " +
@@ -2237,6 +2275,42 @@
       }
     });
 
+    // ---- EXIT-SIDE ROOT PASS -------------------------------------------------
+    // #341 already knew the typeless-root CHECK had to run after the walk,
+    // because the walk can supply the `type`. The half it did not follow through
+    // on is that the root REPAIRS have to move too: `inlineRootRef` and
+    // `resolveRefSiblings` ran at entry, and the single-member `allOf` flatten in
+    // the walk above copies every member key into the node — so it HOISTS a
+    // `$ref` to the root, or next to a constraint, at a point where both
+    // repairs have already been and gone. Measured on openai@7.4.0:
+    //   {allOf:[{$ref -> object}]}                 raw ACCEPTED, we blocked it
+    //                                              ("nothing left to inline" —
+    //                                              there was, we just ran the
+    //                                              inliner before it existed)
+    //   {minLength, allOf:[{$ref -> string}]}      raw THROWS, our output THREW
+    // and the second is the sharper one, because the SAME schema with the `$ref`
+    // written directly at entry is repaired and accepted. One `allOf` wrapper
+    // decided whether a constraint was fixed or silently shipped broken, and the
+    // only difference is WHEN the keyword appeared.
+    //
+    // Only the ROOT inliner is re-run, and the boundary is deliberate. With the
+    // flatten now guarded above, a `$ref` can no longer be hoisted next to a
+    // CONSTRAINT — so `resolveRefSiblings` has nothing new to do, and re-running
+    // it would newly inline the standard Pydantic v1 shape (`{title, description,
+    // allOf:[{$ref}]}`), which the vendor accepts as a `$ref` beside annotations.
+    // That would expand the document against OpenAI's 5000-property budget for no
+    // benefit; an existing #349 test caught it, and the test was right.
+    //
+    // The root inliner IS still owed: an unguarded-but-legal flatten (annotation
+    // siblings, or none) can hoist a bare `$ref` to the root, where the entry-side
+    // `inlineRootRef` has already been and gone. Measured: `{allOf:[{$ref -> an
+    // object}]}` is ACCEPTED by the vendor, which resolves the root chain — and we
+    // used to BLOCK it with "nothing left to inline", when in fact there was; we
+    // had simply run the inliner before the pointer existed. Re-running is safe:
+    // it is a lossless inline, a no-op when there is nothing to inline, and it
+    // reports what it did.
+    s = inlineRootRef(s, ledger);
+
     // The ROOT `type` check runs LAST, because the walk above can supply the
     // `type` itself — a single-member object `allOf` is flattened there, and the
     // vendor accepts that exact input for the same reason. Running this earlier
@@ -2282,6 +2356,65 @@
             : " Declare the properties you expect.") +
           " Do NOT just add `type: \"object\"`: the API accepts that, and the result is an " +
           "object whose only legal value is `{}` — a parameter that can never be populated.",
+          DOCS.openai));
+      }
+    }
+
+    // The root shape is decided HERE, on what we are actually handing back, and
+    // not on what arrived (#342: a claim about the output belongs at the exit).
+    // The entry-side blockers above cover the shapes the CALLER wrote; this covers
+    // the ones WE wrote. Keying it on the outcome rather than on a keyword list is
+    // the point (#352): it needs no knowledge of which rewrite produced the shape,
+    // so a rewrite added later cannot slip past it the way the flatten slipped
+    // past the entry-side pair.
+    //
+    // Deliberately NOT a repair. There is no root form of a union, and turning a
+    // scalar root into an object means inventing a wrapper property whose name we
+    // would be guessing — so per #329's corollary this names the remodelling
+    // instead of manufacturing a schema that is valid and no longer the caller's.
+    // The nested half of the same class, and it is the sharpest row measured:
+    // `resolveRefSiblings` ran at entry, and the flatten above then HOISTS a
+    // `$ref` up beside whatever the wrapper was carrying. So
+    //   {minLength: 3, $ref: S}                     repaired -> ACCEPTED
+    //   {minLength: 3, allOf: [{$ref: S}]}          shipped   -> REJECTED
+    // are the same schema one wrapper apart, and the only difference is WHEN the
+    // `$ref` appeared. Checked on the output for the same reason as the root:
+    // whether the pointer was written by the caller or by us, it is ours now.
+    //
+    // The tolerated-sibling set is the vendor's, not ours (`$defs`/`definitions`
+    // bags and the seven annotations do not constrain), so this fires only where
+    // `toStrictJsonSchema()` actually throws.
+    walk(s, "root", function (node, path) {
+      if (typeof node.$ref !== "string") return;
+      var bad = Object.keys(node).filter(function (k) {
+        return k !== "$ref" && !toleratedRefSibling(k, path === "root", node);
+      });
+      if (!bad.length) return;
+      ledger.push(entry("!", path,
+        "This `$ref` sits beside " + bad.map(function (k) { return "`" + k + "`"; }).join(", ") +
+        ", which Draft 7 ignores and OpenAI refuses (`Schema $ref at `" + path + "` has " +
+        "non-annotation siblings`). It is here because a single-member `allOf` was flattened " +
+        "into this node, lifting the `$ref` up next to those keywords. Write the `$ref` " +
+        "WITHOUT the `allOf` wrapper and we will inline the definition for you, which makes " +
+        "the constraint and the reference coexist; or move the keywords into the definition.",
+        DOCS.openai));
+    });
+
+    if (!rootShapeBlocked) {
+      var badRootType = s.type && s.type !== "object" ? s.type : null;
+      if (badRootType || s.anyOf) {
+        ledger.push(entry("!", "root",
+          "After the fixes above this root is " +
+          (badRootType
+            ? "`type: " + JSON.stringify(badRootType) + "`"
+            : "a bare `anyOf` union") +
+          ", which OpenAI strict mode rejects (`Root schema must " +
+          (badRootType ? "have type: 'object'`" : "not use \\`anyOf\\`") + "`). You did not write " +
+          "that root — it came out of flattening a single-member `allOf`, which copies the " +
+          "member's keys up into the node (OpenAI's own transformer does the same, which is why " +
+          "the original input is rejected too). Wrap the composed schema in an object: " +
+          "`{\"type\": \"object\", \"properties\": {\"result\": <it>}, \"required\": [\"result\"], " +
+          "\"additionalProperties\": false}`.",
           DOCS.openai));
       }
     }
@@ -4782,7 +4915,8 @@
     // warn about a keyword the vendor keeps. Get the second wrong and we call a
     // silent deletion a demotion, which is the severity users act on.
     ANTHROPIC_GO_SUPPORTED_KEYS: Object.keys(ANTHROPIC_GO_SUPPORTED),
-    GO_INVOPOP_MODELLED_KEYS: Object.keys(GO_INVOPOP_MODELLED)
+    GO_INVOPOP_MODELLED_KEYS: Object.keys(GO_INVOPOP_MODELLED),
+    OPENAI_ANNOTATION_KEYWORDS_LIST: Object.keys(OPENAI_ANNOTATION_KEYWORDS)
   };
 
   if (typeof module !== "undefined" && module.exports) module.exports = api;

@@ -5787,5 +5787,163 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   });
 })();
 
+// --- #363: a rule that reads a keyword cannot see one a LATER rewrite invents ---
+//
+// The single-member `allOf` flatten copies the member's keys UP into the node.
+// Both root blockers and `resolveRefSiblings`/`inlineRootRef` run BEFORE the walk
+// that does it, so the converter manufactured, after its own checks had passed,
+// exactly the shapes those checks exist to catch. Seven routes measured against
+// openai@7.4.0's toStrictJsonSchema(): five where our output was REJECTED with
+// zero blockers reported (#330's invariant break), one nested `$ref`-beside-a-
+// constraint, and one OVER-block where the vendor accepts and we refused.
+// Fixed on the OUTPUT rather than by adding spellings to the entry side (#342,
+// #352): keyed on the outcome, so a rewrite added later cannot slip past it.
+(function () {
+  function conv(schema) { return E.toOpenAI(JSON.parse(JSON.stringify(schema))); }
+  function blk(r) {
+    return (r.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function blkAt(r, path) {
+    return blk(r).filter(function (l) { return l.path === path; });
+  }
+  // Never dereference [0].msg directly: with engine.js reverted there is no
+  // blocker, and a raw [0].msg aborts the whole FILE instead of reporting these
+  // as failures (#322's trap, hit here in my own tests).
+  function msgAt(r, path) {
+    var hits = blkAt(r, path);
+    return hits.length ? hits[0].msg : "";
+  }
+  var OBJ = { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false };
+  var OBJ2 = { type: "object", properties: { b: { type: "string" } }, required: ["b"], additionalProperties: false };
+
+  // ---- the five manufactured ROOTS -------------------------------------------
+  // Each is a root the CALLER never wrote: the flatten hoisted the member's
+  // `type`/`anyOf` up. The vendor rejects all five (its own transformer performs
+  // the same flatten, which is why the raw input is rejected too).
+  var scalarRoot = conv({ allOf: [{ type: "string", minLength: 3 }] });
+  ok("#363 a flattened scalar member makes the ROOT non-object, and that is blocked",
+    blkAt(scalarRoot, "root").length === 1);
+  ok("#363 ...and the message says the caller did not write that root",
+    /did not write/.test(msgAt(scalarRoot, "root")));
+  ok("#363 ...and names the flatten as the source",
+    /single-member `allOf`/.test(msgAt(scalarRoot, "root")));
+
+  ok("#363 a flattened array member makes the ROOT non-object, and that is blocked",
+    blkAt(conv({ allOf: [{ type: "array", items: { type: "string" } }] }), "root").length === 1);
+
+  // `anyOf` and `oneOf` both land here, and the `oneOf` route is two rewrites
+  // deep: the flatten lifts `oneOf` to the root, then the walk's oneOf->anyOf
+  // rewrite turns it into the very `anyOf` root #362's blocker exists to catch.
+  ok("#363 a flattened `anyOf` member makes the ROOT a bare union, and that is blocked",
+    blkAt(conv({ allOf: [{ anyOf: [OBJ, OBJ2] }] }), "root").length === 1);
+  ok("#363 a flattened `oneOf` member is rewritten to a root `anyOf`, and that is blocked",
+    blkAt(conv({ allOf: [{ oneOf: [OBJ, OBJ2] }] }), "root").length === 1);
+  ok("#363 ...and the union case says `anyOf`, not a type",
+    /bare `anyOf` union/.test(msgAt(conv({ allOf: [{ anyOf: [OBJ, OBJ2] }] }), "root")));
+
+  // An object-shaped node whose member is a scalar: the flatten leaves BOTH
+  // `properties` and `type:"string"` on one node. The vendor throws.
+  ok("#363 a scalar member flattened onto an object-shaped node is blocked",
+    blkAt(conv({ properties: { a: { type: "string" } }, allOf: [{ type: "string" }] }), "root").length === 1);
+
+  // ---- the nested `$ref` route, and its at-entry twin -------------------------
+  // The sharpest row: the SAME schema one `allOf` wrapper apart. Written directly
+  // the `$ref` is inlined and the result is accepted; wrapped, the flatten hoists
+  // it AFTER the inliner has run and the constraint shipped broken.
+  var wrapped = conv({
+    type: "object", properties: { c: { minLength: 3, allOf: [{ $ref: "#/$defs/S" }] } },
+    required: ["c"], additionalProperties: false, $defs: { S: { type: "string" } }
+  });
+  ok("#363 a `$ref` hoisted next to a constraint is blocked",
+    blkAt(wrapped, "root.c").length === 1);
+  ok("#363 ...naming the offending sibling",
+    /`minLength`/.test(msgAt(wrapped, "root.c")));
+  ok("#363 ...and pointing at the shape we DO repair",
+    /WITHOUT the `allOf` wrapper/.test(msgAt(wrapped, "root.c")));
+
+  var direct = conv({
+    type: "object", properties: { c: { minLength: 3, $ref: "#/$defs/S" } },
+    required: ["c"], additionalProperties: false, $defs: { S: { type: "string" } }
+  });
+  ok("#363 GUARD the at-entry twin is still REPAIRED, not blocked",
+    blk(direct).length === 0 &&
+    direct.schema.properties.c.type === "string" &&
+    direct.schema.properties.c.minLength === 3 &&
+    direct.schema.properties.c.$ref === undefined);
+
+  // ---- the OVER-block, which is the same ordering bug pointing the other way --
+  // The flatten hoists a bare `$ref` to the root, where `inlineRootRef` has
+  // already been and gone; we then called it "nothing left to inline" and blocked
+  // a schema the vendor ACCEPTS (it resolves the root chain). Re-running the root
+  // inliner at the exit is what fixes it.
+  var hoisted = conv({
+    allOf: [{ $ref: "#/$defs/S" }],
+    $defs: { S: { type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false } }
+  });
+  ok("#363 a bare `$ref` hoisted to the root is INLINED, not blocked",
+    blk(hoisted).length === 0 && hoisted.schema.type === "object" &&
+    hoisted.schema.properties && hoisted.schema.properties.a !== undefined);
+
+  // ---- over-block guards: shapes the vendor accepts must stay quiet -----------
+  // The pydantic v1 described-field shape is the one that matters most: its
+  // siblings are ANNOTATIONS, the vendor tolerates a `$ref` beside them, and an
+  // earlier draft of this fix inlined it -- expanding the document against
+  // OpenAI's 5000-property budget for no benefit. An existing #349 test caught
+  // that, and the test was right.
+  var pyd1 = conv({
+    title: "R", type: "object",
+    properties: { c: { description: "d", allOf: [{ $ref: "#/definitions/Color" }] } },
+    required: ["c"], definitions: { Color: { enum: ["red", "blue"], type: "string" } }
+  });
+  ok("#363 GUARD the pydantic v1 annotation+allOf+$ref shape is not blocked",
+    blk(pyd1).length === 0);
+  ok("#363 GUARD ...and it stays a `$ref`, not an inlined copy",
+    pyd1.schema.properties.c.$ref === "#/$defs/Color" &&
+    pyd1.schema.properties.c.description === "d");
+
+  ok("#363 GUARD an ordinary closed object is untouched and unblocked",
+    blk(conv(OBJ)).length === 0);
+  ok("#363 GUARD a root `$ref` written at entry is still inlined, not blocked",
+    blk(conv({ $ref: "#/$defs/S", $defs: { S: JSON.parse(JSON.stringify(OBJ)) } })).length === 0);
+  ok("#363 GUARD a single-member object `allOf` still merges cleanly",
+    blk(conv({ allOf: [{ type: "object", properties: { a: { type: "string" } }, required: ["a"] }] })).length === 0);
+
+  // ---- the root blockers must not DOUBLE-report -------------------------------
+  // Two rules can now reach the root (entry-side, which knows what the caller
+  // wrote, and exit-side, which knows what we produced). The boundary between
+  // them is part of the design (#359), so a caller-written bad root gets exactly
+  // one blocker, from the rule that can attribute it.
+  ok("#363 a caller-written scalar root is reported ONCE",
+    blkAt(conv({ type: "string" }), "root").length === 1);
+  ok("#363 a caller-written `anyOf` root is reported ONCE",
+    blkAt(conv({ anyOf: [OBJ, OBJ2] }), "root").length === 1);
+  ok("#363 ...and that one still names the spelling the caller wrote (#362)",
+    /`oneOf`/.test(msgAt(conv({ oneOf: [OBJ, OBJ2] }), "root")));
+
+  // ---- the vendor's annotation set, pinned -----------------------------------
+  // Transcribed from `JSON_SCHEMA_ANNOTATION_KEYWORDS` (openai@7.4.0). The suite
+  // is dependency-free and cannot run the vendor, so this pins a MEASURED
+  // SNAPSHOT and re-measuring after a version bump is a manual step (#361).
+  // `deprecated` is deliberately absent and `readOnly`/`writeOnly` deliberately
+  // present -- both measured, both the opposite of what the names suggest.
+  // guarded so a reverted engine.js REPORTS these as failures rather than
+  // aborting the whole file on a TypeError (#322's trap).
+  var ann = E.OPENAI_ANNOTATION_KEYWORDS_LIST || [];
+  ok("#363 the annotation set has exactly 7 members", ann.length === 7);
+  ["$comment", "default", "description", "examples", "readOnly", "title", "writeOnly"]
+    .forEach(function (k) {
+      ok("#363 annotation set contains `" + k + "`", ann.indexOf(k) !== -1);
+    });
+  ok("#363 annotation set does NOT contain `deprecated` (vendor throws on it)",
+    ann.indexOf("deprecated") === -1);
+
+  // A `$defs`/`definitions` bag is not a constraining sibling -- the vendor says
+  // so in its own comment, and treating it as one turned its happiest case into a
+  // blocker in an earlier draft of this very fix.
+  ok("#363 a `$defs` bag beside a `$ref` is not treated as a constraint",
+    blk(conv({ type: "object", properties: { c: { $ref: "#/$defs/S" } }, required: ["c"], additionalProperties: false, $defs: { S: { type: "string" } } })).length === 0);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

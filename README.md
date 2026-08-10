@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 936 engine + 222 CLI + 36 ESM/library assertions = **1194** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 967 engine + 228 CLI + 37 ESM/library assertions = **1232** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -580,7 +580,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1194 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1232 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -956,6 +956,44 @@ Two cases, two remedies, and they are not interchangeable:
   constrains nothing everywhere, because what went missing is the `$ref` *into*
   the bag. Naming an escape hatch here would be a false promise, so the blocker
   says to restore the pointer instead.
+
+
+### A single-member `allOf` can invent the root
+
+`allOf` with one member is *flattened*: the member's keywords are copied up into
+the node, which is what OpenAI's own transformer does. The consequence is easy to
+miss — the flatten can put a `type`, an `anyOf` or a `$ref` somewhere the
+converter had **already finished checking**:
+
+```json
+{"allOf": [{"type": "string", "minLength": 3}]}
+```
+
+You did not write a scalar root; the flatten produced one, after the root checks
+had passed. OpenAI rejects it (`Root schema must have type: 'object'`), so this
+is a blocker naming the remodelling rather than a repair — there is no root form
+of a union, and turning a scalar root into an object means inventing a wrapper
+property whose name would be a guess.
+
+The nested version is the one worth internalising, because the same schema one
+wrapper apart gets opposite treatment:
+
+| input | result |
+|---|---|
+| `{"minLength": 3, "$ref": "#/$defs/S"}` | **repaired** — the definition is inlined, output accepted |
+| `{"minLength": 3, "allOf": [{"$ref": "#/$defs/S"}]}` | **blocker** — the `$ref` was hoisted next to the constraint after the inliner ran |
+
+Both are rejected by OpenAI as written; only the first has a lossless repair at
+the point we look. If you hit the second, drop the `allOf` wrapper and we inline
+it for you.
+
+Two shapes deliberately stay quiet, because the vendor accepts them: a `$ref`
+beside pure **annotations** (`$comment`, `default`, `description`, `examples`,
+`readOnly`, `title`, `writeOnly` — the exact set openai@7.4.0 enumerates, and
+note `deprecated` is *not* in it), which is the standard Pydantic v1 output for a
+described nested field; and a `$defs`/`definitions` bag beside a `$ref`, which is
+not a constraining sibling at all.
+
 
 ## License
 MIT.

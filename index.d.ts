@@ -150,6 +150,15 @@ export const ANTHROPIC_GO_SUPPORTED_KEYS: string[];
  */
 export const GO_INVOPOP_MODELLED_KEYS: string[];
 
+/**
+ * The seven keywords openai@7.4.0 treats as pure annotations
+ * (`JSON_SCHEMA_ANNOTATION_KEYWORDS` in its lib/transform.js). They are
+ * load-bearing twice in the vendor: they gate whether a single-member `allOf`
+ * may be flattened, and whether a `$ref`'s siblings are tolerated. Note
+ * `deprecated` is NOT one of them while `readOnly`/`writeOnly` are.
+ */
+export const OPENAI_ANNOTATION_KEYWORDS_LIST: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -162,6 +171,7 @@ declare const api: {
   ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
   ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;
+  OPENAI_ANNOTATION_KEYWORDS_LIST: typeof OPENAI_ANNOTATION_KEYWORDS_LIST;
 };
 
 export default api;
