@@ -1002,9 +1002,12 @@
       "`openai` 7.4.0's `toStrictJsonSchema` and `@anthropic-ai/sdk` 0.116.0's `betaTool` " +
       "both forward it VERBATIM, and being accepted is not being honoured (#347) -- a " +
       "constrained decoder cannot be constrained by a type it does not know. Where this " +
-      "comes from, measured: `smolagents` builds tool schemas straight from Python type " +
-      "hints, and `_function_type_hints_utils.get_json_schema` emits `{\"type\": \"any\"}` " +
-      "for a bare `Any`, `List[Any]`, `Dict[str, Any]` and `Optional[Any]` alike. THE " +
+      "comes from, measured on `smolagents` 1.26.0: it builds tool schemas straight from " +
+      "Python type hints, and `_function_type_hints_utils` renders EVERY `Any` as " +
+      "`{\"type\": \"any\"}`. Its tool-calling path knows that is not sendable and rewrites " +
+      "it to `\"string\"` — but only at the TOP LEVEL of `tool.inputs`, so a bare `Any` and " +
+      "`Optional[Any]` are cleaned while `List[Any]` and `Dict[str, Any]` still go out with " +
+      "`{\"type\": \"any\"}` nested under `items` / `additionalProperties`. THE " +
       "REMEDY IS NOT TO DELETE `type`: `any` means the match-anything schema, and a " +
       "typeless / match-anything node is itself refused further down this pipeline " +
       "(#315/#333) because a constrained decoder cannot express anything-goes. Declare the " +

@@ -7029,7 +7029,7 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 // VERBATIM, so acceptance is not correctness (#347).
 //
 // Reachability is a real generator, not a hand-written fixture (#311): the
-// verbatim payloads below are smolagents' own output.
+// verbatim payloads below are smolagents own generator output; see the note below.
 (function () {
   var TARGETS = Object.keys(E.DOCS);
   // Keyed on the ledger OP plus a phrase unique to THIS rule -- the generic
@@ -7098,9 +7098,20 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("#373 an input treated as an EXAMPLE is not reported",
     !badType((E.convert({ items: [1, 2, 3], total: 12.5 }, "openai") || {}).ledger));
 
-  // --- REACHABILITY: verbatim smolagents output (#311 -- test against the real
-  // generator's input, not a fixture we wrote). get_json_schema() renders EVERY
-  // `Any` annotation this way, in four different positions.
+  // --- REACHABILITY: verbatim smolagents 1.26.0 output (#311 -- test against
+  // the real generator, not a fixture we wrote). `_function_type_hints_utils`
+  // renders EVERY `Any` this way, so all four rows below are genuine generator
+  // output and all four are legitimate inputs to this tool.
+  //
+  // STATED AT ITS TRUE STRENGTH, because a first draft of this overstated it
+  // and the measurement caught it (#369): on the TOOL-CALLING path smolagents
+  // sanitizes some of them itself. `models.get_tool_json_schema` rewrites
+  // `type: "any"` to `"string"` -- but only at the TOP LEVEL of `tool.inputs`,
+  // so measured end to end a bare `Any` and `Optional[Any]` are CLEANED and
+  // only `List[Any]` and `Dict[str, Any]` reach the wire illegal, nested under
+  // `items` / `additionalProperties`. A depth-1 guard on a recursive document
+  // (#358/#359). The other two rows still matter here: they are what the
+  // generator hands anyone calling it directly, which is the input we take.
   var SMOL = {
     "bare Any": { type: "object", properties: { v: { type: "any", description: "a value" } }, required: ["v"] },
     "List[Any]": { type: "object", properties: { v: { type: "array", items: { type: "any" }, description: "values" } }, required: ["v"] },

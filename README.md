@@ -1250,10 +1250,21 @@ not a constraining sibling at all.
 ## `"any"` is not a type, and one generator writes it everywhere
 
 `type` has exactly seven legal values — `string`, `number`, `integer`, `boolean`,
-`object`, `array`, `null`. `smolagents` builds tool schemas straight from Python
-type hints, and `_function_type_hints_utils.get_json_schema()` renders **every
-`Any` annotation** as `{"type": "any"}` — measured 2026-08-10 for a bare `Any`,
-`List[Any]`, `Dict[str, Any]` and `Optional[Any]`, in four different positions.
+`object`, `array`, `null`. `smolagents` 1.26.0 builds tool schemas straight from
+Python type hints, and `_function_type_hints_utils` renders **every `Any`
+annotation** as `{"type": "any"}`. Its tool-calling path knows that is not
+sendable — `models.get_tool_json_schema()` rewrites `"any"` to `"string"` — but
+only at the **top level** of `tool.inputs`. Measured end to end 2026-08-10:
+
+| annotation | reaches the wire as |
+|---|---|
+| `Any` | `{"type": "string"}` — sanitized |
+| `Optional[Any]` | `{"type": "string", "nullable": true}` — sanitized |
+| `List[Any]` | `{"type": "array", "items": {"type": "any"}}` — **leaks** |
+| `Dict[str, Any]` | `{"type": "object", "additionalProperties": {"type": "any"}}` — **leaks** |
+
+The rewrite is an inventory of exactly the hazard it does not finish covering: a
+depth-1 guard on a recursive document.
 
 `ajv` (2020-12) refuses to compile that schema, so no validator can honour the
 node. The destinations split, and the split is the reason this is a blocker:
