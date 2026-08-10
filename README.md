@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 967 engine + 228 CLI + 37 ESM/library assertions = **1232** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 988 engine + 228 CLI + 38 ESM/library assertions = **1254** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -98,6 +98,32 @@ the "obvious" repair silently deletes something you wrote.
 
 ## Why
 Each provider accepts a different schema dialect, so a schema that works with one gets rejected by the next:
+### A remedy is only as true as the client that has to carry it
+
+`--to gemini-json` tells you which keywords that path does not enforce, and
+offers a remedy: switch to the narrow `responseSchema` path, which *does*
+enforce `pattern`, `minLength`, `maxLength`, `min`/`maxProperties`, `default`
+and `example`.
+
+That sentence is about **Gemini**. Whether it is about **you** depends on your
+client, and for the dominant JS route it is false. `@ai-sdk/google` does not
+forward your schema on the narrow path — it rebuilds the request with
+`convertJSONSchemaToOpenAPISchema`, which destructures a fixed twelve-keyword
+list (`type`, `description`, `required`, `properties`, `items`, `allOf`,
+`anyOf`, `oneOf`, `format`, `const`, `minLength`, `enum`) and silently drops
+everything else. Measured against the real wire payload on 4.0.39, of the seven
+keywords that remedy names **exactly one — `minLength` — arrives**. The switch
+also costs `minimum`, `maximum`, `minItems` and `maxItems`, which the
+`responseJsonSchema` path *does* enforce, so on that client it is strictly
+worse.
+
+So the tool states the remedy and then names the fork, per keyword, rather than
+guessing which client you are on. A REST-direct caller, or Python
+`response_json_schema=`, is unaffected and the remedy holds as written.
+`AI_SDK_GOOGLE_FORWARDED_KEYS` is exported so the table can be re-diffed after a
+version bump; the suite is dependency-free and cannot run `@ai-sdk/google`, so
+it pins a **measured snapshot**, and re-measuring is a manual step.
+
 - **OpenAI Structured Outputs (strict):** `additionalProperties: false` on every object; every property in `required` (optionals become nullable); root must be an object, not `anyOf`. Its keyword set is an **allowlist** — *"if you turn on Structured Outputs … and call the API with an unsupported JSON Schema, you will receive an error."* The error is raised for keywords whose validation semantics strict mode cannot compile (`uniqueItems`, `patternProperties`, `propertyNames`, `min`/`maxProperties`, `contains`, `not`, `if`/`then`/`else`, `dependentRequired`, `prefixItems`, …). Annotations and soft constraints — `description`, `title`, `default`, `examples`, `minLength`/`maxLength`, `pattern`, `format`, `minimum`/`maximum`, `multipleOf`, `$schema`, `$id` — are **accepted and passed through untouched**, so this tool leaves them alone.
 
   Three rules here are *conditional*, and a flat "is this keyword allowed?" list gets all three wrong:
@@ -580,7 +606,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1232 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1254 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

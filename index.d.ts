@@ -124,6 +124,13 @@ export const DOCS: Record<Provider, string>;
 export const GEMINI_ALLOWED_KEYS: string[];
 
 /**
+ * Keys `@ai-sdk/google`'s `convertJSONSchemaToOpenAPISchema` destructures, i.e.
+ * everything that can reach Gemini's narrow `responseSchema` path through that
+ * client. Snapshot of @ai-sdk/google 4.0.39 — re-measure after a version bump.
+ */
+export const AI_SDK_GOOGLE_FORWARDED_KEYS: string[];
+
+/**
  * The `format` VALUES Anthropic's transformer keeps on a string node.
  * Confirmed against three independent vendor artifacts, each a literal in
  * code: the JS `SUPPORTED_STRING_FORMATS`, the Python `SupportedStringFormats`
@@ -168,6 +175,7 @@ declare const api: {
   toGemini: typeof toGemini;
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
+  AI_SDK_GOOGLE_FORWARDED_KEYS: typeof AI_SDK_GOOGLE_FORWARDED_KEYS;
   ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
   ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;

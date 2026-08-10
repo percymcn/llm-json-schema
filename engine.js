@@ -3720,6 +3720,32 @@
     "additionalProperties": 1, "required": 1, "propertyOrdering": 1
   };
 
+  // The keywords the NARROW `responseSchema` path genuinely enforces and this
+  // one does not. This is a fact about GEMINI, and on its own it is exactly the
+  // half that misleads: it is the list our "switch paths to get it enforced"
+  // remedy is built on, and a remedy is only as true as the CLIENT that has to
+  // carry it.
+  var GEMINI_NARROW_ENFORCED = {
+    "pattern": 1, "minLength": 1, "maxLength": 1,
+    "minProperties": 1, "maxProperties": 1, "default": 1, "example": 1
+  };
+
+  // ...and the other half. `@ai-sdk/google` does not send your schema on the
+  // narrow path — it REBUILDS the request with `convertJSONSchemaToOpenAPISchema`,
+  // which destructures this fixed list and silently drops everything else. So
+  // for that client the path switch above is a statement about a request it
+  // never builds. Transcribed from the destructure in @ai-sdk/google 4.0.39 and
+  // measured against the real wire payload (2026-08-10): of the seven keywords
+  // in GEMINI_NARROW_ENFORCED, exactly `minLength` arrives.
+  //
+  // Snapshot, like the Go tables (#361): this suite is dependency-free and
+  // cannot run @ai-sdk/google, so re-measure after a version bump.
+  var AI_SDK_GOOGLE_FORWARDED = {
+    "type": 1, "description": 1, "required": 1, "properties": 1, "items": 1,
+    "allOf": 1, "anyOf": 1, "oneOf": 1, "format": 1, "const": 1,
+    "minLength": 1, "enum": 1
+  };
+
   // Gemini has no `$ref`, so the only correct transform is to inline the
   // definitions — not to warn and then strip the `$defs` bag, which is what
   // this used to do and which turned `{ $ref, definitions }` (the exact shape
@@ -4075,9 +4101,14 @@
           "`@google/generative-ai` (what @langchain/google-genai uses) has no such field at all. " +
           "This path keeps `$ref`/`$defs` and recursion, but it does NOT ENFORCE `pattern`, " +
           "`minLength`, `maxLength`, `min/maxProperties`, `default` or `example` — those are " +
-          "silently ignored here and work only on the narrow `responseSchema` path. The two " +
-          "subsets are complementary; neither is a superset. Nothing below is an error: " +
-          "unsupported keywords are ignored, so `--check` stays green.",
+          "silently ignored here and reach Gemini only on the narrow `responseSchema` path. " +
+          "That last clause is about GEMINI, not about your client: if you get there through " +
+          "@ai-sdk/google, its `convertJSONSchemaToOpenAPISchema` rebuilds the request from a " +
+          "fixed 12-keyword list and `minLength` is the only one of those seven that survives, " +
+          "so switching is strictly worse there — it also drops `minimum`/`maximum`/" +
+          "`minItems`/`maxItems`, which this path enforces. The two subsets are complementary; " +
+          "neither is a superset. Nothing below is an error: unsupported keywords are ignored, " +
+          "so `--check` stays green.",
           DOCS.gemini, true));
       } else {
         ledger.push(entry("=", "root",
@@ -4130,14 +4161,34 @@
             // stripping correct there and wrong here. Deleting a keyword the
             // request would have accepted destroys a real constraint to buy
             // nothing, which is precisely the bug the previous cycle fixed.
+            var remedy =
+              "If you need it enforced, drop the top-level `$schema` to take the narrow " +
+              "`responseSchema` path (which does enforce `pattern`, `minLength`, `maxLength`, " +
+              "`min/maxProperties`, `default`, `example`), or restate it in `description`.";
+            // The remedy above is a claim about GEMINI. Whether it reaches Gemini
+            // is a claim about the CLIENT, and only the caller knows which one
+            // they are on — so name the fork rather than inferring it.
+            if (GEMINI_NARROW_ENFORCED[k]) {
+              remedy += AI_SDK_GOOGLE_FORWARDED[k]
+                ? " That switch does survive a converting client: @ai-sdk/google's " +
+                  "`convertJSONSchemaToOpenAPISchema` forwards `" + k + "` — the only one of " +
+                  "those seven it does."
+                : " BUT THAT IS A CLAIM ABOUT WHAT GEMINI ENFORCES, NOT ABOUT WHAT YOUR CLIENT " +
+                  "SENDS. @ai-sdk/google does not forward your schema on the narrow path — it " +
+                  "REBUILDS the request with `convertJSONSchemaToOpenAPISchema`, which forwards " +
+                  "a fixed 12-keyword list and drops `" + k + "` before the request exists. On " +
+                  "that client the switch buys nothing AND additionally costs " +
+                  "`minimum`/`maximum`/`minItems`/`maxItems`, which THIS path does enforce, so " +
+                  "it is strictly worse. `minLength` is the only one of the seven it forwards. " +
+                  "(Measured on @ai-sdk/google 4.0.39; a REST-direct caller, or Python " +
+                  "`response_json_schema=`, is unaffected and the remedy holds as written.)";
+            }
             ledger.push(entry("=", path,
               "Kept `" + k + "`, but it is NOT enforced on this path — it is absent from the " +
               "accepted property list enumerated on the `response_json_schema` field of " +
               "`google-genai`. The full JSON Schema may be sent, so this is ignored rather " +
               "than rejected; your request still succeeds, but nothing constrains `" + k + "`. " +
-              "If you need it enforced, drop the top-level `$schema` to take the narrow " +
-              "`responseSchema` path (which does enforce `pattern`, `minLength`, `maxLength`, " +
-              "`min/maxProperties`, `default`, `example`), or restate it in `description`.",
+              remedy,
               DOCS.gemini, true));
           }
         });
@@ -4872,6 +4923,13 @@
     // `types.Schema` model (`extra="forbid"`), and the Go `Schema` struct's
     // json tags (google.golang.org/genai v1.67.0) — all 22, identical.
     GEMINI_ALLOWED_KEYS: Object.keys(GEMINI_ALLOWED),
+
+    // The keys @ai-sdk/google's `convertJSONSchemaToOpenAPISchema` destructures,
+    // i.e. everything that can reach Gemini's narrow `responseSchema` path
+    // through that client. Exported for the same reason as the Go tables (#361):
+    // a table transcribed from a vendor artifact has no expiry date on it, so
+    // make re-diffing it one command rather than a re-derivation.
+    AI_SDK_GOOGLE_FORWARDED_KEYS: Object.keys(AI_SDK_GOOGLE_FORWARDED),
 
     // The `format` VALUES Anthropic's transformer keeps on a string. Exported
     // for the same reason as GEMINI_ALLOWED_KEYS: so "all three SDKs agree" is a

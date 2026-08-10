@@ -5945,5 +5945,78 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- #364: the gemini-json remedy is a claim about GEMINI, not about the client
+// The note tells the reader to switch to the narrow `responseSchema` path to get
+// a keyword enforced. That is true of Gemini and false of the dominant JS client:
+// @ai-sdk/google rebuilds the narrow request from a fixed 12-keyword destructure,
+// so 6 of the 7 keywords the remedy names never reach Gemini at all.
+// Fates measured against the real wire payload on @ai-sdk/google 4.0.39.
+(function () {
+  function conv(node) {
+    return E.convert({
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object", properties: { f: JSON.parse(JSON.stringify(node)) },
+      required: ["f"]
+    }, "gemini-json");
+  }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  var FORK = "NOT ABOUT WHAT YOUR CLIENT SENDS";
+  var SURVIVES = "That switch does survive a converting client";
+
+  // The six that are DROPPED by the converter must carry the warning...
+  [["pattern", { type: "string", pattern: "^x" }],
+   ["maxLength", { type: "string", maxLength: 9 }],
+   ["minProperties", { type: "object", properties: { a: { type: "string" } }, minProperties: 1 }],
+   ["maxProperties", { type: "object", properties: { a: { type: "string" } }, maxProperties: 2 }],
+   ["default", { type: "string", default: "d" }],
+   ["example", { type: "string", example: "e" }]].forEach(function (row) {
+    var l = led(conv(row[1]));
+    ok("#364 `" + row[0] + "` remedy names the converting-client fork", has(l, FORK));
+    ok("#364 `" + row[0] + "` fork is not the survives-wording", !has(l, SURVIVES));
+  });
+
+  // ...and `minLength` must carry the OPPOSITE wording. This is the whole
+  // discriminator: without it the rule could be firing blanket and every
+  // assertion above would still pass (#323's pass-either-way pattern).
+  var ml = led(conv({ type: "string", minLength: 3 }));
+  ok("#364 `minLength` says the switch DOES survive the client", has(ml, SURVIVES));
+  ok("#364 `minLength` does NOT carry the drop warning", !has(ml, FORK));
+
+  // Over-block guard: a keyword the narrow path does not enforce either has no
+  // path-switch to qualify, so the clause must stay silent rather than attach
+  // itself to every unsupported keyword.
+  var uq = led(conv({ type: "array", items: { type: "string" }, uniqueItems: true }));
+  ok("#364 `uniqueItems` note is present at all", has(uq, "Kept `uniqueItems`"));
+  ok("#364 `uniqueItems` does not get the converting-client clause",
+    !has(uq, FORK) && !has(uq, SURVIVES));
+
+  // #317: this is an advisory about a schema the path ACCEPTS. It must never
+  // fail the gate, however alarming the wording is.
+  var pat = conv({ type: "string", pattern: "^x" });
+  ok("#364 the fork never turns into a gate failure",
+    pat.ok === true && led(pat).filter(function (e) { return e.op === "!" && !e.advisory; }).length === 0);
+
+  // The root summary makes the same promise and needs the same qualification.
+  ok("#364 the `$schema` root note qualifies its own path-switch claim",
+    has(led(conv({ type: "string", pattern: "^x" })), "if you get there through"));
+
+  // The vendor table itself, pinned. 12 keys, and the two that decide every
+  // row above must be on the correct sides.
+  // Guarded: an engine without this export must make these REPORT, not crash.
+  // An unguarded `.length` here aborts the whole file and hides every assertion
+  // after it, which is exactly what makes a revert-check unreadable (#322).
+  var FWD = Array.isArray(E.AI_SDK_GOOGLE_FORWARDED_KEYS) ? E.AI_SDK_GOOGLE_FORWARDED_KEYS : null;
+  ok("#364 AI_SDK_GOOGLE_FORWARDED_KEYS has the 12 destructured keys",
+    !!FWD && FWD.length === 12);
+  ok("#364 the table forwards `minLength` and not `pattern`",
+    !!FWD && FWD.indexOf("minLength") !== -1 && FWD.indexOf("pattern") === -1);
+  ok("#364 the table drops every other length/range keyword",
+    !!FWD && ["maxLength", "minimum", "maximum", "minItems", "maxItems", "minProperties",
+     "maxProperties", "default", "example"].every(function (k) {
+      return FWD.indexOf(k) === -1;
+    }));
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
