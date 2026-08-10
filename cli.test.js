@@ -1534,5 +1534,41 @@ console.log("\n" + pass + " passed, " + fail + " failed");
 })();
 
 
+// #368 — the fork must reach the binary, because the exit code does NOT move.
+// This document is legal for three of the five measured clients and a hard 400
+// for one, and we cannot know which the caller is on, so exit 0 is the honest
+// answer and the NOTE is the entire deliverable for the langchain user.
+(function () {
+  var OPTIONAL = JSON.stringify({
+    type: "object",
+    properties: { p: { type: ["string", "null"] } },
+    required: ["p"]
+  });
+  var gc = run(["--to", "gemini-client", "--check"], OPTIONAL);
+  var gn = run(["--to", "gemini", "--check"], OPTIONAL);
+
+  ok("#368 CLI: the fork reaches the binary on gemini-client",
+    /@langchain\/google-genai/.test(gc.stderr) && /THE CHECK/.test(gc.stderr), gc.stderr);
+  ok("#368 CLI: it gives the proto's own rejection reason",
+    /Proto field is not repeating/.test(gc.stderr), gc.stderr);
+  ok("#368 CLI: it points at the target that emits the other spelling",
+    /--to gemini\b/.test(gc.stderr), gc.stderr);
+  // Discriminator: `--to gemini` IS the escape hatch, so it must not print the
+  // fork — otherwise the advice loops back on itself. Without this pair the
+  // note could be firing blanket and every assertion above would still pass.
+  ok("#368 CLI: `--to gemini` does NOT print the fork",
+    !/THE CHECK/.test(gn.stderr), gn.stderr);
+  // `--check` writes only the ledger, so compare the CONVERTED documents.
+  var gcOut = run(["--to", "gemini-client"], OPTIONAL);
+  var gnOut = run(["--to", "gemini"], OPTIONAL);
+  ok("#368 CLI: the two targets emit genuinely different documents",
+    /"nullable"/.test(gnOut.stdout) && !/"nullable"/.test(gcOut.stdout) &&
+    /"null"/.test(gcOut.stdout),
+    gcOut.stdout + " || " + gnOut.stdout);
+  ok("#368 CLI: the fork never fails the gate",
+    gc.status === 0, "status " + gc.status);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

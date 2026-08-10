@@ -3829,6 +3829,19 @@
   //   allOf   | DROPPED, node emptied | forwarded verbatim, recursed
   //   not     | DROPPED               | DROPPED
   //
+  // #368 measured the three members #365/#366 recorded as UNMEASURED. Same
+  // battery, same controls, all of which survived:
+  //
+  //   keyword | agno 2.8.7 | litellm 1.96.0 | @langchain/google-genai 2.2.0
+  //   oneOf   | DROPPED, emptied | DROPPED, emptied | forwarded verbatim
+  //   allOf   | DROPPED, emptied | DROPPED, emptied | forwarded verbatim
+  //   not     | DROPPED          | DROPPED          | forwarded verbatim
+  //
+  // So the keep decision holds against five members rather than two: 3 drop
+  // `oneOf`/`allOf` and 2 forward them; 4 drop `not` and 1 forwards it. For
+  // every dropper our output is byte-identical to stripping, so keeping costs
+  // them nothing and buys the forwarders an entire union.
+  //
   // The decisive part is not that they disagree, it is the ASYMMETRY of the
   // strip we used to do. For google-adk, stripping bought NOTHING: its output is
   // byte-identical whether we strip the keyword or hand it over intact, because
@@ -3843,7 +3856,63 @@
   //
   // Snapshot, like the Go tables (#361) and #364's AI-SDK table: this suite is
   // dependency-free and cannot run either client, so re-measure on a version bump.
-  var GEMINI_CLIENT_CARRIED = { "oneOf": 1, "allOf": 1 };
+  // #368: DERIVED from GEMINI_CLIENT_MEMBERS below rather than hand-written, so
+  // the exported table cannot drift from the measurements it summarises (#361).
+  // It gained `not` when a fifth member turned out to forward it — with two
+  // members it was `["oneOf","allOf"]` and that was a true statement about those
+  // two, not about the class.
+  //
+  // NOTE the branch below keys on GEMINI_ANYOF_REMEDY, not on this: whether a
+  // keyword is carried by SOMEBODY and whether a dropped keyword has a lossless
+  // remodelling are different questions, and `not` answers them differently
+  // (one client forwards it; there is no `anyOf` form of a negation).
+  var GEMINI_ANYOF_REMEDY = { "oneOf": 1, "allOf": 1 };
+
+  // #368. The class has a SECOND axis, and on it there is no intersection form.
+  //
+  // `nullForm` is what the client needs for an optional field, measured on the
+  // real wire payload for the JS clients:
+  //
+  //   "rewrites" — the client turns `type:["X","null"]` into `nullable` ITSELF
+  //                and DROPS a hand-written `nullable`. Needs the union form;
+  //                handing it `nullable` loses the null constraint SILENTLY.
+  //   "either"   — carries both forms to the backend intact.
+  //   "forwards" — performs no rewrite. The union form reaches `responseSchema`
+  //                verbatim and the proto REJECTS it ("Proto field is not
+  //                repeating"), so this client needs `nullable`.
+  //
+  // A "forwards" client is not really a converting client at all: it is
+  // transparent, so the document must satisfy the narrow proto directly, which
+  // is exactly what `--to gemini` produces. That is why no new target is
+  // warranted here (#362/#336 — a separate target is for a destination needing
+  // a different DOCUMENT, and this one already exists).
+  //
+  // 3 rewrite, 1 either, 1 forwards. We emit the union form because the cost of
+  // being wrong differs: a "forwards" client gives a LOUD 400 the caller can
+  // act on, while "rewrites" clients lose nullability SILENTLY (#347/#335/#329).
+  var GEMINI_CLIENT_MEMBERS = [
+    { client: "google-adk",              version: "2.6.3",  forwards: [],                    nullForm: "rewrites" },
+    { client: "agno",                    version: "2.8.7",  forwards: [],                    nullForm: "rewrites" },
+    { client: "@ai-sdk/google",          version: "4.0.39", forwards: ["oneOf", "allOf"],    nullForm: "rewrites" },
+    { client: "litellm",                 version: "1.96.0", forwards: [],                    nullForm: "either" },
+    { client: "@langchain/google-genai", version: "2.2.0",  forwards: ["oneOf", "allOf", "not"], nullForm: "forwards" }
+  ];
+
+  // Derived so the prose below cannot drift from the table (#361).
+  function geminiClientsBy(nullForm) {
+    return GEMINI_CLIENT_MEMBERS.filter(function (m) { return m.nullForm === nullForm; });
+  }
+  function geminiClientsForwarding(kw) {
+    return GEMINI_CLIENT_MEMBERS.filter(function (m) { return m.forwards.indexOf(kw) !== -1; });
+  }
+  function namesOf(list) {
+    return list.map(function (m) { return "`" + m.client + "` " + m.version; }).join(", ");
+  }
+  // Every keyword at least one measured client forwards, derived not asserted.
+  var GEMINI_CLIENT_CARRIED = {};
+  GEMINI_CLIENT_MEMBERS.forEach(function (m) {
+    m.forwards.forEach(function (k) { GEMINI_CLIENT_CARRIED[k] = 1; });
+  });
 
   // The OTHER path. `google-genai` (Python) 2.17.0 documents the backend's
   // accepted set for `response_json_schema` verbatim on the field itself:
@@ -4134,13 +4203,30 @@
       // than the raw input on this path.
       if (rest.length <= 1) {
         if (rest.length === 1 && hasNull) {
+          // #368: "the converting client performs the rewrite itself" was a
+          // categorical claim about a CLASS, and it is FALSE for a member that
+          // forwards. Fork it, and — per #366 — name the CHECK instead of
+          // guessing which client the caller is on, because that is a fact
+          // about their call site rather than about the schema.
+          var rewriters = geminiClientsBy("rewrites");
+          var forwarders = geminiClientsBy("forwards");
           ledger.push(entry("=", path,
-            "Left `type: " + before + "` as a union. On this target the converting client " +
-            "performs the `nullable` rewrite itself; doing it here would emit `nullable`, " +
-            "which google-adk 2.6.3 drops silently (it is not a field of its " +
-            "`_ExtendedJSONSchema`), and the property would stop being nullable with " +
-            "nothing reporting it. Assigning this document straight to `responseSchema` " +
-            "instead would be REJECTED — use `--to gemini` for that.",
+            "Left `type: " + before + "` as a union, and WHICH CLIENT YOU USE decides " +
+            "whether that is right — measured 2026-08-10 across " +
+            GEMINI_CLIENT_MEMBERS.length + " clients, no single spelling works for all " +
+            "of them. " + namesOf(rewriters) + " each perform the `nullable` rewrite " +
+            "THEMSELVES and DROP a hand-written `nullable`, so emitting `nullable` here " +
+            "would make the property stop being nullable with nothing reporting it — " +
+            "which is why this target keeps the union. But " + namesOf(forwarders) +
+            " performs no rewrite at all: it strips only `$schema` and " +
+            "`additionalProperties` and assigns the rest straight to `responseSchema`, " +
+            "where the proto REJECTS a list-valued `type` (`Proto field is not " +
+            "repeating, cannot start list`) — a hard 400. THE CHECK, and it takes one " +
+            "look at your own call site: if your client hands your document to " +
+            "`responseSchema` without rebuilding it, you are on the forwarding side and " +
+            "want `--to gemini`, whose output carries `nullable` instead. If it rebuilds " +
+            "the request from its own `Schema` type, stay here. `litellm` 1.96.0 carries " +
+            "either form, so it needs no decision.",
             DOCS.gemini, true));
         }
         return;
@@ -4484,32 +4570,41 @@
               Object.keys(node).forEach(function (kk) { if (kk !== k) withoutKw[kk] = node[kk]; });
               var emptied = !constrainsSomething(withoutKw);
               ledger.push(entry("=", path,
-                GEMINI_CLIENT_CARRIED[k]
+                GEMINI_ANYOF_REMEDY[k]
                   ? "Kept `" + k + "` — whether it survives depends on WHICH converting " +
                     "client you use, and that is the one fact only you have. Measured " +
-                    "2026-08-10: `@ai-sdk/google` 4.0.39 forwards `" + k + "` verbatim and " +
-                    "recurses into its branches, and the live v1beta proto accepts it " +
+                    "2026-08-10 across " + GEMINI_CLIENT_MEMBERS.length + " clients: " +
+                    namesOf(geminiClientsForwarding(k)) + " forward `" + k + "` verbatim " +
+                    "and recurse into its branches, and the live v1beta proto accepts it " +
                     "(no `Cannot find field`), so there it is carried end to end. " +
-                    "`google-adk` 2.6.3's `_to_gemini_schema` DROPS it with no error" +
+                    namesOf(GEMINI_CLIENT_MEMBERS.filter(function (m) {
+                      return m.forwards.indexOf(k) === -1;
+                    })) + " DROP it with no error" +
                     (emptied
                       ? " — and `" + k + "` is the only constraint on this node, so on that " +
                         "client this property ends up asserting nothing about the data " +
                         "while the call still succeeds."
                       : ".") +
-                    " Deleting it here would have destroyed a constraint the first client " +
-                    "enforces while changing nothing for the second, which drops it either " +
-                    "way. If you are on google-adk, remodel it as `anyOf` — both clients " +
-                    "carry that."
-                  : "Kept `" + k + "` — BOTH measured converting clients drop it " +
-                    "(`google-adk` 2.6.3 and `@ai-sdk/google` 4.0.39, 2026-08-10), so on " +
+                    " Deleting it here would have destroyed a constraint the forwarding " +
+                    "clients enforce while changing nothing for the dropping ones, which " +
+                    "drop it either way. If you are on a dropping client, remodel it as " +
+                    "`anyOf` — every measured client carries that."
+                  : "Kept `" + k + "` — " +
+                    namesOf(GEMINI_CLIENT_MEMBERS.filter(function (m) {
+                      return m.forwards.indexOf(k) === -1;
+                    })) + " all drop it (measured 2026-08-10), so on " +
                     "this target expect it to be unenforced" +
                     (emptied
                       ? ", and since it is the only constraint on this node the property " +
                         "will assert nothing about the data while the call still succeeds."
                       : ".") +
-                    " It is left in the file rather than deleted because neither client " +
-                    "ERRORS on it — they ignore it — and because this list is a snapshot " +
-                    "of two members of an open class, not a fact about every client.",
+                    " It is left in the file rather than deleted because no measured " +
+                    "client ERRORS on it — they ignore it — and because " +
+                    (geminiClientsForwarding(k).length
+                      ? namesOf(geminiClientsForwarding(k)) + " DOES forward it, and this " +
+                        "list is a snapshot of an open class, not a fact about every client."
+                      : "this list is a snapshot of " + GEMINI_CLIENT_MEMBERS.length +
+                        " members of an OPEN class, not a fact about every client."),
                 DOCS.gemini, true));
             } else {
               // Advisory, never a gate failure: the destination accepts this,
@@ -5183,6 +5278,7 @@
     // gemini-client` used to decide by itself: the two members of that class
     // disagree here, so the rule reports instead of choosing (#365).
     GEMINI_CLIENT_CARRIED_KEYS: Object.keys(GEMINI_CLIENT_CARRIED),
+    GEMINI_CLIENT_MEMBERS: GEMINI_CLIENT_MEMBERS,
 
     // Every `strict` declaration in openai@7.4.0's resources, with what OMITTING
     // it means on that surface. Exported for #361's reason and one more: this is

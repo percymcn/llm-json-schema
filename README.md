@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1036 engine + 252 CLI + 41 ESM/library assertions = **1329** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1057 engine + 258 CLI + 42 ESM/library assertions = **1357** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -662,7 +662,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1329 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1357 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -692,20 +692,48 @@ each keyword on a node of the right shape and beside a `description` control
 that must survive, `@ai-sdk/google` read from the real wire payload via an
 intercepting `fetch` rather than from its source:
 
-| keyword | `google-adk` 2.6.3 | `@ai-sdk/google` 4.0.39 |
-|---|---|---|
-| `oneOf` | dropped — node emptied | **forwarded verbatim**, recursed |
-| `allOf` | dropped — node emptied | **forwarded verbatim**, recursed |
-| `not` | dropped | dropped |
-| `{"type":["string","null"]}` | → `{STRING, nullable}` | → `{anyOf:[string], nullable}` |
-| `{"type":["string","integer"]}` | → `STRING`, **integer branch lost** | → `anyOf`, both kept |
-| hand-written `nullable: true` | **dropped** | **dropped** |
+| keyword | `google-adk` 2.6.3 | `agno` 2.8.7 | `litellm` 1.96.0 | `@ai-sdk/google` 4.0.39 | `@langchain/google-genai` 2.2.0 |
+|---|---|---|---|---|---|
+| `oneOf` | dropped — node emptied | dropped — emptied | dropped — emptied | **forwarded** | **forwarded** |
+| `allOf` | dropped — node emptied | dropped — emptied | dropped — emptied | **forwarded** | **forwarded** |
+| `not` | dropped | dropped | dropped | dropped | **forwarded** |
+| `{"type":["string","null"]}` | → `{STRING, nullable}` | → `{STRING, nullable}` | → `anyOf:[string,null]` | → `{anyOf:[string], nullable}` | **forwarded verbatim** |
+| `{"type":["string","integer"]}` | → `STRING`, **integer lost** | → `STRING`, **integer lost** | → `anyOf`, both kept | → `anyOf`, both kept | **forwarded verbatim** |
+| hand-written `nullable: true` | **dropped** | **dropped** | kept | **dropped** | kept |
 
-The union rows are a genuine **intersection**: both clients do the `nullable`
-rewrite themselves and both drop a hand-written `nullable`, so leaving the union
-spelling alone is right for both; and the multi-member rewrite to `anyOf` is
-required by one and a no-op for the other. Those rules were correct and are now
-verified against a second member.
+The combinator rows settle the keep decision against five members rather than
+two: every client that drops `oneOf`/`allOf`/`not` drops it *itself*, so keeping
+it costs those callers nothing (our output is byte-identical to stripping for
+them) and buys the forwarders an entire union.
+
+**The nullability rows have no intersection form at all.** Three clients rewrite
+`type:["X","null"]` into `nullable` themselves *and* drop a hand-written
+`nullable`, so they need the union spelling. `@langchain/google-genai` performs
+no rewrite — it strips only `$schema` and `additionalProperties` and assigns the
+rest straight to `responseSchema` (`chat_models.js:676`), where the proto
+rejects a list-valued `type` outright. `litellm` takes either. No single
+document satisfies all five.
+
+This target keeps the **union** spelling, and the reason is the shape of the
+harm rather than a head count: for a forwarding client the union produces a
+**loud 400** the caller can act on, while emitting `nullable` would make three
+clients drop the null constraint **silently**. So the output does not change and
+the *diagnosis* forks — the note names `@langchain/google-genai`, gives the
+proto's own rejection text, and states the check to run against your own call
+site: **if your client hands your document to `responseSchema` without
+rebuilding it, you want `--to gemini`,** whose output carries `nullable`
+instead. It stays advisory, never a gate failure: which client is calling is a
+fact only you have, and blocking would be a false CI failure for four of five.
+
+That reframe is the useful part. A *forwarding* client is not a converting
+client — it is transparent, so its document has to satisfy the narrow proto
+directly, which is what `--to gemini` has always produced. The class this target
+really models is **rewriting** clients; the name is what invited a forwarding
+one in, and the single rule that assumes a rewrite is exactly the rule that
+broke.
+
+`GEMINI_CLIENT_MEMBERS` is exported so the whole table above is re-diffable
+after a version bump.
 
 The `oneOf`/`allOf` rows are where the members disagree, and this target used to
 **delete** those keywords for everyone. The asymmetry is what makes that wrong

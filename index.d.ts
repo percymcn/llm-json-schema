@@ -142,6 +142,22 @@ export const AI_SDK_GOOGLE_FORWARDED_KEYS: string[];
 export const GEMINI_CLIENT_CARRIED_KEYS: string[];
 
 /**
+ * The measured members of the "converting client" class behind `--to
+ * gemini-client`, with what each forwards and which nullability spelling it
+ * needs. `nullForm` is `"rewrites"` (turns `type:["X","null"]` into `nullable`
+ * itself and drops a hand-written `nullable`), `"either"`, or `"forwards"`
+ * (performs no rewrite, so the union form reaches `responseSchema` verbatim and
+ * the proto rejects it). There is no spelling that works for all of them.
+ * Snapshot as of 2026-08-10 — re-measure after a version bump.
+ */
+export const GEMINI_CLIENT_MEMBERS: Array<{
+  client: string;
+  version: string;
+  forwards: string[];
+  nullForm: "rewrites" | "either" | "forwards";
+}>;
+
+/**
  * The `format` VALUES Anthropic's transformer keeps on a string node.
  * Confirmed against three independent vendor artifacts, each a literal in
  * code: the JS `SUPPORTED_STRING_FORMATS`, the Python `SupportedStringFormats`
@@ -232,6 +248,7 @@ declare const api: {
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
   AI_SDK_GOOGLE_FORWARDED_KEYS: typeof AI_SDK_GOOGLE_FORWARDED_KEYS;
   GEMINI_CLIENT_CARRIED_KEYS: typeof GEMINI_CLIENT_CARRIED_KEYS;
+  GEMINI_CLIENT_MEMBERS: typeof GEMINI_CLIENT_MEMBERS;
   ANTHROPIC_STRING_FORMATS_KEPT: typeof ANTHROPIC_STRING_FORMATS_KEPT;
   ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;

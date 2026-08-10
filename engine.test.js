@@ -3642,15 +3642,27 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     GC.ledger.some(function (l) {
       return l.advisory && l.msg.indexOf("Kept `oneOf`") !== -1;
     }));
-  // The over-block guard in the other direction: `not` is dropped by BOTH
-  // measured clients, so it must NOT be described as carried. Without this the
-  // rule could be firing blanket and every assertion above would still pass.
+  // The over-block guard in the other direction: `not` must NOT get the same
+  // treatment as `oneOf`/`allOf`. Without this the rule could be firing blanket
+  // and every assertion above would still pass.
+  //
+  // #368 CORRECTED THE FACT THIS PINS, not its intent. It used to assert the
+  // literal prose "BOTH measured converting clients drop it" — true of the two
+  // members #365 measured, and FALSE once a fifth (`@langchain/google-genai`
+  // 2.2.0) turned out to forward `not`. Re-keyed on the stable half (it is kept;
+  // the droppers are named; it does NOT get the `anyOf` remedy, which is the
+  // real discriminator between the two branches, since there is no `anyOf` form
+  // of a negation) and STRENGTHENED to require the forwarder be named too.
   var GCnot = E.convert({ type: "string", not: { type: "string", pattern: "^x" } },
     "gemini-client");
-  ok("gemini-client: `not` is kept too (neither client errors on it)",
+  ok("gemini-client: `not` is kept too (no measured client errors on it)",
     !!GCnot.schema.not);
-  ok("gemini-client: ...but is reported as dropped by BOTH clients",
-    has(GCnot.ledger, "BOTH measured converting clients drop it"));
+  ok("gemini-client: ...and the clients that drop `not` are named",
+    has(GCnot.ledger, "google-adk") && has(GCnot.ledger, "all drop it"));
+  ok("gemini-client: ...and the one client that FORWARDS `not` is named too",
+    has(GCnot.ledger, "@langchain/google-genai"));
+  ok("gemini-client: ...but `not` is NOT offered the `anyOf` remedy",
+    !has(GCnot.ledger, "remodel it as `anyOf`"));
   // #329's question asked about the layer downstream: if the keyword was the
   // node's only constraint, the client that drops it leaves a property
   // asserting nothing. That clause must fire here and NOT on a node that has
@@ -6272,6 +6284,128 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("#367 the schema still passes through with the keywords kept",
     js.schema.properties.code.pattern === "^[A-Z]{3}$" &&
     js.schema.properties.code.minLength === 3);
+})();
+
+
+// ---------------------------------------------------------------------------
+// #368 — a forwarding client is not a converting one.
+//
+// `--to gemini-client` is named for a CLASS. #365 measured two members and said
+// so in the shipped table. Measuring the three members #365/#366 recorded by
+// name found a SECOND axis on which the class has NO intersection form: three
+// clients rewrite `type:["X","null"]` into `nullable` themselves (and drop a
+// hand-written `nullable`), one takes either, and one FORWARDS the union
+// verbatim into `responseSchema`, where the proto rejects it outright.
+// ---------------------------------------------------------------------------
+(function () {
+  // A guarded read, so a missing export reports rather than aborting the file
+  // (#322's trap — an unguarded property access kills every assertion after it).
+  var MEMBERS = (E && Array.isArray(E.GEMINI_CLIENT_MEMBERS)) ? E.GEMINI_CLIENT_MEMBERS : [];
+  var byForm = function (f) {
+    return MEMBERS.filter(function (m) { return m.nullForm === f; })
+      .map(function (m) { return m.client; });
+  };
+
+  ok("#368 the member table is exported and has all five measured clients",
+    MEMBERS.length === 5);
+  // The table is the deliverable here, so pin the split rather than the count:
+  // get `rewrites` wrong and we tell three clients to emit a spelling that
+  // silently deletes their null constraint; get `forwards` wrong and we certify
+  // a document that hard-400s.
+  ok("#368 three members REWRITE the nullability spelling themselves",
+    byForm("rewrites").length === 3 &&
+    byForm("rewrites").indexOf("google-adk") !== -1 &&
+    byForm("rewrites").indexOf("agno") !== -1 &&
+    byForm("rewrites").indexOf("@ai-sdk/google") !== -1);
+  ok("#368 exactly one member FORWARDS, and it is the langchain one",
+    byForm("forwards").length === 1 && byForm("forwards")[0] === "@langchain/google-genai");
+  ok("#368 exactly one member carries EITHER spelling",
+    byForm("either").length === 1 && byForm("either")[0] === "litellm");
+  // No intersection form (#336). If some future edit makes one spelling work
+  // for everybody, this fails and the fork below should be reconsidered.
+  ok("#368 no nullability spelling works for every measured member",
+    byForm("rewrites").length > 0 && byForm("forwards").length > 0);
+  // Derived, not asserted (#361): `not` joined the carried set when a member
+  // that forwards it was measured.
+  ok("#368 the carried table is derived from the members and now includes `not`",
+    E.GEMINI_CLIENT_CARRIED_KEYS.indexOf("not") !== -1 &&
+    E.GEMINI_CLIENT_CARRIED_KEYS.indexOf("oneOf") !== -1 &&
+    E.GEMINI_CLIENT_CARRIED_KEYS.indexOf("allOf") !== -1);
+
+  // The defect: this exact document exits 0 today and hard-400s for a
+  // forwarding client. The output does not change (three members need it) but
+  // the diagnosis must fork.
+  var opt = E.convert({
+    type: "object",
+    properties: { p: { type: ["string", "null"] } },
+    required: ["p"]
+  }, "gemini-client");
+
+  ok("#368 the union spelling is still KEPT — three members need it",
+    Array.isArray(opt.schema.properties.p.type) &&
+    opt.schema.properties.p.type.indexOf("null") !== -1 &&
+    opt.schema.properties.p.nullable === undefined);
+  ok("#368 the note no longer claims the converting client always rewrites",
+    !has(opt.ledger, "the converting client performs the `nullable` rewrite itself"));
+  ok("#368 the note names the client that does NOT rewrite",
+    has(opt.ledger, "@langchain/google-genai"));
+  ok("#368 the note says that client's request is REJECTED, with the proto reason",
+    has(opt.ledger, "Proto field is not repeating"));
+  ok("#368 the note NAMES THE CHECK rather than guessing the caller's client",
+    has(opt.ledger, "THE CHECK") && has(opt.ledger, "without rebuilding it"));
+  ok("#368 the note points at the target whose output IS the other spelling",
+    has(opt.ledger, "--to gemini"));
+  ok("#368 the note still explains why emitting `nullable` here would be silent",
+    has(opt.ledger, "stop being nullable"));
+  // Advisory, never a gate failure (#317): which client is calling is a fact
+  // only the caller has (#319), and blocking would be a false CI failure for
+  // four of the five measured members.
+  ok("#368 the fork never becomes a gate failure",
+    opt.ledger.every(function (l) {
+      return l.msg.indexOf("THE CHECK") === -1 || l.advisory === true;
+    }));
+
+  // Over-block guards, held both ways.
+  var multi = E.convert({
+    type: "object",
+    properties: { p: { type: ["string", "integer"] } },
+    required: ["p"]
+  }, "gemini-client");
+  // 2+ real members are rewritten to `anyOf`, which the live proto accepts, so
+  // a forwarding client is fine there and must NOT get the fork.
+  ok("#368 a multi-member union is unaffected — it becomes `anyOf`, which is accepted",
+    !!multi.schema.properties.p.anyOf && !has(multi.ledger, "THE CHECK"));
+  var plain = E.convert({
+    type: "object",
+    properties: { p: { type: "string" } },
+    required: ["p"]
+  }, "gemini-client");
+  ok("#368 an ordinary non-nullable property draws no fork",
+    !has(plain.ledger, "THE CHECK"));
+  // The other Gemini targets are about a different destination and must stay
+  // quiet — `--to gemini` is the ESCAPE HATCH, so if it grew this note the
+  // advice would be circular.
+  var narrow = E.convert({
+    type: "object",
+    properties: { p: { type: ["string", "null"] } },
+    required: ["p"]
+  }, "gemini");
+  ok("#368 `--to gemini` emits the OTHER spelling and does not fork",
+    narrow.schema.properties.p.nullable === true &&
+    narrow.schema.properties.p.type === "string" &&
+    !has(narrow.ledger, "THE CHECK"));
+
+  // The combinator counts were stale, not wrong in kind: the keep decision is
+  // confirmed against five members. `oneOf` keeps the `anyOf` remedy; `not`
+  // must not get it, which is the discriminator proving the branch is real.
+  var one = E.convert({
+    type: "object",
+    properties: { p: { oneOf: [{ type: "string" }, { type: "integer" }] } }
+  }, "gemini-client");
+  ok("#368 the `oneOf` note names a forwarder and a dropper from the five",
+    has(one.ledger, "@ai-sdk/google") && has(one.ledger, "google-adk"));
+  ok("#368 ...and no longer says the class has two members",
+    !has(one.ledger, "two members of an open class"));
 })();
 
 
