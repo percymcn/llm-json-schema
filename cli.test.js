@@ -1208,5 +1208,41 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     })).status === 0);
 })();
 
+// --- #352: a gate that passed a document it had just emptied ----------------
+//
+// The severities are the finding, so they are asserted through the binary
+// rather than only in the engine. Before this, `--to gemini` answered exit 0
+// ("Already valid for gemini. No changes needed.") on a file it handed back as
+// `{}`, and exit 1 ("commit my output") on the rest — where the change on offer
+// was the deletion of every constraint in the document.
+(function () {
+  var BAG = JSON.stringify({ definitions: { I: { type: "object" } } });
+  var PATTERN = JSON.stringify({ patternProperties: { "^a": { type: "string" } } });
+
+  var bag = run(["--to", "gemini", "--check"], BAG);
+  ok("#352 a document emptied to `{}` no longer passes the gate",
+    bag.status === 3, "exit " + bag.status);
+  ok("#352 the blocker reaches the installed binary's output",
+    (bag.stdout + bag.stderr).indexOf("constrains nothing") !== -1);
+  ok("#352 the pointerless bag is told to restore its `$ref`",
+    (bag.stdout + bag.stderr).indexOf("$ref` INTO the bag") !== -1);
+
+  // The same file, two targets, opposite answers: the narrow proto has no field
+  // for `patternProperties` so the document empties, while `responseJsonSchema`
+  // takes it verbatim. That disagreement is the proof the remedy is real — it
+  // points at a target that genuinely accepts the file.
+  ok("#352 the narrow proto blocks what the JSON-Schema path carries",
+    run(["--to", "gemini", "--check"], PATTERN).status === 3 &&
+    run(["--to", "gemini-json", "--check"], PATTERN).status === 0);
+
+  // Over-block guard through the binary: the rule keys on a whole-document
+  // outcome, so an ordinary schema must be completely untouched by it.
+  var fine = run(["--to", "gemini", "--check"], JSON.stringify({
+    type: "object", properties: { a: { type: "string" } }, required: ["a"]
+  }));
+  ok("#352 an ordinary schema still passes gemini cleanly",
+    fine.status === 0 && (fine.stdout + fine.stderr).indexOf("constrains nothing") === -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

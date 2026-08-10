@@ -4503,5 +4503,142 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(opt.ledger, "added to required"));
 })();
 
+// --- #352: the outcome no keyword rule can see — an emptied document --------
+//
+// Found by a sweep, not by reading code: every schema this suite feeds to a
+// converter was captured (362 distinct inputs) and run through all 10 targets,
+// then checked against properties the project states but had never executed.
+// 14 inputs came back constraining NOTHING — 22 of those rows at exit 1
+// ("commit my output") and 2 at exit 0 ("Already valid — no changes needed").
+//
+// Each keyword rule involved is individually right: the narrow proto has no
+// field for `if`, `contains`, `propertyNames`, `patternProperties`,
+// `dependentRequired` or `unevaluatedProperties`, and a converting client
+// cannot carry `oneOf`. What none of them can see is the node consisting of
+// NOTHING BUT the keyword being removed — #329's tell, asked about the DOCUMENT
+// ROOT for the first time. #347 caught one route (a match-anything `not`) and
+// keyed its fix on the KEYWORD, which is why the other routes survived.
+//
+// Honest severity: `types.Schema` (google-genai 2.17.0) ACCEPTS `{}` — measured
+// — so this is not a rejection. The request succeeds and the model is simply
+// free to return anything, which is #347's corollary again: a metric that only
+// measures acceptance scores the broken behaviour as a win.
+(function () {
+  function note(l) {
+    return l.filter(function (e) {
+      return e.msg.indexOf("Nothing is left in this document") !== -1;
+    });
+  }
+  function blocked(r) {
+    return r.ledger.some(function (e) { return e.op === "!" && !e.advisory; });
+  }
+  // Guarded on purpose: with the rule reverted there is no entry to read, and a
+  // bare `[0].msg` aborts the whole file, which hides every assertion after it
+  // and makes the revert check unreadable (#322).
+  function noteText(l) { return (note(l)[0] || { msg: "" }).msg; }
+
+  // Each of these is an ordinary shape a generator or a hand-written schema
+  // produces, and each one used to come back as a document constraining nothing.
+  [
+    ["patternProperties", { patternProperties: { "^a": { type: "string" } } }],
+    ["if/then", { "if": { type: "string" }, then: { minLength: 1 } }],
+    ["contains", { contains: { type: "integer" } }],
+    ["propertyNames", { propertyNames: { pattern: "^a" } }],
+    ["dependentRequired", { dependentRequired: { a: ["b"] } }],
+    ["unevaluatedProperties", { unevaluatedProperties: false }]
+  ].forEach(function (row) {
+    var r = E.toGemini(row[1]);
+    ok("#352 gemini reports the emptied document for " + row[0],
+      note(r.ledger).length === 1 && blocked(r));
+  });
+
+  // The discriminator that proves the rule is keyed on the OUTCOME and not on a
+  // keyword list: ONE input, two targets, opposite verdicts. #343 measured that
+  // the live v1beta endpoint accepts `oneOf` in `responseSchema`, so `--to
+  // gemini` KEEPS it and the document still constrains something; a converting
+  // client rebuilds the request from its own `Schema` type, which has no such
+  // field, so `--to gemini-client` empties the same file.
+  var pet = {
+    title: "Pet",
+    oneOf: [
+      { type: "object", properties: { meow: { type: "string" } }, required: ["meow"] },
+      { type: "object", properties: { bark: { type: "string" } }, required: ["bark"] }
+    ]
+  };
+  ok("#352 a union kept by the narrow proto is not reported as emptied",
+    note(E.toGemini(pet).ledger).length === 0);
+  ok("#352 the same union IS reported when a converting client strips it",
+    note(E.toGemini(pet, false, true).ledger).length === 1);
+
+  // Exit 0 was the worst of the two: the orphan-`$defs` pruner removes a bag
+  // nothing points into WITHOUT a ledger entry, so a document consisting only of
+  // that bag reached the "no changes needed" fallback with an empty ledger and
+  // was told every keyword in it is a field of the SDK's `Schema` type — about a
+  // document whose keywords had just been deleted.
+  var bagOnly = { definitions: { I: { type: "object" } } };
+  var bagRes = E.toGemini(bagOnly);
+  ok("#352 a definition bag nothing points into no longer passes as valid",
+    note(bagRes.ledger).length === 1 && blocked(bagRes));
+  ok("#352 the emptied note replaces the false 'no changes needed' line",
+    !has(bagRes.ledger, "Every keyword here is a field of the SDK's `Schema` type"));
+
+  // Two cases, two remedies, and conflating them would be a false promise: a
+  // document whose only content is a pointerless bag constrains nothing on EVERY
+  // target, so naming an escape hatch there would send the reader somewhere that
+  // cannot help. Measured: 13 of the 14 emptying shapes survive `--to
+  // gemini-json`; this one is the fourteenth.
+  ok("#352 the pointerless-bag case names the missing $ref, not another target",
+    noteText(bagRes.ledger).indexOf("`$ref` INTO the bag") !== -1 &&
+    noteText(bagRes.ledger).indexOf("--to gemini-json") === -1);
+  ok("#352 the strippable-keyword case names the target that was measured to work",
+    noteText(E.toGemini({ contains: { type: "integer" } }).ledger)
+      .indexOf("`--to gemini-json`") !== -1);
+  ok("#352 that same bag is reported on the JSON-Schema path too",
+    note(E.toGemini(bagOnly, true).ledger).length === 1);
+
+  // --- over-block guards ---------------------------------------------------
+  // Being merely stricter than the vendor is this project's most repeated bug
+  // (#312/#314/#317/#322/#329/#337/#343/#344/#348), and this rule fires on a
+  // whole-document outcome, so it has the widest possible blast radius.
+  ok("#352 an ordinary schema draws no emptied note on any target",
+    ["openai", "openai-nonstrict", "openai-realtime", "anthropic", "anthropic-json",
+      "anthropic-json-python", "anthropic-go", "gemini", "gemini-json", "gemini-client"]
+      .every(function (p) {
+        return note(E.convert({
+          type: "object", properties: { a: { type: "string" } },
+          required: ["a"], additionalProperties: false
+        }, p).ledger).length === 0;
+      }));
+  // `gemini-json` carries every one of these keywords, so the same file that
+  // blocks on the narrow proto must stay clean there — otherwise the remedy the
+  // narrow path recommends would point at a target that also refuses it.
+  ok("#352 gemini-json carries the keywords that empty the narrow proto",
+    [{ patternProperties: { "^a": { type: "string" } } },
+      { contains: { type: "integer" } },
+      { propertyNames: { pattern: "^a" } }]
+      .every(function (s) { return note(E.toGemini(s, true).ledger).length === 0; }));
+  // An input that already constrained nothing has lost nothing. The rule is
+  // about what the CONVERSION did, not about how weak the input was.
+  ok("#352 an input that was already unconstrained is not reported",
+    note(E.toGemini({}).ledger).length === 0 &&
+    note(E.toGemini({ title: "x", description: "d" }).ledger).length === 0);
+  // A PROPERTY emptying to `{}` is a different, already-reported thing: the
+  // document still constrains plenty. Keying the check on the root is what keeps
+  // these apart, and #343's advisory already covers the node level.
+  ok("#352 a property emptied inside a schema is not a document-level report",
+    note(E.toGemini({
+      type: "object",
+      properties: { v: { const: "a" } },
+      required: ["v"]
+    }).ledger).length === 0);
+  // Exactly one entry, however many keywords were removed on the way.
+  ok("#352 the note is emitted once, not once per removal",
+    note(E.toGemini({
+      patternProperties: { "^a": { type: "string" } },
+      propertyNames: { pattern: "^a" },
+      contains: { type: "integer" }
+    }).ledger).length === 1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

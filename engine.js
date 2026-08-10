@@ -376,6 +376,90 @@
     return e;
   }
 
+  // ---- did the conversion leave anything behind? ---------------------------
+  //
+  // Keywords that describe a schema without asserting anything about the
+  // instance. A document holding only these accepts every JSON value there is.
+  var ANNOTATION_ONLY = {
+    title: 1, description: 1, $comment: 1, examples: 1, default: 1,
+    deprecated: 1, readOnly: 1, writeOnly: 1, propertyOrdering: 1,
+    $schema: 1, $id: 1
+  };
+
+  // The two sides ask DIFFERENT questions on purpose, and the asymmetry is the
+  // whole point of the rule.
+  //
+  // Output side — "does what I am handing back constrain anything?" A `$defs`
+  // bag nothing points into does NOT count: it asserts nothing about any
+  // instance, so a document reduced to one still accepts every JSON value.
+  function constrainsSomething(s) {
+    if (s === false) return true;               // matches nothing — a constraint
+    if (s === true || s === null || typeof s !== "object") return false;
+    return Object.keys(s).some(function (k) {
+      return !ANNOTATION_ONLY[k] && k !== "$defs" && k !== "definitions";
+    });
+  }
+
+  // Input side — "did this document have content at all?" Here a definition bag
+  // DOES count, and it is the case that made the asymmetry necessary: a bare
+  // `{"definitions": {...}}` is the llama-index shape (#341), where the root
+  // `$ref` was deleted upstream and only the bag arrived. As a schema it already
+  // constrained nothing, so a symmetric rule stays silent — and staying silent
+  // is what let `--to gemini` answer exit 0, "Already valid. No changes needed",
+  // while handing back `{}`. The author plainly modelled something; saying so
+  // beats agreeing with the deletion.
+  function hadContent(s) {
+    if (!isPlainObject(s)) return constrainsSomething(s);
+    return Object.keys(s).some(function (k) { return !ANNOTATION_ONLY[k]; });
+  }
+
+  // #352. Every keyword rule in this file decides one keyword's fate, and each
+  // of them is individually defensible: the narrow proto has no field for `if`,
+  // `contains`, `propertyNames`, `patternProperties`, `dependentRequired` or
+  // `unevaluatedProperties`, and a converting client cannot carry `oneOf`. The
+  // outcome none of them can see is the node consisting of NOTHING BUT the
+  // keyword being removed — #329's tell, asked here about the DOCUMENT ROOT for
+  // the first time. Measured across the whole test corpus: 14 ordinary inputs
+  // came back constraining nothing, 22 of those rows at exit 1 ("commit my
+  // output") and 2 at exit 0 ("Already valid — no changes needed").
+  //
+  // #347 caught one route (a match-anything `not`) and keyed the fix on the
+  // KEYWORD, so the other routes survived. This is keyed on the OUTCOME, which
+  // is why it needs no list: whatever deletes the last constraint trips it.
+  //
+  // Honest severity: `types.Schema` (google-genai 2.17.0) ACCEPTS `{}`, so this
+  // is not a rejection — the request succeeds and the model is simply free to
+  // return any JSON at all. Our headline metric (raw rejected -> ours accepted)
+  // scores the broken behaviour as a win, which is #347's corollary again.
+  //
+  // Blocker rather than a repair: there is nothing to repair. The constraints
+  // have no representation in this dialect, so the only honest moves are to
+  // remodel or to change target — and the target is named because it was
+  // measured, not guessed (all 14 survive `--to gemini-json`).
+  function noteEmptiedDocument(input, output, ledger, docUrl, alternative) {
+    if (!hadContent(input) || constrainsSomething(output)) return;
+    // Which of the two cases this is has to be read from the INPUT, and that is
+    // #341's lesson rather than a style choice: the orphan-`$defs` pruner has
+    // already deleted the bag by the time this runs — precisely because nothing
+    // pointed into it — so asking the OUTPUT whether a bag was there always
+    // answers no. The two cases need different remedies, and switching targets
+    // cannot help a document whose only content was a bag nothing points at: it
+    // constrains nothing everywhere, so naming an escape hatch would be a false
+    // promise. The asymmetry between the two predicates is exactly this test.
+    var bag = hadContent(input) && !constrainsSomething(input);
+    ledger.push(entry("!", "root",
+      "Nothing is left in this document that asserts anything about the data, so what " +
+      "you would send constrains nothing — the model may return any JSON at all. Any " +
+      "removals are listed above with their reasons; this note is about the total. " +
+      (bag
+        ? "The definition bag that is left describes a type nothing points at, so it " +
+          "constrains no instance and no target can rescue it: what went missing is the " +
+          "`$ref` INTO the bag, most likely before this document reached us. Restore that " +
+          "pointer — a top-level `$ref`, or a property that references the definition."
+        : alternative),
+      docUrl));
+  }
+
   // ---- schema inference from a JSON example --------------------------------
 
   // Join the schemas inferred from two sibling array elements. Reading only
@@ -1750,6 +1834,10 @@
         DOCS.openai, true));
     }
 
+    noteEmptiedDocument(schema, s, ledger, DOCS.openai,
+      "Measured over this project's whole fixture corpus: 13 of the 14 shapes that empty here " +
+      "survive `--to openai-nonstrict` intact, so if you are not setting `strict: true` the " +
+      "constraints are still in the request (unenforced, but present). Under strict mode they have to be remodelled.");
     return { schema: s, ledger: ledger };
   }
 
@@ -2154,6 +2242,14 @@
     var s = clone(schema);
     var ledger = [];
     var url = outputFormatPath ? DOCS["anthropic-json"] : DOCS.anthropic;
+    // Go has no verbatim surface at all (#332), so the remedy every other
+    // Anthropic message can offer does not exist there.
+    var ANTHROPIC_EMPTIED_REMEDY = goSdk
+      ? "There is no verbatim escape hatch in Go — both helpers run the same transform — so the " +
+        "constraint has to be remodelled into keywords the transform keeps, or enforced after the " +
+        "response comes back."
+      : "Measured: 13 of the 14 shapes that empty here survive `--to anthropic` (the " +
+        "`tools[].input_schema` path) intact, because no transform runs there. On this path they have to be remodelled.";
     // On the Go SDK the tools path runs the SAME transform, so the sentence
     // every other Anthropic message ends with — "it survives on
     // tools[].input_schema" — is false there and must not be printed.
@@ -2359,6 +2455,7 @@
         "`transformSchemaMap` as `BetaJSONSchemaOutputFormat` (schemautil.go), so both surfaces get " +
         "the rebuild. Use `--to anthropic-go`.",
         url, true));
+      noteEmptiedDocument(schema, s, ledger, url, ANTHROPIC_EMPTIED_REMEDY);
       return { schema: s, ledger: ledger };
     }
 
@@ -2650,6 +2747,7 @@
         "verbatim and none of those notes apply.",
         url));
     }
+    noteEmptiedDocument(schema, s, ledger, url, ANTHROPIC_EMPTIED_REMEDY);
     return { schema: s, ledger: ledger };
   }
 
@@ -3084,6 +3182,18 @@
       "Gemini resolves `$ref` only on the `responseJsonSchema` path, and only for genuine local " +
       "pointers.");
 
+    // Measured 2026-08-09 over the whole corpus: all 14 shapes that empty on the
+    // narrow proto or through a converting client survive `--to gemini-json`.
+    // That is a real escape hatch rather than a guess, which is what makes the
+    // blocker actionable instead of a bare refusal (#329's corollary).
+    var GEMINI_EMPTIED_REMEDY = clientConverts
+      ? "Measured: 13 of the 14 shapes that empty here survive `--to gemini-json` intact. That " +
+        "path takes full JSON Schema — but only if you hand it to `responseJsonSchema` YOURSELF, " +
+        "since the converting library you are using rebuilds the request from its own `Schema` type."
+      : "Measured: 13 of the 14 shapes that empty here survive `--to gemini-json` intact — the " +
+        "`responseJsonSchema` field takes full JSON Schema, and adding a top-level `$schema` is " +
+        "what routes `@google/genai` there for you.";
+
     // A node with no legal values. Hoisted ABOVE the path split on purpose:
     // both Gemini paths carry these shapes, and Path A returns early, so a walk
     // placed after the split would silently cover only the narrow path.
@@ -3215,6 +3325,7 @@
           "(nullable is not sufficient) — make it optional or flatten it to a fixed depth.",
           DOCS.gemini));
       });
+      noteEmptiedDocument(schema, s, ledger, DOCS["gemini-json"], GEMINI_EMPTIED_REMEDY);
       return { schema: s, ledger: ledger };
     }
 
@@ -3511,6 +3622,13 @@
       }
     }
 
+    // BEFORE the "no changes needed" fallback, deliberately: the orphan-`$defs`
+    // pruner deletes a bag nothing points into WITHOUT a ledger entry, so a
+    // document consisting only of that bag reached the fallback with an empty
+    // ledger and was told "Every keyword here is a field of the SDK's `Schema`
+    // type" — about a document whose keywords had just been removed. Exit 0.
+    noteEmptiedDocument(schema, s, ledger, DOCS.gemini, GEMINI_EMPTIED_REMEDY);
+
     if (ledger.length === 0) {
       ledger.push(entry("=", "root",
         "No changes needed. Every keyword here is a field of the SDK's `Schema` type, " +
@@ -3680,6 +3798,9 @@
         "`Mode.TOOLS_STRICT` is deprecated and sends a non-strict payload.",
       url, true));
 
+    noteEmptiedDocument(input, schema, ledger, url,
+      "Nothing is removed on this surface, so if you are seeing this the document already " +
+      "carried no assertion when it arrived.");
     return { schema: schema, ledger: ledger };
   }
 

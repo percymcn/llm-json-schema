@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 713 engine + 197 CLI + 34 ESM/library assertions = **944** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 731 engine + 202 CLI + 34 ESM/library assertions = **967** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -485,7 +485,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 944 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 967 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -759,6 +759,45 @@ this shape at all, and neither zod 3 + `zod-to-json-schema` nor zod 4's native
 hand-authored / OpenAPI-composition idiom rather than something the common
 generators hand you — which is most likely why it survived this long.
 
+
+## When the conversion deletes everything
+
+Each keyword rule in this tool decides one keyword's fate, and each is
+individually defensible. Gemini's narrow `responseSchema` proto has no field for
+`if`, `contains`, `propertyNames`, `patternProperties`, `dependentRequired` or
+`unevaluatedProperties`, so they come out. A library that converts JSON Schema
+for you rebuilds the request from its own `Schema` type, which has no `oneOf`, so
+that comes out too.
+
+The outcome no per-keyword rule can see is the node consisting of **nothing but**
+the keyword being removed. Then the removal is not a widening, it is a deletion —
+and at the document root it deletes the whole schema. `{"patternProperties":
+{"^a": {"type": "string"}}}` used to convert to `{}` and exit 1, meaning "commit
+my output". `{"definitions": {"I": {...}}}` — the shape you get when something
+upstream dropped the root `$ref` and left only the bag — converted to `{}` and
+exited **0**, printing *"Already valid for gemini. No changes needed."*
+
+Fourteen shapes in this project's own fixture corpus did this. All of them are
+now a blocker (exit 3), keyed on the **outcome** rather than on a keyword list,
+because a keyword-keyed version of this rule already shipped once and missed
+every route but the one it was written for.
+
+The severity is worth stating precisely, because it is not a 400.
+`types.Schema` (`google-genai` 2.17.0) **accepts** `{}`, measured. The request
+succeeds; the model is simply free to return any JSON at all. A tool that scores
+itself on *raw rejected → ours accepted* records that as a win, which is why the
+check had to be about what is left in the document rather than about what the
+vendor tolerates.
+
+Two cases, two remedies, and they are not interchangeable:
+
+- **Keywords this dialect cannot express.** 13 of the 14 shapes survive `--to
+  gemini-json` intact — `responseJsonSchema` takes full JSON Schema — so the
+  blocker names it. Same file, two targets, opposite verdicts.
+- **A definition bag nothing points into.** No target can rescue this one: it
+  constrains nothing everywhere, because what went missing is the `$ref` *into*
+  the bag. Naming an escape hatch here would be a false promise, so the blocker
+  says to restore the pointer instead.
 
 ## License
 MIT.
