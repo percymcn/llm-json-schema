@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 741 engine + 208 CLI + 34 ESM/library assertions = **983** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 749 engine + 208 CLI + 34 ESM/library assertions = **991** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -372,13 +372,33 @@ Measured, one client at a time:
 | `openai-nonstrict`, `openai-realtime` | legal — no subset restriction without `strict` | — |
 | `anthropic` (tools) | kept verbatim — no transform runs | `betaTool`, `@anthropic-ai/sdk@0.116.0` |
 | `anthropic-json` (TS `output_format`) | **rejected** — *"JSON schema must have a type defined…"* | `transformJSONSchema` |
+| `anthropic-json-python` (Py `output_format`) | **rejected** — `TypeError: 'bool' object is not a mapping` | `transform_schema`, `anthropic==0.121.0` |
 | `anthropic-go` | kept verbatim on **both** surfaces | `anthropic-sdk-go@v1.62.0` |
 | `gemini` (narrow `responseSchema`) | **rejected** — `types.Schema` is `extra="forbid"` | `google-genai==2.17.0` |
 | `gemini-json` (`responseJsonSchema`) | legal — ordinary JSON Schema | — |
 
-So this is the fourth thing Anthropic's three SDKs disagree about, and the Go
-one is again the permissive side. `--to anthropic-json-python` is deliberately
-left alone: that client was not probed for this shape, so nothing is claimed.
+So this is the fourth thing Anthropic's three SDKs disagree about — 2-1 rather
+than a three-way split, with Go the permissive side. The Python row was measured
+later than the rest, and until it was, this tool gave the *same bytes* opposite
+verdicts on `--to anthropic-json` and `--to anthropic-json-python`.
+
+The Python client does not descend two keywords, and they are treated
+differently on purpose:
+
+- **`not`** — demoted to `description` prose wholesale, so a boolean anywhere
+  beneath it is accepted. Not blocked. (`--to anthropic-json` still blocks it,
+  so the same file legitimately gives 3 on TypeScript and 0 on Python.)
+- **`prefixItems`** — also demoted, so the *input* is safe. It is blocked
+  anyway, because the question is what **our output** contains: the
+  homogeneous-tuple collapse rewrites `prefixItems: [true]` into `items: true`,
+  moving the boolean into a slot the vendor does reject. Same keyword class,
+  opposite answers, decided by whether this tool moves the node.
+
+Known gap, stated rather than papered over: a boolean standing in for the
+`$defs` **bag itself** (`{"$defs": true}`) is not detected and exits 0. It is a
+real hole and an unreachable one — no generator emits it — and the walker it
+would change is shared by all ten targets, so it is recorded rather than
+patched in passing.
 
 Where it is rejected, this tool **blocks** rather than repairing. There is no
 repair — a dialect that constrains decoding has no way to express "anything
@@ -485,7 +505,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 983 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 991 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

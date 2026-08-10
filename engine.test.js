@@ -2386,9 +2386,62 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     blockers(E.convert(propBool(true), "anthropic-go")).length === 0);
   ok("anthropic-go says the TypeScript path disagrees",
     has(E.convert(propBool(true), "anthropic-go").ledger, "the Go SDK keeps it"));
-  // Never probed for this shape -> claim nothing.
-  ok("anthropic-json-python is left unchanged (not probed for this shape)",
-    blockers(E.convert(propBool(true), "anthropic-json-python")).length === 0);
+  // #354: #333 recorded this client as unprobed rather than guessing. Measured
+  // on anthropic==0.121.0 it RAISES `TypeError: 'bool' object is not a mapping`,
+  // so it sides with TypeScript and this assertion is the reverse of the one it
+  // replaces. The old test asserted the gap, not a behaviour.
+  ok("anthropic-json-python blocks a boolean subschema (Python transform raises)",
+    blockers(E.convert(propBool(true), "anthropic-json-python")).length === 1);
+  ok("anthropic-json-python names the Python transform, not the TS one",
+    has(E.convert(propBool(true), "anthropic-json-python").ledger,
+      "'bool' object is not a mapping"));
+  // The two clients disagree, so the message must not blame the vendor at large.
+  ok("anthropic-json-python says which client this is about",
+    has(E.convert(propBool(true), "anthropic-json-python").ledger,
+      "the Go SDK keeps the same bytes verbatim"));
+
+  // --- over-block guards: positions the Python transform never descends -----
+  // It demotes `not` to `description` prose wholesale, so every boolean below
+  // it is accepted verbatim. Measured at three depths.
+  ok("anthropic-json-python does NOT block a boolean under `not`",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "string" } },
+      not: { type: "object", properties: { b: true } }
+    }, "anthropic-json-python")).length === 0);
+  ok("anthropic-json-python does NOT block a boolean under a nested `not`",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "string", not: { type: "array", items: true } } }
+    }, "anthropic-json-python")).length === 0);
+  // ...but the TypeScript path still does, so the exclusion is scoped to Python.
+  ok("anthropic-json still blocks a boolean under `not`",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "string" } },
+      not: { type: "object", properties: { b: true } }
+    }, "anthropic-json")).length === 1);
+
+  // A tuple is the case where the position in OUR OUTPUT is the one that counts:
+  // the vendor accepts a boolean under `prefixItems` (demoted to prose), but our
+  // own homogeneous-tuple collapse rewrites it into `items`, which it rejects.
+  ok("anthropic-json-python blocks a boolean our tuple collapse moves into `items`",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "array", prefixItems: [true] } }
+    }, "anthropic-json-python")).length === 1);
+  // Control: the same shape with a real element type is not blocked at all.
+  ok("anthropic-json-python leaves an ordinary tuple alone",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "array", prefixItems: [{ type: "integer" }] } }
+    }, "anthropic-json-python")).length === 0);
+  // Control: an ordinary schema with no boolean anywhere is untouched.
+  ok("anthropic-json-python does not fire on a schema with no boolean",
+    blockers(E.convert({
+      type: "object", additionalProperties: false, required: ["a"],
+      properties: { a: { type: "string" } }
+    }, "anthropic-json-python")).length === 0);
 
   // Gemini: narrow proto rejects it, JSON-Schema path accepts it.
   ok("gemini (narrow proto) blocks a boolean subschema",

@@ -2307,8 +2307,37 @@
     //   Go `BetaJSONSchemaOutputFormat`
     //      and `BetaToolInputSchema`      -> preserved VERBATIM, both surfaces
     //   TypeScript `betaTool`             -> preserved verbatim (no transform runs)
-    // The Python client was not probed for this shape, so nothing is claimed for
-    // `--to anthropic-json-python` and its behaviour is left unchanged.
+    //   Python `transform_schema`         -> RAISES `TypeError: 'bool' object is
+    //                                        not a mapping` (`ValueError` under
+    //                                        `not`), so the request is never built
+    // #333 left the Python client unprobed and said so rather than guessing. It
+    // has now been measured on anthropic==0.121.0 (`anthropic/lib/_parse/_transform.py`,
+    // the module #333 could not find), and it sides with TypeScript, not Go — so
+    // the vendor's three SDKs are 2-1 here rather than split three ways, and it is
+    // OUR gate that disagreed with itself: the same bytes exited 3 on
+    // `--to anthropic-json` and 0 on `--to anthropic-json-python`.
+    //
+    // Positions were mapped rather than assumed. The transform raises at a
+    // property value, both spellings of `items`, an `anyOf`/`oneOf`/`allOf`
+    // member, a nested property, `$defs` and the root. It ACCEPTS a boolean
+    // under `prefixItems` — that keyword is demoted to `description` prose
+    // before anything descends into it — and accepts the by-design boolean
+    // slots (`additionalProperties`, `unevaluatedProperties`), which
+    // findBooleanSubschemas already excludes.
+    //
+    // `not` is the other subtree the transform never descends — it demotes the
+    // whole keyword to `description` prose — so a boolean ANYWHERE under `not`
+    // is accepted and must not be blocked. Being merely stricter than the vendor
+    // is this project's most repeated bug, so it is excluded below.
+    //
+    // `prefixItems` is nonetheless still blocked here, and deliberately: the
+    // question is what OUR OUTPUT contains, not what the input did (#342). Our
+    // own homogeneous-tuple collapse (#346) rewrites `prefixItems: [true]` into
+    // `items: true`, moving the boolean out of the one slot the vendor tolerates
+    // and into one it raises on. A rule keyed on the input position would have
+    // excluded this row as vendor-safe and shipped a document that cannot be
+    // built. `not` is not rewritten by us, so it stays where the vendor tolerates
+    // it — same question, opposite answers, decided by whether WE move the node.
     if (outputFormatPath) {
       findBooleanSubschemas(s).forEach(function (h) {
         if (goSdk) {
@@ -2321,12 +2350,19 @@
             url, true));
           return;
         }
-        if (pythonSdk) return;   // not probed for this shape — claim nothing
+        // Measured, not assumed: `transform_schema` demotes `not` to prose
+        // before descending, so every boolean below it is accepted verbatim.
+        if (pythonSdk && h.path.indexOf("/not") !== -1) return;
         ledger.push(entry("!", h.path,
-          booleanSubschemaMessage(h.value,
-            "The TypeScript `output_format` transformer rejects it: `transformJSONSchema` throws " +
-            "`JSON schema must have a type defined if anyOf/oneOf/allOf are not used`, because a " +
-            "boolean carries no `type` for it to dispatch on." + VERBATIM_ESCAPE),
+          booleanSubschemaMessage(h.value, pythonSdk
+            ? "The Python `output_format` transformer rejects it: `transform_schema` " +
+              "(anthropic==0.121.0) walks every sub-schema as a mapping and raises " +
+              "`TypeError: 'bool' object is not a mapping` on the boolean, so the request " +
+              "is never built. Note the Go SDK keeps the same bytes verbatim, so this is a " +
+              "fact about the client you are using, not about Anthropic." + VERBATIM_ESCAPE
+            : "The TypeScript `output_format` transformer rejects it: `transformJSONSchema` throws " +
+              "`JSON schema must have a type defined if anyOf/oneOf/allOf are not used`, because a " +
+              "boolean carries no `type` for it to dispatch on." + VERBATIM_ESCAPE),
           url));
       });
 
