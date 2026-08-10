@@ -478,8 +478,12 @@ var INSTRUCTOR_ANTHROPIC = JSON.stringify({
 
   var json = run(["--to", "anthropic-json", "--check"], INSTRUCTOR_ANTHROPIC);
   ok("--check --to anthropic-json exits 1 on the same payload", json.status === 1, json.stderr);
+  // #367: was keyed on the literal "NOT enforced on the `output_format`". That
+  // premise was falsified — the transform is per-call-site, not per-field — so
+  // the assertion is re-keyed on the property it was really testing.
   ok("anthropic-json explains the demote-to-prose loss",
-    /NOT enforced on the .output_format/.test(json.stderr), json.stderr);
+    /is NOT enforced/.test(json.stderr) &&
+    /appended to this node's .description./.test(json.stderr), json.stderr);
 
   var out = run(["--to", "anthropic"], INSTRUCTOR_ANTHROPIC);
   ok("--to anthropic emits the schema unchanged",
@@ -1390,6 +1394,44 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
       return (p.stdout + p.stderr).indexOf(MARK) === -1 && p.status === 0; })());
 })();
 
+// ---------------------------------------------------------------------------
+// #367 — the demote-to-prose condition must reach the installed binary, must
+// differ per SDK, must NOT appear on Go or the tools path, and must never fail
+// the gate (the request is accepted either way — #317).
+// ---------------------------------------------------------------------------
+(function () {
+  var SCH = JSON.stringify({
+    type: "object",
+    properties: { code: { type: "string", pattern: "^[A-Z]{3}$", minLength: 3 } },
+    required: ["code"]
+  });
+  var js = run(["--to", "anthropic-json", "--check"], SCH);
+  var py = run(["--to", "anthropic-json-python", "--check"], SCH);
+  var go = run(["--to", "anthropic-go", "--check"], SCH);
+  var tools = run(["--to", "anthropic", "--check"], SCH);
+
+  ok("#367 CLI: the JS target prints the call-site condition",
+    /conditional on how you hand the schema over/.test(js.stderr), js.stderr);
+  ok("#367 CLI: the JS target names the helper-only call sites",
+    /four call sites and all four are HELPERS/.test(js.stderr), js.stderr);
+  ok("#367 CLI: the python target names output_config and the deprecation",
+    /output_config/.test(py.stderr) && /DeprecationWarning/.test(py.stderr), py.stderr);
+  ok("#367 CLI: the two SDKs print DIFFERENT conditions",
+    /is_dict\(output_format\)/.test(py.stderr) &&
+    !/is_dict\(output_format\)/.test(js.stderr), py.stderr);
+  // Discriminator: Go has no non-transforming form, so it must not be told the
+  // demotion is conditional.
+  ok("#367 CLI: Go is NOT told the demotion is conditional",
+    !/conditional on how you hand the schema over/.test(go.stderr), go.stderr);
+  ok("#367 CLI: the tools path is not told either",
+    !/conditional on how you hand the schema over/.test(tools.stderr), tools.stderr);
+  // Advisory only — the schema is legal on every one of these targets.
+  ok("#367 CLI: the condition never fails the gate",
+    js.status === 0 && py.status === 0 && go.status === 0 && tools.status === 0,
+    "statuses: " + [js.status, py.status, go.status, tools.status].join(","));
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 // --- #363: exit codes for shapes the walk MANUFACTURED --------------------
 // A blocker is exit 3 and a fixable schema is exit 1, and the distinction is the
@@ -1451,6 +1493,44 @@ console.log("\n" + pass + " passed, " + fail + " failed");
   ok("#366 CLI: realtime is not told about the AUTO surfaces",
     !/NOT non-strict everywhere/.test(rt.stderr), rt.stderr.slice(0, 300));
   ok("#366 CLI: realtime still exits 0", rt.status === 0, "status=" + rt.status);
+})();
+
+
+// ---------------------------------------------------------------------------
+// #367 — the demote-to-prose condition must reach the installed binary, must
+// differ per SDK, must NOT appear on Go or the tools path, and must never fail
+// the gate (the request is accepted either way — #317).
+// ---------------------------------------------------------------------------
+(function () {
+  var SCH = JSON.stringify({
+    type: "object",
+    properties: { code: { type: "string", pattern: "^[A-Z]{3}$", minLength: 3 } },
+    required: ["code"]
+  });
+  var js = run(["--to", "anthropic-json", "--check"], SCH);
+  var py = run(["--to", "anthropic-json-python", "--check"], SCH);
+  var go = run(["--to", "anthropic-go", "--check"], SCH);
+  var tools = run(["--to", "anthropic", "--check"], SCH);
+
+  ok("#367 CLI: the JS target prints the call-site condition",
+    /conditional on how you hand the schema over/.test(js.stderr), js.stderr);
+  ok("#367 CLI: the JS target names the helper-only call sites",
+    /four call sites and all four are HELPERS/.test(js.stderr), js.stderr);
+  ok("#367 CLI: the python target names output_config and the deprecation",
+    /output_config/.test(py.stderr) && /DeprecationWarning/.test(py.stderr), py.stderr);
+  ok("#367 CLI: the two SDKs print DIFFERENT conditions",
+    /is_dict\(output_format\)/.test(py.stderr) &&
+    !/is_dict\(output_format\)/.test(js.stderr), py.stderr);
+  // Discriminator: Go has no non-transforming form, so it must not be told the
+  // demotion is conditional.
+  ok("#367 CLI: Go is NOT told the demotion is conditional",
+    !/conditional on how you hand the schema over/.test(go.stderr), go.stderr);
+  ok("#367 CLI: the tools path is not told either",
+    !/conditional on how you hand the schema over/.test(tools.stderr), tools.stderr);
+  // Advisory only — the schema is legal on every one of these targets.
+  ok("#367 CLI: the condition never fails the gate",
+    js.status === 0 && py.status === 0 && go.status === 0 && tools.status === 0,
+    "statuses: " + [js.status, py.status, go.status, tools.status].join(","));
 })();
 
 

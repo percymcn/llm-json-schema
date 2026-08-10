@@ -1170,10 +1170,19 @@ var INSTRUCTOR_ANTHROPIC = {
   ok("anthropic-json collapses the tuple the tools path keeps",
     json.schema.properties.bbox.prefixItems === undefined &&
     json.schema.properties.bbox.items !== undefined);
+  // #367: these two were keyed on the literal prose "NOT enforced on the
+  // `output_format`", which #367 corrected — the demotion is a property of how
+  // the schema is handed over, not of the request field. The property under test
+  // (this path reports the demotion, the tools path does not) is orthogonal to
+  // the wording, so it is re-keyed on the stable half AND strengthened to
+  // require the new condition clause.
   ok("anthropic-json still reports maxLength as demoted to prose",
-    has(json.ledger, "NOT enforced on the `output_format`"));
+    has(json.ledger, "is NOT enforced") && has(json.ledger, "appended to this node's `description`"));
+  ok("anthropic-json says the demotion is conditional on the call site",
+    has(json.ledger, "conditional on how you hand the schema over"));
   ok("anthropic tools path does NOT emit the demote-to-prose notes",
-    !has(tools.ledger, "NOT enforced on the `output_format`"));
+    !has(tools.ledger, "appended to this node's `description`") &&
+    !has(tools.ledger, "conditional on how you hand the schema over"));
 })();
 
 (function () {
@@ -6167,6 +6176,102 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   ok("#366 the schema still passes through byte-identical",
     JSON.stringify(loose.schema) === JSON.stringify(SCH) &&
     JSON.stringify(rt.schema) === JSON.stringify(SCH));
+})();
+
+
+// ---------------------------------------------------------------------------
+// #367 — `anthropic-json` is named for a CONDITION ("the structured-output
+// path") and that condition does NOT decide whether Anthropic's demote-to-prose
+// transform runs. Measured 2026-08-10: TS calls it from HELPERS ONLY (four call
+// sites, two accepting `{transform:false}`), and Python guards it behind
+// `if is_dict(output_format)` while the RECOMMENDED `output_config.format`
+// parameter never transforms at all.
+// ---------------------------------------------------------------------------
+(function () {
+  function led(r, sub) {
+    return (r.ledger || []).some(function (l) { return String(l.msg || "").indexOf(sub) !== -1; });
+  }
+  var SCH = {
+    type: "object",
+    properties: { code: { type: "string", pattern: "^[A-Z]{3}$", minLength: 3 } },
+    required: ["code"]
+  };
+  var cp = function () { return JSON.parse(JSON.stringify(SCH)); };
+
+  // Guarded: with engine.js reverted this export does not exist, and an
+  // unguarded `.some()` on undefined aborts the whole file, hiding every
+  // assertion after it (#322's trap). A missing table must REPORT as failures.
+  var T = Array.isArray(E.ANTHROPIC_TRANSFORM_SURFACES) ? E.ANTHROPIC_TRANSFORM_SURFACES : [];
+  ok("#367 ANTHROPIC_TRANSFORM_SURFACES is exported",
+    Array.isArray(E.ANTHROPIC_TRANSFORM_SURFACES) && T.length === 10);
+  // Guard against a vacuous table: BOTH verdicts must be present, or an
+  // all-true/all-false list would satisfy every assertion below (#340).
+  ok("#367 the table carries both verdicts",
+    T.some(function (r) { return r.transforms; }) &&
+    T.some(function (r) { return !r.transforms; }));
+  ok("#367 both languages are represented",
+    T.some(function (r) { return r.lang === "ts"; }) &&
+    T.some(function (r) { return r.lang === "py"; }));
+  // The finding in one row: the parameter the SDK's own DeprecationWarning
+  // points at does NOT transform.
+  ok("#367 the recommended python parameter does not transform",
+    T.some(function (r) {
+      return r.lang === "py" && r.form.indexOf("output_config") !== -1 && r.transforms === false;
+    }));
+  ok("#367 exactly one python form transforms, and it is the deprecated one",
+    T.filter(function (r) { return r.lang === "py" && r.transforms; }).length === 1 &&
+    T.filter(function (r) { return r.lang === "py" && r.transforms; })[0].form.indexOf("deprecated") !== -1);
+  ok("#367 the TS opt-out rows are the two json-schema helpers",
+    T.filter(function (r) { return r.lang === "ts" && !r.transforms; }).length === 3);
+  ok("#367 every row names a concrete call form", T.every(function (r) {
+    return typeof r.form === "string" && r.form.length > 8 && typeof r.transforms === "boolean";
+  }));
+
+  var js = E.toAnthropic(cp(), true, "js");
+  var py = E.toAnthropic(cp(), true, "python");
+  var go = E.toAnthropic(cp(), true, "go");
+  var tools = E.toAnthropic(cp(), false);
+
+  ok("#367 the JS target says the demotion is conditional",
+    led(js, "conditional on how you hand the schema over"));
+  ok("#367 the JS target names the helper-only call sites and the opt-out",
+    led(js, "four call sites and all four are HELPERS") && led(js, "{ transform: false }"));
+  ok("#367 the JS target names the inline no-helper escape",
+    led(js, "inline `{ type: \"json_schema\", schema }`"));
+  ok("#367 the python target says the demotion is conditional",
+    led(py, "conditional on how you hand the schema over"));
+  ok("#367 the python target names the is_dict guard and output_config",
+    led(py, "if is_dict(output_format)") && led(py, "output_config"));
+  ok("#367 the python target names the deprecation direction",
+    led(py, "DeprecationWarning"));
+  // The two SDKs must give DIFFERENT explanations — a single generalised
+  // sentence would satisfy every assertion above.
+  ok("#367 the two SDKs' conditions genuinely differ",
+    !led(js, "if is_dict(output_format)") && !led(py, "four call sites and all four are HELPERS"));
+  // THE DISCRIMINATOR (#366's Realtime pair): Go has no non-transforming form,
+  // so it must KEEP the categorical claim. Without this row the rule could be
+  // firing blanket and everything above would still pass.
+  // (`pattern` is in Go's `supportedSchemaKeys`, so the demoted keyword here is
+  // `minLength`, reported via #361's formatExtraValue path — the categorical
+  // wording is "enforced by the Go SDK", not the structured-output phrasing.)
+  ok("#367 Go keeps the categorical claim and gets NO condition clause",
+    !led(go, "conditional on how you hand the schema over") &&
+    led(go, "enforced by the Go SDK"));
+  ok("#367 the tools path gets no condition clause either",
+    !led(tools, "conditional on how you hand the schema over"));
+
+  // Advisory only, on every target: the request is accepted either way, so a
+  // gate failure here would be #317's exact mistake.
+  [js, py, go].forEach(function (r) {
+    ok("#367 the condition never becomes a gate failure",
+      (r.ledger || []).every(function (l) {
+        return l.msg.indexOf("conditional on how you hand") === -1 || l.advisory === true;
+      }));
+  });
+  // The document is untouched on this path, so the ledger IS the deliverable.
+  ok("#367 the schema still passes through with the keywords kept",
+    js.schema.properties.code.pattern === "^[A-Z]{3}$" &&
+    js.schema.properties.code.minLength === 3);
 })();
 
 

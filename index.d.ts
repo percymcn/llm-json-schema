@@ -89,13 +89,15 @@ export function toOpenAI(schema: JSONSchema): TransformResult;
 /**
  * Transform a schema for Anthropic.
  *
- * Anthropic has two dialects and the switch is which request field you use, not
- * anything in the schema — so the path is a parameter, never inferred.
+ * Anthropic has two dialects and nothing in the schema selects between them —
+ * so the path is a parameter, never inferred.
  *
  * @param outputFormatPath `false`/omitted targets `tools[].input_schema`, where
- * Anthropic applies no transform and the schema is sent verbatim. `true` targets
- * `output_format: {type: "json_schema"}`, which rebuilds the schema and demotes
- * unrecognised keywords to `description` prose.
+ * neither SDK applies a transform and the schema is sent verbatim. `true` targets
+ * the structured-output path, where the schema is rebuilt and unrecognised
+ * keywords are demoted to `description` prose — but only when the transform
+ * actually runs, which is decided by the CALL SITE and not by the request field:
+ * see {@link ANTHROPIC_TRANSFORM_SURFACES}.
  */
 export function toAnthropic(schema: JSONSchema, outputFormatPath?: boolean): TransformResult;
 /**
@@ -197,6 +199,28 @@ export const OPENAI_STRICT_SURFACES: Array<{
   api: string;
 }>;
 
+/**
+ * Every measured way of reaching Anthropic's structured-output path, and whether
+ * the demote-to-prose transform runs on it.
+ *
+ * The transform is NOT a property of the request field. In TypeScript
+ * (`@anthropic-ai/sdk` 0.116.0) it has four call sites and all four are helpers,
+ * two of which take `{ transform: false }`; an inline `{ type: "json_schema",
+ * schema }` skips it. In Python (`anthropic` 0.121.0) it sits behind
+ * `if is_dict(output_format)`, so only a pydantic *type* on the deprecated
+ * `output_format=` parameter is transformed — the recommended
+ * `output_config.format` never is.
+ *
+ * Go is absent on purpose: both of its helpers transform, so it has no
+ * non-transforming form. Measured snapshot — re-measure after a bump. And
+ * "verbatim" is a claim about the client, not about what the service enforces.
+ */
+export const ANTHROPIC_TRANSFORM_SURFACES: Array<{
+  lang: "ts" | "py";
+  form: string;
+  transforms: boolean;
+}>;
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -213,6 +237,7 @@ declare const api: {
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;
   OPENAI_ANNOTATION_KEYWORDS_LIST: typeof OPENAI_ANNOTATION_KEYWORDS_LIST;
   OPENAI_STRICT_SURFACES: typeof OPENAI_STRICT_SURFACES;
+  ANTHROPIC_TRANSFORM_SURFACES: typeof ANTHROPIC_TRANSFORM_SURFACES;
 };
 
 export default api;

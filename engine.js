@@ -2553,6 +2553,60 @@
   //        NO length, i.e. totally unconstrained. That is the worse outcome, and
   //        it is exactly what zod v4's `z.toJSONSchema(z.tuple([...]))` emits.
 
+  // #367. `--to anthropic-json` is named for a CONDITION — "you are on the
+  // structured-output path rather than the tools path" (#315). Nobody had asked
+  // whether every way of reaching that path agrees, and they do not.
+  //
+  // The demote-to-prose rewrite is NOT a property of the request field. It is a
+  // property of HOW YOU HAND THE SCHEMA OVER, measured 2026-08-10:
+  //
+  //   TypeScript @anthropic-ai/sdk 0.116.0 — `transformJSONSchema` has exactly
+  //   FOUR call sites and every one is a HELPER; it is never called from the
+  //   request path. So an inline `output_config: { format: { type:
+  //   "json_schema", schema } }` (type-legal under --strict, verified with tsc)
+  //   is sent VERBATIM. Two of the four helpers additionally take
+  //   `{ transform: false }` and then skip it (`options?.transform ?? true`).
+  //
+  //   Python anthropic 0.121.0 — `transform_schema` IS in the request path
+  //   (parse/stream/count_tokens), but behind `if is_dict(output_format)`, which
+  //   casts and returns UNTRANSFORMED. Only a pydantic *type* is transformed.
+  //   And the `output_config.format` parameter — the one the SDK's own
+  //   DeprecationWarning tells you to migrate to — never transforms at all:
+  //   every method takes a dict there, and a model is rejected outright
+  //   (`TypeError: Object of type ModelMetaclass is not JSON serializable`).
+  //
+  // So the vendor's own deprecation notice moves a Python caller off the only
+  // demoting form onto a parameter where no demoting form exists.
+  //
+  // Go is deliberately absent from this table and keeps the categorical claim:
+  // #332 measured both of its helpers running `transformSchemaMap`, so it has no
+  // verbatim form. That pair is the discriminator — without it the rule below
+  // could be firing blanket and every other assertion would still pass.
+  //
+  // Honest limit, stated as #361 states its tables: the suite is dependency-free
+  // and cannot run either SDK, so this pins a MEASURED SNAPSHOT of two versions
+  // and re-measuring after a bump is manual. And "verbatim" is a claim about the
+  // CLIENT only — whether the service then enforces the keyword is not
+  // observable without an API key (#343's client-is-not-the-service boundary).
+  var ANTHROPIC_TRANSFORM_SURFACES = [
+    { lang: "ts", form: "jsonSchemaOutputFormat(schema)", transforms: true },
+    { lang: "ts", form: "jsonSchemaOutputFormat(schema, { transform: false })", transforms: false },
+    { lang: "ts", form: "betaJSONSchemaOutputFormat(schema)", transforms: true },
+    { lang: "ts", form: "betaJSONSchemaOutputFormat(schema, { transform: false })", transforms: false },
+    { lang: "ts", form: "zodOutputFormat(zodType)", transforms: true },
+    { lang: "ts", form: "betaZodOutputFormat(zodType)", transforms: true },
+    { lang: "ts", form: "inline { type: \"json_schema\", schema } (no helper)", transforms: false },
+    { lang: "py", form: "output_format=<pydantic type> (deprecated param)", transforms: true },
+    { lang: "py", form: "output_format=<dict> (deprecated param)", transforms: false },
+    { lang: "py", form: "output_config={\"format\": <dict>} (recommended param)", transforms: false }
+  ];
+
+  function anthropicDemotingForms(lang) {
+    return ANTHROPIC_TRANSFORM_SURFACES.filter(function (s) {
+      return s.transforms && (!lang || s.lang === lang);
+    });
+  }
+
   var ANTHROPIC_STRING_FORMATS = {
     "date-time": 1, "time": 1, "date": 1, "duration": 1, "email": 1,
     "hostname": 1, "uri": 1, "ipv4": 1, "ipv6": 1, "uuid": 1
@@ -2904,6 +2958,29 @@
         "`transformSchemaMap` as `BetaJSONSchemaOutputFormat`, so `--to anthropic` (which models the " +
         "TypeScript/Python tools path, where no transform runs) does NOT describe your client."
       : " It IS sent as-is on the `tools[].input_schema` path, so this is kept, not stripped.";
+
+    // #367. Reaching the structured-output path does NOT by itself mean the
+    // rewrite runs — see ANTHROPIC_TRANSFORM_SURFACES. Which of the two branches
+    // a caller is on is not derivable from the schema (it is a fact about their
+    // call site), so per #366 the tool NAMES THE CHECK instead of guessing.
+    // Deliberately empty for Go, which has no non-transforming form.
+    var TRANSFORM_CONDITION = goSdk ? "" :
+      " That is conditional on how you hand the schema over, and the request field does not decide " +
+      "it: " + (pythonSdk
+        ? "in Python the rewrite lives behind `if is_dict(output_format)`, so it runs ONLY for a " +
+          "pydantic *type* passed to the deprecated `output_format=` parameter. A plain dict is cast " +
+          "through untouched, and `output_config={\"format\": ...}` — the parameter the SDK's own " +
+          "DeprecationWarning tells you to migrate to — never transforms on any method, because it " +
+          "takes a dict and rejects a model outright. So following the deprecation notice moves you " +
+          "off the only demoting form"
+        : "in TypeScript `transformJSONSchema` has four call sites and all four are HELPERS, never " +
+          "the request path. It runs for `jsonSchemaOutputFormat`/`betaJSONSchemaOutputFormat` " +
+          "(unless you pass `{ transform: false }`) and for the two zod helpers (no opt-out). An " +
+          "inline `{ type: \"json_schema\", schema }` written straight into the request — type-legal " +
+          "under `--strict` — skips it entirely") +
+      ". On the non-transforming forms this keyword is NOT rewritten into prose; it goes on the wire " +
+      "as you wrote it, and whether the service then enforces it is not something this tool can " +
+      "observe. Check your call site against the list above rather than assuming.";
 
     // Both paths: nothing on Anthropic's side ever RESOLVES a `$ref`, so a
     // pointer in a spelling that does not resolve locally is dead either way.
@@ -3616,10 +3693,10 @@
               ? "`supportedSchemaKeys` lists it, but `transformSchema`'s per-type branch demotes this " +
                 "particular value anyway, so"
               : "it is not in `supportedSchemaKeys`, so")
-          : " on the `output_format` (structured output) path. Anthropic's transformer does not " +
-            "recognise it, so") +
+          : " on the structured-output path WHENEVER ANTHROPIC'S TRANSFORM RUNS. The transformer does " +
+            "not recognise it, so") +
         " it is appended to this node's `description` as text — the model is told about it but " +
-        "nothing validates it." + VERBATIM_ESCAPE + extra,
+        "nothing validates it." + TRANSFORM_CONDITION + VERBATIM_ESCAPE + extra,
         url, true));
     });
 
@@ -3630,11 +3707,13 @@
           "they are the point: `transformSchemaMap` accepts this schema and then quietly demotes what " +
           "`supportedSchemaKeys` does not list, and deletes outright what `invopop/jsonschema` does " +
           "not model. Both of Go's helpers run it, so there is no verbatim surface to fall back to."
-        : "No structural changes needed for the `output_format` path — but read the unenforced-keyword " +
-        "notes above, because they are the point: the transformer accepts this schema and then " +
-        "silently demotes what it does not recognise to `description` prose. If you are sending the " +
-        "schema as `tools[].input_schema` instead, use `--to anthropic`, where it goes on the wire " +
-        "verbatim and none of those notes apply.",
+        : "No structural changes needed for the structured-output path — but read the " +
+        "unenforced-keyword notes above, because they are the point: WHEN THE TRANSFORM RUNS it " +
+        "accepts this schema and then silently demotes what it does not recognise to `description` " +
+        "prose. Whether it runs is decided by your call site, not by the request field — see the " +
+        "condition spelled out in those notes. If you are sending the schema as " +
+        "`tools[].input_schema` instead, use `--to anthropic`, where it goes on the wire verbatim " +
+        "and none of those notes apply.",
         url));
     }
     noteEmptiedDocument(schema, s, ledger, url, ANTHROPIC_EMPTIED_REMEDY);
@@ -5112,6 +5191,15 @@
     // re-diffable rather than re-derived.
     OPENAI_STRICT_SURFACES: OPENAI_STRICT_SURFACES.map(function (s) {
       return { path: s.path, file: s.file, line: s.line, unset: s.unset, api: s.api };
+    }),
+
+    // Every measured way of reaching Anthropic's structured-output path, and
+    // whether the demote-to-prose transform runs on it. Exported for #361's
+    // reason plus #366's: `anthropic-json` is named for a CONDITION whose
+    // meaning turns out to be per-call-site rather than per-request-field, so
+    // the grouping IS the finding and should be re-diffable, not re-derived.
+    ANTHROPIC_TRANSFORM_SURFACES: ANTHROPIC_TRANSFORM_SURFACES.map(function (s) {
+      return { lang: s.lang, form: s.form, transforms: s.transforms };
     }),
 
     // The `format` VALUES Anthropic's transformer keeps on a string. Exported

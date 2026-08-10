@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1015 engine + 238 CLI + 40 ESM/library assertions = **1293** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1036 engine + 252 CLI + 41 ESM/library assertions = **1329** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -149,12 +149,55 @@ it pins a **measured snapshot**, and re-measuring is a manual step.
   - **`--to openai-realtime`** — the same dialect, for the surface where it is not a choice: `RealtimeFunctionTool` has no `strict` field at all.
 
   **Some clients decide this for you.** [Instructor](https://github.com/567-labs/instructor) omits `strict` on *every* OpenAI path — `Mode.TOOLS` (the default), `Mode.JSON_SCHEMA`, and `Mode.TOOLS_STRICT`, which is deprecated and collapses to `Mode.TOOLS`, so asking for strict silently gets you non-strict. Measured on `instructor==1.15.4`: no `strict` key in any of the three payloads. Gating those against the strict rules fails CI on a schema the API accepts as written.
-- **Anthropic also has TWO paths, but the switch is *which request field you use*, not a key in the schema** (verified against `@anthropic-ai/sdk@0.116.0`). Because nothing in the schema tells you which one you are on, each is its own target:
+- **Anthropic also has TWO paths, and nothing in the schema tells you which one you are on** (verified against `@anthropic-ai/sdk@0.116.0`). Because of that, each is its own target. *A caveat this README got wrong until Cycle #367: the switch is **not** simply "which request field you use" — reaching the structured-output field does not by itself mean the transform runs. See [When the Anthropic transform actually runs](#when-the-anthropic-transform-actually-runs).*
   - **`--to anthropic` → `tools[].input_schema`** — no client-side transform at all. Your JSON Schema is attached verbatim; the only check is that the root is `type: "object"`. Tuples, `maxLength`, `format`, a draft-07 `definitions` bag and a non-exclusive `oneOf` all survive untouched, so this target reports them as fine rather than "fixing" them. `strict: true` goes on the **tool**, not the schema — the SDK documents it as *"guarantees schema validation on tool names and inputs"*; without it the schema is guidance the model can violate.
-  - **`--to anthropic-json` → the structured-output path** (`output_format` / `output_config`: `{ type: "json_schema" }`) — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`**.
+  - **`--to anthropic-json` → the structured-output path** (`output_format` / `output_config`: `{ type: "json_schema" }`) — `lib/transform-json-schema.js` rebuilds the schema from a small allowlist, and **anything it doesn't recognise is `JSON.stringify`'d into that node's `description`** — *when it runs*; see below.
   - **`--to anthropic-json-python`** — the same path, as implemented by the **Python** `anthropic` SDK, which is not the same program. This split is by **SDK language, not version**: `anthropic==0.116.0` and `@anthropic-ai/sdk@0.116.0` carry the same version string and disagree, so it is not a skew you can upgrade past.
 
   - **`--to anthropic-go`** — `github.com/anthropics/anthropic-sdk-go`, and it is a **third** implementation, not an alias of either. Pick it for **any** use of that SDK, tools included: Go is the one language where `tools[].input_schema` is *not* verbatim, because `BetaToolInputSchema` calls the same `transformSchemaMap` as `BetaJSONSchemaOutputFormat` (`schemautil.go`). Measured identical output from both helpers on all 19 shapes probed, on `v1.62.0`.
+
+
+### When the Anthropic transform actually runs
+
+`--to anthropic-json` is named for a **condition** — "you are on the structured-output
+path rather than the tools path". Reaching that path does **not** by itself mean the
+demote-to-prose rewrite happens. Measured 2026-08-10 on `@anthropic-ai/sdk@0.116.0`
+and `anthropic==0.121.0`:
+
+| how you hand the schema over | transform runs? |
+|---|---|
+| TS `jsonSchemaOutputFormat(schema)` / `betaJSONSchemaOutputFormat(schema)` | **yes** |
+| TS the same two with `{ transform: false }` | no |
+| TS `zodOutputFormat(z)` / `betaZodOutputFormat(z)` (no opt-out) | **yes** |
+| TS inline `{ type: "json_schema", schema }`, no helper | no |
+| PY `output_format=<pydantic type>` (deprecated parameter) | **yes** |
+| PY `output_format=<dict>` (deprecated parameter) | no |
+| PY `output_config={"format": <dict>}` (**recommended** parameter) | no |
+
+In TypeScript, `transformJSONSchema` has exactly **four call sites and every one is a
+helper** — it is never called from the request path, so an inline object (type-legal
+under `--strict`, verified with `tsc`) is sent verbatim. In Python the transform *is*
+in the request path (`parse`/`stream`/`count_tokens`) but sits behind
+`if is_dict(output_format):`, which casts a plain dict through untouched; only a
+pydantic **type** is transformed.
+
+The sharp part: `output_format` is `@deprecated` in favour of `output_config.format`
+in both SDKs, and `output_config.format` **never** transforms — it takes a dict on
+every method and rejects a model outright. So following the SDK's own
+`DeprecationWarning` moves a Python caller off the only demoting form.
+
+The tool cannot see your call site, so it does not guess: it reports the demotion
+**with the condition attached** and tells you which list to check yourself. Both
+branches are advisory and never fail `--check` — the request is accepted either way.
+`--to anthropic-go` deliberately keeps the categorical claim, because [both of Go's
+helpers run the transform](#anthropic-ships-three-sdks) and it has no verbatim form.
+
+Two honest limits. "Verbatim" is a claim about the **client** — whether the service
+then enforces the keyword is not observable without an API key ([a client is not the
+service](#a-client-is-not-the-service)). And the table is a measured snapshot of two
+versions; it is exported as `ANTHROPIC_TRANSFORM_SURFACES` so it can be re-diffed
+rather than re-derived, but re-measuring after a version bump is manual.
+
 
   **Anthropic ships three SDKs with three different supported-key sets, at the same vendor.** Measured 2026-08-09 by calling each SDK's own transform:
 
@@ -619,7 +662,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1293 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1329 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
