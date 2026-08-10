@@ -5191,9 +5191,12 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 
   // The typed control must still get the reassuring note -- and must NOT get
   // the destruction note. This pair is what makes the two branches meaningful.
+  // #359 widened this claim: the note now says the whole SUBTREE is intact,
+  // which is a stronger statement than the original "leaves it intact" and is
+  // only made when it is true. Asserted as a pair with its negative below.
   ok("#358: a typed value schema still gets the preservation note",
     has(conv({ type: "object", additionalProperties: { type: "string" } }, "anthropic-go"),
-      "leaves it intact"));
+      "leaves the subtree intact"));
 
   // We never strip: the value schema stays in our output, which is what makes
   // the remedy actionable (#318 -- leave the shape visible).
@@ -5202,6 +5205,172 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
       var r = E.convert(JSON.parse(JSON.stringify(ZOD_NEVER)), "anthropic-go") || {};
       var ap = r.schema && r.schema.additionalProperties;
       return !!ap && typeof ap === "object" && ap.not !== undefined;
+    })());
+})();
+
+// ---------------------------------------------------------------------------
+// #359 -- the vendor's recursion does not stop where our rule stopped.
+//
+// #358 mirrored Go's guard for the value schema sitting IN `additionalProperties`
+// and, in the clean case, printed "recurses into the value schema ... leaves it
+// intact". That recursion keeps going. walk() never enters `additionalProperties`
+// at all, so every rule is blind below that edge -- and the one rule that read
+// through it read exactly one level and then affirmatively reassured about the
+// rest. Measured on anthropic-sdk-go@v1.62.0.
+// ---------------------------------------------------------------------------
+(function () {
+  var MARK = "will REPLACE IT with the literal JSON `true`";
+  var CALM = "leaves the subtree intact";
+  function conv(s, t) { return E.convert(JSON.parse(JSON.stringify(s)), t) || {}; }
+  function has(r, sub) {
+    return (r.ledger || []).some(function (l) { return String(l.msg || "").indexOf(sub) !== -1; });
+  }
+  function blockers(r) {
+    return (r.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; }).length;
+  }
+
+  // VERBATIM zod@4.4.3 output for `z.record(z.string(), z.object({ x: z.never() }))`
+  // (#311 -- generate the input with the tool the audience uses). The value
+  // model is INLINED under `additionalProperties`, which is what puts it in a
+  // position nothing reached.
+  var ZOD_REC_NEVER = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: {
+      type: "object", properties: { x: { not: {} } },
+      required: ["x"], additionalProperties: false
+    }
+  };
+  // `z.record(z.string(), z.record(z.string(), z.never()))` -- two map edges.
+  var ZOD_REC_REC = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: {
+      type: "object", propertyNames: { type: "string" },
+      additionalProperties: { not: {} }
+    }
+  };
+
+  // Measured: the SDK returns `{"additionalProperties":{...,"properties":{"x":true},...}}`
+  // -- a property that admitted NO value now admits every value.
+  ok("#359: a typeless node below a map edge is reported",
+    has(conv(ZOD_REC_NEVER, "anthropic-go"), MARK));
+  ok("#359: it is a blocker, matching the same defect in a walked position",
+    blockers(conv(ZOD_REC_NEVER, "anthropic-go")) === 1);
+  ok("#359: the destroyed node's own path is named, not just the map's",
+    (conv(ZOD_REC_NEVER, "anthropic-go").ledger || []).some(function (l) {
+      return l.op === "!" && l.path === "root{}.x";
+    }));
+  ok("#359: a second map edge is followed too",
+    has(conv(ZOD_REC_REC, "anthropic-go"), MARK));
+  ok("#359: depth is not capped at one level below the map",
+    has(conv({
+      type: "object",
+      additionalProperties: {
+        type: "object",
+        properties: { inner: { type: "object", properties: { deep: { not: {} } }, required: ["deep"] } },
+        required: ["inner"]
+      }
+    }, "anthropic-go"), MARK));
+  ok("#359: an array item below a map edge is reached",
+    has(conv({ type: "object", additionalProperties: { type: "array", items: { description: "no type" } } },
+      "anthropic-go"), MARK));
+
+  // THE FALSE REASSURANCE. #358's note named the mechanism of the harm
+  // ("recurses into the value schema") as the comfort. It must not be printed
+  // when that recursion destroys something. This pair is the whole fix.
+  ok("#359: the reassuring note is NOT printed when the subtree is destroyed",
+    !has(conv(ZOD_REC_NEVER, "anthropic-go"), CALM));
+  ok("#359: the reassuring note IS printed when the subtree really is clean",
+    has(conv({
+      type: "object",
+      additionalProperties: { type: "object", properties: { x: { type: "string" } }, required: ["x"] }
+    }, "anthropic-go"), CALM));
+
+  // --- mirror fidelity: five clauses read off schemautil.go -----------------
+  // Each is a place the vendor STOPS. Reporting past any of them would be the
+  // stricter-than-the-vendor bug this project has shipped repeatedly.
+  //
+  // Clause 3: with declared `properties`, the object branch overwrites
+  // `additionalProperties` with `false` and never visits the value -- so the
+  // #356 typed-catchall shape must NOT be descended.
+  ok("#359 mirror: a typed catchall's value subtree is not descended (clause 3)",
+    !has(conv({
+      type: "object", properties: { a: { type: "string" } }, required: ["a"],
+      additionalProperties: { type: "object", properties: { x: { not: {} } }, required: ["x"] }
+    }, "anthropic-go"), MARK));
+  // Clause 4: `Items` is a `*Schema`; the draft-07 array form fails to
+  // unmarshal and takes the whole document to null -- #332's rule owns that.
+  ok("#359 mirror: array-form `items` below a map is not descended (clause 4)",
+    !has(conv({ type: "object", additionalProperties: { type: "array", items: [{ not: {} }] } },
+      "anthropic-go"), MARK));
+  // Clause 5: the switch is on a STRING type, so a union-typed node reaches no
+  // branch and nothing below it is visited.
+  ok("#359 mirror: a union-typed node below a map is not descended (clause 5)",
+    !has(conv({ type: "object", additionalProperties: { type: ["object", "null"], properties: { x: { not: {} } } } },
+      "anthropic-go"), MARK));
+  // Clause 1: anyOf/allOf recurse unconditionally, before the type switch.
+  ok("#359 mirror: an `anyOf` branch below a map IS descended (clause 1)",
+    has(conv({
+      type: "object",
+      additionalProperties: { anyOf: [{ type: "string" }, { type: "object", properties: { x: { not: {} } }, required: ["x"] }] }
+    }, "anthropic-go"), MARK));
+  // Clause 2: the vendor bails on a zeroing node, so nothing below one is
+  // reached -- and #358 already reports the value schema itself, so reporting
+  // its children too would double-count a subtree the SDK never looks at.
+  ok("#359 mirror: nothing below a node that itself zeroes out is reported (clause 2)",
+    (conv({ type: "object", additionalProperties: { description: "typeless", properties: { x: { not: {} } } } },
+      "anthropic-go").ledger || []).filter(function (l) {
+        return String(l.msg || "").indexOf(MARK) !== -1;
+      }).length === 0);
+
+  // --- over-block guards ----------------------------------------------------
+  // `{}` and `true` are the same schema, so Go's `true` is faithful (#347/#358).
+  ok("#359 guard: an unconstrained `{}` below a map stays quiet",
+    !has(conv({ type: "object", additionalProperties: { type: "object", properties: { x: {} }, required: ["x"] } },
+      "anthropic-go"), MARK));
+  ok("#359 guard: a fully typed map subtree stays quiet",
+    !has(conv({
+      type: "object",
+      additionalProperties: { type: "object", properties: { x: { type: "string" } }, required: ["x"] }
+    }, "anthropic-go"), MARK));
+  ok("#359 guard: an ordinary closed object is untouched",
+    !has(conv({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "anthropic-go"), MARK));
+
+  // Pydantic is NOT affected and must not be double-reported: `Dict[str, Model]`
+  // routes the value model out to `$defs`, a position walk() already reaches,
+  // so the existing typeless blocker owns it. Verbatim pydantic 2.13.4 output
+  // for `Dict[str, Inner]` where `Inner.x: Any`.
+  var PYD = {
+    "$defs": { Inner: { properties: { x: { title: "X" } }, required: ["x"], title: "Inner", type: "object" } },
+    properties: { m: { additionalProperties: { $ref: "#/$defs/Inner" }, title: "M", type: "object" } },
+    required: ["m"], title: "M1", type: "object"
+  };
+  ok("#359: the pydantic route is covered by the existing rule, not this one",
+    !has(conv(PYD, "anthropic-go"), MARK));
+  ok("#359: and it is still reported exactly once, by that rule",
+    blockers(conv(PYD, "anthropic-go")) === 1);
+
+  // --- per-target scope, measured not ported (rule 0-bis) -------------------
+  // Only Go preserves the map AND recurses into the value. Measured 2026-08-10:
+  // the TypeScript and Python `output_format` transformers both return
+  // `{"type":"object","properties":{},"additionalProperties":false}` for the
+  // destroying shape AND for a typed control -- identical, so they never read
+  // the value and there is nothing below to lose. `betaTool` returns both
+  // byte-identical. `openai` blocks the open map outright (#329).
+  ["anthropic", "anthropic-json", "anthropic-json-python", "openai",
+   "openai-nonstrict", "openai-realtime", "gemini", "gemini-json", "gemini-client"].forEach(function (t) {
+    ok("#359 scope: " + t + " does not claim the Go-only deep loss",
+      !has(conv(ZOD_REC_NEVER, t), MARK));
+  });
+
+  // We never strip: the subtree stays in our output so the remedy is
+  // actionable (#318), and a second pass says the same thing (idempotent).
+  ok("#359: the destroyed node survives our own output",
+    (function () {
+      var r = conv(ZOD_REC_NEVER, "anthropic-go");
+      var ap = r.schema && r.schema.additionalProperties;
+      return !!ap && ap.properties && ap.properties.x && ap.properties.x.not !== undefined;
     })());
 })();
 

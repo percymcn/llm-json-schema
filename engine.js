@@ -118,6 +118,79 @@
       node.const === undefined;
   }
 
+  // #358 mirrored the vendor's guard for the value schema SITTING IN
+  // `additionalProperties`. It stopped there, and the note it prints in the
+  // clean case says the quiet part out loud: "recurses into the value schema".
+  // That recursion does not stop either -- `transformSchema` keeps going down
+  // whatever it finds, so a map whose VALUE is a well-typed object can still
+  // have a node three levels below it replaced with `true`.
+  //
+  // walk() never enters `additionalProperties`, so EVERY rule keyed on it is
+  // blind below that edge (#356 recorded the walker gap; this is a rule that
+  // composes with it). Widening walk() itself would fire these rules below the
+  // map for all ten targets, and only Go looks there -- so instead this mirrors
+  // `transformSchema`'s OWN recursion, clause for clause. Measured against
+  // anthropic-sdk-go@v1.62.0 `schemautil.go`:
+  //
+  //   1. `anyOf` and `allOf` recurse unconditionally, BEFORE the type switch.
+  //   2. The bail (`*s = jsonschema.Schema{}`) runs before the switch, so a
+  //      node that zeroes out is never descended into.
+  //   3. `case "object"` recurses into `properties` values IF there are any --
+  //      and in that branch `additionalProperties` is overwritten with `false`,
+  //      so the value schema is NOT visited. Only the `else if` dictionary
+  //      clause (no properties) descends into it. Same discriminator as #356,
+  //      pointing the same way the vendor points it.
+  //   4. `case "array"` recurses into `items`, object form only -- `Items` is a
+  //      `*Schema`, so the draft-07 array form fails to unmarshal and takes the
+  //      whole document to `null` (#332's rule owns that, not this one).
+  //   5. The switch is on a STRING `Type`, so a union-typed node matches no
+  //      case and nothing below it is reached (and a union `type` is itself the
+  //      #332 total loss).
+  //
+  // Only nodes reached THROUGH an `additionalProperties` edge are returned:
+  // everything else on Go's path is already covered by walk().
+  function goTrueNodesUnderMaps(root) {
+    var found = [];
+    // Three positions, and the distinctions are load-bearing:
+    //   near      -- the NEAREST enclosing map, named in the message.
+    //   owner     -- the OUTERMOST map, i.e. the one walk() can actually reach.
+    //                The open-map note is attached there, so that is the key
+    //                the note filters on; a nested map has no note of its own.
+    //   immediate -- the value schema sitting directly in a map walk() reaches.
+    //                #358's rule already owns exactly that node. A nested map's
+    //                immediate value is NOT owned by anyone else, because
+    //                walk() never reached the nested map to notice it.
+    function descend(node, path, near, owner, immediate) {
+      if (!isPlainObject(node)) return;
+      ["anyOf", "allOf"].forEach(function (kw) {   // clause 1: before the bail
+        if (Array.isArray(node[kw])) {
+          node[kw].forEach(function (sub, i) {
+            descend(sub, path + "/" + kw + "[" + i + "]", near, owner, false);
+          });
+        }
+      });
+      if (goReplacesWithTrue(node)) {              // clause 2: the vendor bails here
+        if (near !== null && !immediate) found.push({ path: path, mapPath: near, owner: owner });
+        return;
+      }
+      if (typeof node.type !== "string") return;                 // clause 5
+      if (node.type === "object") {                              // clause 3
+        if (isPlainObject(node.properties) && Object.keys(node.properties).length) {
+          Object.keys(node.properties).forEach(function (k) {
+            descend(node.properties[k], path + "." + k, near, owner, false);
+          });
+        } else if (isPlainObject(node.additionalProperties)) {
+          descend(node.additionalProperties, path + "{}", path,
+            owner === null ? path : owner, near === null);
+        }
+      } else if (node.type === "array") {                        // clause 4
+        if (isPlainObject(node.items)) descend(node.items, path + "[]", near, owner, false);
+      }
+    }
+    descend(root, "root", null, null, false);
+    return found;
+  }
+
   // A TYPED CATCHALL is the shape isOpenMap deliberately excludes one line
   // above: declared `properties` AND an `additionalProperties` that still
   // carries a schema. `z.object({...}).catchall(...)` emits exactly this
@@ -2807,6 +2880,32 @@
     // "additionalProperties":false}`, i.e. a field that can only ever be `{}`.
     // Advisory, never a gate failure, because the request still returns 200 —
     // that is the established policy for everything this path destroys.
+    //
+    // On the Go path, first find every node BELOW a map edge that the SDK's own
+    // recursion will overwrite with `true`. This has to run before the walk
+    // below, because the reassuring branch of the open-map note is only true
+    // when this comes back empty for that map.
+    var goDeep = goSdk ? goTrueNodesUnderMaps(s) : [];
+    goDeep.forEach(function (d) {
+      // Same defect, same severity as the typeless rule in a walked position:
+      // for `anthropic-go` that is a blocker, and making the identical node
+      // advisory purely because of WHERE it sits would be arbitrary. The
+      // outcome is the same either way — a node silently inverted into
+      // match-anything — so the two positions are made to agree.
+      ledger.push(entry("!", d.path,
+        "This node sits inside `" + d.mapPath + "`'s value schema, and the Go SDK will REPLACE IT " +
+        "with the literal JSON `true`. `transformSchema`'s dictionary clause recurses into " +
+        "`additionalProperties` and then keeps going — into `properties`, `items`, `anyOf` and any " +
+        "further maps below — and every node it reaches without a `type` (or `anyOf`/`allOf`/`enum`/" +
+        "`const` to stand in for one) is overwritten with the zero `jsonschema.Schema`, which " +
+        "marshals as `true`. So a well-typed map value does not protect what is underneath it. " +
+        "Nothing is raised and the request returns 200. Give this node an explicit `type`. " +
+        "(`z.record(z.string(), z.object({ x: z.never() }))` on zod 4 emits exactly this — the " +
+        "value model is inlined under `additionalProperties`, and `x`, which admitted NO value, " +
+        "comes back admitting every value. Pydantic is not affected: it routes the value model out " +
+        "to `$defs`, which is a position this tool already reaches.)",
+        url));
+    });
     walk(s, "root", function (node, path) {
       if (!isOpenMap(node)) return;
       // Measured: the Go SDK is the only one of the three that gets this right.
@@ -2841,11 +2940,21 @@
             url, true));
           return;
         }
+        // Keyed on the OUTERMOST map, not the nearest one: a nested map has no
+        // note of its own, so its losses have to surface under the map the
+        // reader can actually see.
+        var deepHits = goDeep.filter(function (d) { return d.owner === path; });
         ledger.push(entry("=", path,
           "This is an open map (`additionalProperties` with no `properties`), and the Go SDK keeps it " +
           "— `transformSchema` has an explicit dictionary clause that preserves `additionalProperties` " +
-          "and recurses into the value schema. Your value schema declares a `type`, so that recursion " +
-          "leaves it intact. Worth knowing only because the other " +
+          "and recurses into the value schema. " + (deepHits.length
+            ? "That recursion does not stop at the value schema, and it does not leave this subtree " +
+              "intact: " + deepHits.length + " node" + (deepHits.length > 1 ? "s" : "") + " below this map " +
+              "(" + deepHits.map(function (d) { return "`" + d.path + "`"; }).join(", ") + ") " +
+              (deepHits.length > 1 ? "are" : "is") + " overwritten with `true`. See the entr" +
+              (deepHits.length > 1 ? "ies" : "y") + " above."
+            : "Your value schema declares a `type` and nothing below it is typeless, so that " +
+              "recursion leaves the subtree intact.") + " Worth knowing only because the other " +
           "two paths differ: `--to anthropic-json` (TypeScript) rebuilds this node as " +
           "`{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}`, so the field can " +
           "never be populated, and `--to openai` blocks it outright.",
