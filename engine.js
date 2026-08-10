@@ -4228,6 +4228,86 @@
             "the request from its own `Schema` type, stay here. `litellm` 1.96.0 carries " +
             "either form, so it needs no decision.",
             DOCS.gemini, true));
+          return;
+        }
+
+        // #369. The `rest.length <= 1` guard above was written for `["X","null"]`
+        // and is WIDER THAN ITS JUSTIFICATION. #368's trade-off is a decision
+        // about NULLABILITY: keep the union so the three rewriting clients do not
+        // silently lose the null constraint, and accept a loud 400 for the one
+        // forwarding client. A list carrying NO nullability at stake buys those
+        // clients nothing — #365's discriminator, asked of a sub-case — so
+        // leaving it is a pure cost to the forwarder, paid for nothing.
+        //
+        // Measured 2026-08-10 on the live v1beta pre-auth proto, controls in the
+        // `type` slot under test (#344 — bogus key REJECTED, bogus type value
+        // REJECTED, plain reaching `API key not valid`):
+        //   `["string"]`  REJECTED (`Proto field is not repeating, cannot start list`)
+        //   `["null"]`    REJECTED (same)
+        //   `"null"`      ACCEPTED — the scalar is a real proto `Type` member
+        // Both rewrites below are LOSSLESS by JSON Schema semantics: a
+        // one-element `type` array means exactly that type.
+        //
+        // A DRAFTED JUSTIFICATION FOR THIS DIED ON MEASUREMENT, and the corrected
+        // version is the one worth carrying. The draft read "a rewriting client
+        // normalizes either spelling, so its output does not move." FALSE for two
+        // of the four rewriters, measured 2026-08-10 with a `description` control
+        // beside each node that had to survive (#364) — and my first `@ai-sdk`
+        // reader scored three vacuous IDENTICALs because the capture returned
+        // null on BOTH sides and the control was absent (#368's trap, hit again):
+        //   google-adk 2.6.3  identical on all three
+        //   agno 2.8.7        identical on all three
+        //   litellm 1.96.0    DIFFERS on `["null","null"]`: keeps it as
+        //                     `anyOf:[null,null]`, vs `{"type":"null"}` for the
+        //                     scalar
+        //   @ai-sdk/google    DIFFERS on `["string"]`: emits
+        //     4.0.39          `{"anyOf":[{"type":"string"}]}`, vs `{"type":"string"}`
+        // So the honest claim is about MEANING, not bytes: no rewriter's accept
+        // set moves, and where the emitted document DOES move, BOTH forms were
+        // put through the live v1beta oracle and BOTH are accepted (controls in
+        // the same nested slot rejected, so the oracle discriminates there).
+        // The rewrite therefore costs the four rewriters nothing and converts a
+        // hard 400 into a working request for the forwarder — which is the whole
+        // reason it is worth making.
+        //
+        // Reachability measured on real generators rather than argued: zod 3 +
+        // `zod-to-json-schema` 3.24.5 emits `{"type":["null","null"]}` verbatim
+        // for `z.null().nullable()`. Redundant-but-legal user code, and the kind
+        // of thing composed/generated schemas produce — weaker than "every user
+        // hits this", and stated at that strength. For a plain null field
+        // (`z.null()`, `a: None`) zod 4 native and pydantic 2.13.4 both emit the
+        // SCALAR `{"type":"null"}`, which is already correct here and is
+        // deliberately left alone below. Note zod 4's `z.null().nullable()` does
+        // NOT reach this rule at all — it emits `anyOf:[null,null]`, a different
+        // route — so zod 3 + `zod-to-json-schema` is the only measured producer.
+        //
+        // Scalar-only shapes are excluded by the `isList` guard: a bare `"null"`
+        // is accepted by the proto and must keep passing through untouched.
+        if (isList && rest.length === 1 && !hasNull) {
+          node.type = rest[0];
+          ledger.push(entry("~", path,
+            "Rewrote `type: " + before + "` to `" + rest[0] + "`. A one-element `type` array " +
+            "means exactly that type, so this is lossless — but the two spellings are NOT " +
+            "interchangeable at the destination: measured on the live v1beta endpoint, a " +
+            "list-valued `type` is rejected outright (`Proto field is not repeating, cannot " +
+            "start list`), so a client that forwards your document to `responseSchema` " +
+            "without rebuilding it gets a hard 400 on the list form. Unlike the `[\"X\",\"null\"]` " +
+            "union this target deliberately keeps, there is no nullability here to trade away, " +
+            "so nothing is gained by leaving it.",
+            DOCS.gemini));
+          return;
+        }
+        if (isList && rest.length === 0 && hasNull) {
+          node.type = "null";
+          ledger.push(entry("~", path,
+            "Rewrote `type: " + before + "` to `\"null\"`. Lossless — a null-only union is the " +
+            "null type — and it is the spelling the destination actually takes: measured on " +
+            "the live v1beta endpoint, scalar `\"null\"` is ACCEPTED (`NULL` is a real member of " +
+            "the proto's `Type` enum) while the list form is rejected (`Proto field is not " +
+            "repeating`). It is also what zod 4 and pydantic already emit for a null field, so " +
+            "this makes the two spellings agree.",
+            DOCS.gemini));
+          return;
         }
         return;
       }

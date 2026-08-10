@@ -6409,5 +6409,78 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// ---------------------------------------------------------------------------
+// #369. A one-element `type` list, and a null-only one, carry NO nullability —
+// so #368's keep-the-union trade-off does not apply to them. #365's
+// discriminator ("what does the rule buy the member it was written for?")
+// returns NOTHING here, so leaving the list is a pure cost to the forwarding
+// client, paid for nothing.
+//
+// Guarded reads throughout: with `engine.js` reverted these shapes come back
+// unrewritten, and an unguarded `.type` deref would abort the whole file and
+// hide every assertion after it (#322).
+(function () {
+  function gc(sch) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), "gemini-client");
+    return r || {};
+  }
+  function pType(r) {
+    var s = r && r.schema, p = s && s.properties && s.properties.p;
+    return p ? JSON.stringify(p.type) : "(unreached)";
+  }
+  var P = function (t) {
+    return { type: "object", properties: { p: { type: t } } };
+  };
+
+  // The three rewrites.
+  ok("#369 a one-element `type` list collapses to the scalar",
+    pType(gc(P(["string"]))) === '"string"');
+  ok("#369 a null-only `type` list collapses to `\"null\"`",
+    pType(gc(P(["null"]))) === '"null"');
+  ok("#369 a duplicate null-only list collapses too (zod 3 `z.null().nullable()`)",
+    pType(gc(P(["null", "null"]))) === '"null"');
+
+  // THE DISCRIMINATOR. #368 deliberately KEEPS `["X","null"]` as a union,
+  // because there the union buys three rewriting clients their nullability.
+  // Without this pair the new rule could be firing blanket and every assertion
+  // above would still pass (#364/#366's pattern).
+  ok("#369 ...but `[\"X\",\"null\"]` is still KEPT as a union — the trade-off stands",
+    pType(gc(P(["string", "null"]))) === '["string","null"]');
+  ok("#369 ...and that case still prints #368's per-client CHECK",
+    has(gc(P(["string", "null"])).ledger, "THE CHECK"));
+
+  // Over-block guards: these hold both ways and are stated rather than counted
+  // as new coverage.
+  ok("#369 a SCALAR `\"null\"` is left alone — the proto accepts it verbatim",
+    pType(gc(P("null"))) === '"null"');
+  ok("#369 a genuine multi-member union is still rewritten to `anyOf`, not collapsed",
+    (function () {
+      var s = gc(P(["string", "integer"])).schema,
+        p = s && s.properties && s.properties.p;
+      return !!(p && p.anyOf && p.anyOf.length === 2 && p.type === undefined);
+    })());
+
+  // The message has to carry the proto's own rejection text, because that is
+  // what makes the diagnosis checkable against the destination (#343).
+  ok("#369 the note quotes the proto's actual rejection",
+    has(gc(P(["string"])).ledger, "Proto field is not repeating"));
+  ok("#369 the note says the union case is different, so the two rules do not blur",
+    has(gc(P(["string"])).ledger, "no nullability here to trade away"));
+
+  // Scope pin: `--to gemini` emits the proto spelling and must be untouched by
+  // a rule written for the client target (#351's dialect split).
+  ok("#369 `--to gemini` is unaffected — null-only still becomes `nullable`",
+    (function () {
+      var r = E.convert(P(["null"]), "gemini"),
+        p = r && r.schema && r.schema.properties && r.schema.properties.p;
+      return !!(p && p.nullable === true && p.type === undefined);
+    })());
+
+  // Idempotence: the collapsed output must be a fixed point (#352).
+  ok("#369 the rewrite is idempotent",
+    pType(gc(gc(P(["string"])).schema || {})) === '"string"');
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
