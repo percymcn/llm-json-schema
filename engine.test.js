@@ -5001,5 +5001,104 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     })());
 })();
 
+// --- #357: the other three map spellings are EMPTIED on the Anthropic
+// output_format path, not merely unenforced --------------------------------
+//
+// Measured 2026-08-10 on @anthropic-ai/sdk@0.116.0, anthropic==0.121.0 and
+// anthropic-sdk-go@v1.62.0, with a discriminating control in each run: a node
+// whose only key-admitting keyword is `patternProperties`/`propertyNames`/
+// `unevaluatedProperties` comes back as
+// {"type":"object","properties":{},"additionalProperties":false} from ALL
+// THREE. The generic demote-to-prose note said the keyword was "not enforced",
+// which is true of the keyword and false of the field.
+(function () {
+  // Guarded like every other block here: a missing converter must REPORT, not
+  // abort the file and hide the assertions after it (#322).
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    return r.ledger || [];
+  }
+  var MARK = "only thing admitting a key";
+  var DEAD = "never populate this field";
+
+  // Verbatim pydantic 2.13.4 output for
+  // Dict[Annotated[str, StringConstraints(pattern=r'^S_')], str] — the one
+  // shape of this class demonstrated from a dominant generator (#311/#346).
+  var PP_ONLY = { type: "object", patternProperties: { "^S_": { type: "string" } }, title: "M" };
+  var PN_ONLY = { type: "object", propertyNames: { pattern: "^S_" } };
+  var UP_ONLY = { type: "object", unevaluatedProperties: { type: "string" } };
+  // Has declared properties: the field SURVIVES, so the ordinary demotion note
+  // is the correct one and this rule must stay out of it (#356's split).
+  var PP_PROPS = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    patternProperties: { "^S_": { type: "string" } }
+  };
+  // Verbatim zod@4.4.3 `z.record(z.string(), z.string())` — emits BOTH
+  // `propertyNames` and `additionalProperties`, so it is an open map and #329's
+  // arm owns it. This is the reason the new rule excludes open maps.
+  var ZOD_RECORD = {
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: { type: "string" }
+  };
+  var PLAIN = {
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: false
+  };
+
+  ["anthropic-json", "anthropic-json-python", "anthropic-go"].forEach(function (t) {
+    ok("#357 " + t + ": a patternProperties-only node is reported as EMPTIED",
+      has(conv(PP_ONLY, t), MARK) && has(conv(PP_ONLY, t), DEAD));
+    ok("#357 " + t + ": a propertyNames-only node is reported as EMPTIED",
+      has(conv(PN_ONLY, t), MARK));
+    // Over-block guard, both ways: the field survives here, so this rule must
+    // not fire — the generic demotion note is the right one.
+    ok("#357 " + t + " guard: declared `properties` keeps the field, so no emptying claim",
+      !has(conv(PP_PROPS, t), MARK));
+    ok("#357 " + t + " guard: an ordinary closed object is untouched",
+      !has(conv(PLAIN, t), MARK));
+    // Reported ONCE. zod's record is an open map; #329's arm owns it.
+    ok("#357 " + t + " guard: a zod `z.record()` stays with the open-map rule, not this one",
+      !has(conv(ZOD_RECORD, t), MARK) &&
+      has(conv(ZOD_RECORD, t), "This is an open map"));
+    // #347's empty-collection discipline: `patternProperties: {}` describes no
+    // keys, so closing the object loses nothing.
+    ok("#357 " + t + " guard: an EMPTY patternProperties is not evidence of a map",
+      !has(conv({ type: "object", patternProperties: {} }, t), MARK));
+  });
+
+  // The tools path (TypeScript/Python) applies no transform at all, measured
+  // byte-identical, so claiming a loss there would be the stricter-than-the-
+  // vendor bug. This is the assertion that proves the rule is scoped to the
+  // paths that actually destroy the node.
+  ok("#357 guard: `--to anthropic` (verbatim tools path) makes no emptying claim",
+    !has(conv(PP_ONLY, "anthropic"), MARK));
+
+  // Go loses `unevaluatedProperties` with no prose at all: invopop@v0.14.0's
+  // `Schema` models `patternProperties` and `propertyNames` and has no field
+  // for this one, so encoding/json drops it before the transform runs (#332).
+  ok("#357 go: unevaluatedProperties is dropped with no prose, and says so",
+    has(conv(UP_ONLY, "anthropic-go"), "not even demoted to prose"));
+  ok("#357 guard: the TypeScript path does NOT claim the silent-drop mechanism",
+    has(conv(UP_ONLY, "anthropic-json"), MARK) &&
+    !has(conv(UP_ONLY, "anthropic-json"), "not even demoted to prose"));
+
+  // We do not strip the keyword: the value schema stays in the file, which is
+  // what makes the remedy actionable (#318 — leave the shape visible).
+  ok("#357: the value schema survives our own output rather than being deleted",
+    (function () {
+      var r = E.convert(JSON.parse(JSON.stringify(PP_ONLY)), "anthropic-json") || {};
+      var pp = r.schema && r.schema.patternProperties;
+      return !!pp && !!pp["^S_"] && pp["^S_"].type === "string";
+    })());
+
+  // A converter's job is to move nodes, so the position that counts is the one
+  // in our OUTPUT (#354) — the walk must reach a nested map.
+  ok("#357: a nested map-only node is reached by the walk",
+    has(conv({
+      type: "object", additionalProperties: false, required: ["m"],
+      properties: { m: PP_ONLY }
+    }, "anthropic-json"), MARK));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

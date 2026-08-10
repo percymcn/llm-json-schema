@@ -2840,6 +2840,72 @@
         url, true));
     });
 
+    // The SAME question as the open-map arm above, asked through the other three
+    // spellings of "this object admits a key" (#348). It needs its own arm
+    // because the mechanism that destroys the node here is not a strip — it is
+    // the demote-to-prose policy, which normally reads as graceful degradation.
+    //
+    // For a node that also declares `properties`, demotion IS graceful: the
+    // field survives and only the pattern stops being enforced, which the
+    // generic demotion note below already says correctly. For a node whose ONLY
+    // way of admitting a key is one of these keywords, the same demotion plus
+    // the forced close leaves `{"type":"object","properties":{},
+    // "additionalProperties":false}` — the field can never be populated. #348's
+    // composition (a strip WIDENS, a strip plus a forced default INVERTS) with
+    // demote-to-prose standing in for the strip, and the prose framing is
+    // exactly what hides it: "the model is told about it but nothing validates
+    // it" is true of the keyword and false of the field.
+    //
+    // Measured 2026-08-10 on `@anthropic-ai/sdk@0.116.0`, `anthropic==0.121.0`
+    // and `anthropic-sdk-go@v1.62.0`: 3-0 DESTROYED, with a discriminating
+    // control (an ordinary closed object and a node carrying `properties` both
+    // survive). Note that is a DIFFERENT split from the plain open map, which
+    // goes 2-1 because Go's dictionary clause rescues it — that clause keys on
+    // `additionalProperties`, so it does nothing for these three spellings.
+    //
+    // Advisory, never a gate failure: the request returns 200 and the VENDOR is
+    // the one doing this, so blocking would be the stricter-than-the-vendor bug
+    // this project has shipped repeatedly.
+    walk(s, "root", function (node, path) {
+      var ev = mapKeyEvidence(node);
+      // `!isOpenMap` keeps a node reported once: zod 4's `z.record()` emits
+      // `propertyNames` AND `additionalProperties` (measured on zod@4.4.3), so
+      // it is an open map and the arm above already owns it.
+      if (!ev.length || !isObjectSchema(node) || isOpenMap(node)) return;
+      if (hasUsableProperties(node)) return;
+      var names = ev.map(function (k) { return "`" + k + "`"; }).join(" + ");
+      // Go alone loses `unevaluatedProperties` with no trace: invopop's `Schema`
+      // models `patternProperties` and `propertyNames` but has no field for it,
+      // so `encoding/json` drops it BEFORE Anthropic's transform can demote it
+      // (#332's two-severity mechanism). Same dead node either way — but on the
+      // other two the model at least sees the prose.
+      var silent = goSdk && ev.length === 1 && ev[0] === "unevaluatedProperties";
+      ledger.push(entry("=", path,
+        "This object describes its keys with " + names + " and declares no `properties`, " +
+        "so those keywords are the only thing admitting a key. " +
+        (silent
+          ? "The Go SDK has no field for `unevaluatedProperties` (invopop's `Schema` models " +
+            "`patternProperties` and `propertyNames` but not this one), so it is dropped before " +
+            "the transform runs — not even demoted to prose. "
+          : "The transformer does not recognise them, so it demotes them into `description` " +
+            "text and then forces `properties: {}` + `additionalProperties: false`. ") +
+        "What is left is `{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}` " +
+        "— an object whose only legal value is `{}`, so the model can never populate this field. " +
+        "No error is raised. This is worth separating from the ordinary \"demoted to prose\" note: " +
+        "there the field still works and only the constraint stops being enforced, whereas here " +
+        "the keyword was the node's only way of admitting a key, so demoting it and closing the " +
+        "object NARROWS the field to nothing rather than widening it. " +
+        "ALL THREE SDKs do this — unlike a plain open map, which the Go SDK preserves via a " +
+        "dictionary clause that keys on `additionalProperties` and so does nothing here. " +
+        (goSdk
+          ? "There is no verbatim escape hatch in Go: `BetaToolInputSchema` runs the same " +
+            "`transformSchemaMap`, so both surfaces rebuild the node."
+          : "It survives intact on `tools[].input_schema` (`--to anthropic`), which applies no " +
+            "transform at all.") +
+        " " + OPEN_MAP_REMEDY,
+        url, true));
+    });
+
     walk(s, "root", function (node, path) {
       if (path === "root") return;
       normalizeAnthropicUnionType(node, path, ledger, url, sdk);
