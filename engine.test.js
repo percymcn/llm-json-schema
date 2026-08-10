@@ -4925,5 +4925,81 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
   })());
 })();
 
+// --- #356 a typed catchall beside declared `properties` -------------------
+//
+// VERBATIM output of `z.object({a: z.string()}).catchall(...)` on zod@4.4.3
+// (#311 -- test against what the generator really emits). All three Anthropic
+// `output_format` SDKs delete the value schema and force `additionalProperties:
+// false`, measured 2026-08-09 on @anthropic-ai/sdk@0.116.0, anthropic==0.121.0
+// and anthropic-sdk-go@v1.62.0.
+(function () {
+  var CATCHALL_OBJ = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: {
+      type: "object", properties: { z: { type: "string", minLength: 3 } },
+      required: ["z"], additionalProperties: false
+    }
+  };
+  var CATCHALL_STR = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: { type: "string" }
+  };
+  var PLAIN = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: false
+  };
+  var OPEN_MAP = { type: "object", additionalProperties: { type: "string" } };
+  var MARK = "declares `properties` AND an `additionalProperties`";
+  var conv = function (s, t) { return E.convert(JSON.parse(JSON.stringify(s)), t).ledger; };
+
+  ok("#356 anthropic-json reports a deleted catchall value schema",
+    has(conv(CATCHALL_OBJ, "anthropic-json"), MARK));
+  ok("#356 anthropic-json-python reports it too (measured, not ported)",
+    has(conv(CATCHALL_OBJ, "anthropic-json-python"), MARK));
+  ok("#356 anthropic-go reports it -- its dictionary clause needs NO properties",
+    has(conv(CATCHALL_OBJ, "anthropic-go"), MARK));
+  ok("#356 a scalar catchall is reported the same way",
+    has(conv(CATCHALL_STR, "anthropic-json"), MARK));
+  ok("#356 the message names BOTH losses: closed AND value schema gone",
+    (function () {
+      var l = conv(CATCHALL_OBJ, "anthropic-json").filter(function (e) {
+        return e.msg.indexOf(MARK) !== -1;
+      })[0];
+      if (!l) return false;
+      var m = l.msg.replace(/\s+/g, " ");
+      return /stop being accepted/.test(m) && /look like is gone/.test(m);
+    })());
+  ok("#356 it is ADVISORY -- never a gate failure (#317)",
+    (function () {
+      var l = conv(CATCHALL_OBJ, "anthropic-json").filter(function (e) {
+        return e.msg.indexOf(MARK) !== -1;
+      })[0];
+      return !!l && l.advisory === true && l.op === "=";
+    })());
+
+  // --- over-block guards: all four correctly hold both ways -----------------
+  ok("#356 guard: the tools path is verbatim, so nothing is reported there",
+    !has(conv(CATCHALL_OBJ, "anthropic"), MARK));
+  ok("#356 guard: an ordinary closed object is NOT flagged",
+    !has(conv(PLAIN, "anthropic-json"), MARK));
+  ok("#356 guard: a pure open map keeps the #329 rule, not this one",
+    !has(conv(OPEN_MAP, "anthropic-json"), MARK) &&
+    has(conv(OPEN_MAP, "anthropic-json"), "This is an open map"));
+  ok("#356 guard: the two rules are mutually exclusive -- never both on one node",
+    (function () {
+      var l = conv(CATCHALL_OBJ, "anthropic-json");
+      return !has(l, "This is an open map");
+    })());
+  ok("#356 guard: the catchall value schema still survives our own output",
+    (function () {
+      var r = E.convert(JSON.parse(JSON.stringify(CATCHALL_OBJ)), "anthropic-json");
+      var ap = r.schema && r.schema.additionalProperties;
+      return !!ap && ap.properties && ap.properties.z && ap.properties.z.minLength === 3;
+    })());
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

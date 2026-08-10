@@ -1335,5 +1335,36 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     run(["--to", "openai", "--check"], JSON.stringify(BODY)).status === 0);
 })();
 
+// --- #356 typed catchall reaches the CLI, and never fails the gate ---------
+(function () {
+  var CATCHALL = JSON.stringify({
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: {
+      type: "object", properties: { z: { type: "string", minLength: 3 } },
+      required: ["z"], additionalProperties: false
+    }
+  });
+  var PLAIN = JSON.stringify({
+    type: "object", properties: { a: { type: "string" } }, required: ["a"],
+    additionalProperties: false
+  });
+  var MARK = "declares `properties` AND an `additionalProperties`";
+
+  var r = run(["--to", "anthropic-json", "--check"], CATCHALL);
+  ok("#356 CLI surfaces the catchall loss on anthropic-json",
+    (r.stdout + r.stderr).indexOf(MARK) !== -1);
+  ok("#356 CLI: advisory only -- --check still exits 0", r.status === 0);
+  ok("#356 CLI: anthropic-go surfaces it too",
+    (function () { var g = run(["--to", "anthropic-go", "--check"], CATCHALL);
+      return (g.stdout + g.stderr).indexOf(MARK) !== -1 && g.status === 0; })());
+  ok("#356 CLI guard: the tools path stays quiet",
+    (function () { var t = run(["--to", "anthropic", "--check"], CATCHALL);
+      return (t.stdout + t.stderr).indexOf(MARK) === -1 && t.status === 0; })());
+  ok("#356 CLI guard: an ordinary closed object stays quiet",
+    (function () { var p = run(["--to", "anthropic-json", "--check"], PLAIN);
+      return (p.stdout + p.stderr).indexOf(MARK) === -1 && p.status === 0; })());
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

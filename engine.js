@@ -90,6 +90,40 @@
     return false;
   }
 
+  // A TYPED CATCHALL is the shape isOpenMap deliberately excludes one line
+  // above: declared `properties` AND an `additionalProperties` that still
+  // carries a schema. `z.object({...}).catchall(...)` emits exactly this
+  // (measured on zod@4.4.3), as does any OpenAPI object with typed free-form
+  // extras. It is NOT an open map -- closing it does not empty the node, the
+  // declared properties survive -- which is precisely why #329's rule steps
+  // over it, and why nothing else looked either: neither walk() nor
+  // findBooleanSubschemas() descends into `additionalProperties` at all, so the
+  // value schema is an unexamined subtree on top of being an unreported one.
+  //
+  // The vendor uses the SAME discriminator we do and it flips the outcome the
+  // other way. Measured 2026-08-09 across all three Anthropic SDKs on the
+  // `output_format` path -- a pure open map splits 2-1 (Go's `transformSchema`
+  // has an explicit dictionary clause and PRESERVES it) while this shape is
+  // 3-0 DESTROYED, because that clause requires the node to have no
+  // `properties`. So "does this node declare properties?" decides preservation
+  // in one direction and deletion in the other.
+  function hasTypedCatchall(node) {
+    if (!isPlainObject(node)) return false;
+    if (!("additionalProperties" in node)) return false;
+    var ap = node.additionalProperties;
+    if (ap === false) return false;                       // an ordinary closed object
+    if (ap !== true && !isPlainObject(ap)) return false;  // not a schema we understand
+    // The half isOpenMap refuses: this rule is only about nodes that HAVE
+    // declared properties, so the two are mutually exclusive by construction
+    // and a node can never be reported by both.
+    if (!isPlainObject(node.properties) || !Object.keys(node.properties).length) return false;
+    var t = node.type;
+    if (t === undefined) return true;
+    if (t === "object") return true;
+    if (Array.isArray(t) && t.indexOf("object") !== -1) return true;
+    return false;
+  }
+
   // An EMPTIED map is the fossil an open map leaves behind after something has
   // already "repaired" it: `additionalProperties: false` and NO `properties` key
   // at all. Its only legal instance is `{}`, so the field can never be
@@ -2771,6 +2805,38 @@
         "field. No error is raised. " + OPEN_MAP_REMEDY +
         " It survives intact on `tools[].input_schema` (`--to anthropic`), which applies no " +
         "transform at all.",
+        url, true));
+    });
+
+    // The other half of the same keyword, and the half nothing looked at: a node
+    // that declares `properties` AND still carries a typed `additionalProperties`.
+    // Two losses, and the second is the one that reads as a bug rather than a
+    // missing constraint:
+    //   1. the value schema is DELETED outright -- everything the extra keys were
+    //      required to look like is gone;
+    //   2. the map is CLOSED -- keys that were legal before are illegal after, so
+    //      this NARROWS the accept set rather than widening it (#348).
+    // Advisory, never a gate failure: the request still returns 200 and the
+    // vendor is the one doing this, so blocking would be the
+    // stricter-than-the-vendor bug this project has shipped repeatedly.
+    walk(s, "root", function (node, path) {
+      if (!hasTypedCatchall(node)) return;
+      var had = node.additionalProperties === true
+        ? "allowed any extra keys"
+        : "required every extra key to match a schema of its own";
+      ledger.push(entry("=", path,
+        "This node declares `properties` AND an `additionalProperties` that " + had + " " +
+        "(`z.object({...}).catchall(...)` emits exactly this). The `output_format` transformer " +
+        "throws that schema away and forces `additionalProperties: false`, so two things change " +
+        "silently: the extra keys stop being accepted at all, and whatever they were required to " +
+        "look like is gone. No error is raised, and unlike an open map the node still looks " +
+        "healthy afterwards — the declared properties are untouched. " +
+        "ALL THREE SDKs do this, including Go: `transformSchema`'s dictionary clause only " +
+        "preserves `additionalProperties` when the node has NO `properties`, so the very thing " +
+        "that saves a plain open map on `--to anthropic-go` is what condemns this shape. " +
+        "It survives intact on `tools[].input_schema` (`--to anthropic`), which applies no " +
+        "transform at all. If the extra keys matter, declare them as fixed `properties`, or move " +
+        "them into their own map field so the value type has somewhere to live.",
         url, true));
     });
 

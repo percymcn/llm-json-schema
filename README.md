@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 779 engine + 217 CLI + 34 ESM/library assertions = **1030** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 790 engine + 222 CLI + 34 ESM/library assertions = **1046** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -128,7 +128,12 @@ Each provider accepts a different schema dialect, so a schema that works with on
   | draft-07 tuple `items: [A,B]` | — | throws | **whole document dropped** |
   | draft-07 `definitions` bag | lost | stringified into root `description` | **deleted before the transform runs** |
   | open map (`additionalProperties`, no `properties`) | rebuilt as unsatisfiable | rebuilt as unsatisfiable | **preserved and recursed** |
+  | typed catchall (`properties` **and** `additionalProperties`) | value schema deleted, forced `false` | value schema deleted, forced `false` | value schema deleted, forced `false` |
   | typeless node | throws | throws | **replaced by the literal `true`** |
+
+  Those last-but-two rows are worth reading together, because the same condition decides both and it points opposite ways. Go's `transformSchema` has an explicit dictionary clause, which is why a plain open map survives there when the other two SDKs destroy it — but that clause only fires when the node has **no** `properties`. Add one declared property, as `z.object({...}).catchall(...)` does, and Go joins the other two: the value schema is thrown away and `additionalProperties` is forced to `false`. So the map is 2-1 and the catchall is 3-0, decided by "does this node declare properties?" — the same question our own open-map rule asks, answered the other way round.
+
+  That shape is the quieter of the two, which is why it is worth flagging at all: an emptied open map at least *looks* broken afterwards, whereas here the declared properties come through untouched and only the extra keys change — they stop being accepted, and whatever they were required to look like is gone. Nothing raises. `--to anthropic-json`, `--to anthropic-json-python` and `--to anthropic-go` all report it as an advisory (never a gate failure — the request returns 200), and `tools[].input_schema` (`--to anthropic`) keeps it verbatim.
 
   Two of those Go rows are not "unsupported", they are total loss, and they share a cause worth knowing: `transformSchemaMap` round-trips your map through `invopop/jsonschema.Schema` and `return nil`s on **any** unmarshal error, swallowing it. That struct types `Type` as a `string` and `Items` as a `*Schema`, so an array in either field — anywhere in the document, including inside `$defs` — silently discards everything. Both helpers then hand the API a null schema with nothing raised client-side.
 
@@ -557,7 +562,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1030 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1046 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
