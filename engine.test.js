@@ -4640,5 +4640,103 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     }).ledger).length === 1);
 })();
 
+// #353 — Anthropic's root contract, keyed on the OUTCOME.
+//
+// Measured on @anthropic-ai/sdk@0.116.0 across a shape battery: the ONLY root
+// rule either helper has is a literal `type: "object"`. `{type:"object", anyOf:
+// [...]}` is accepted; a nested `definitions` bag is forwarded verbatim. The
+// previous check named the keywords that could supply a type and then excused
+// every one of them, so four typeless roots went out at exit 0.
+(function () {
+  var OBJ = { type: "object", properties: { a: { type: "string" } }, required: ["a"] };
+  function o(x) { return JSON.parse(JSON.stringify(x)); }
+  // Key on the ledger OP, never on the prose (#340: a check keyed on wording
+  // breaks when the wording changes, and matches the wrong entry when it does not).
+  function blocked(l) {
+    return !!l && l.some(function (e) { return e.op === "!" && !e.advisory; });
+  }
+  function rootType(s) { return s && s.type; }
+
+  // --- REPAIRS. Each is verified by the root gaining `type: "object"` while the
+  // structure that carried the meaning survives. ---
+
+  // The DEFAULT output of zod-to-json-schema. `normalizeDefs` runs only on the
+  // output_format path, so on the tools path this spelling reached the root-$ref
+  // inliner unrenamed, matched its `#/$defs/`-only regex, and was left alone.
+  var zodV3 = { $ref: "#/definitions/T", definitions: { T: OBJ } };
+  ok("#353 zod-to-json-schema's default root $ref is inlined on the tools path",
+    rootType(E.toAnthropic(o(zodV3), false).schema) === "object" &&
+    !blocked(E.toAnthropic(o(zodV3), false).ledger));
+  // The spelling that always worked must keep working: this is the pin that
+  // says the fix widened the resolver rather than moved it.
+  ok("#353 the `$defs` spelling of a root $ref still inlines",
+    rootType(E.toAnthropic(o({ $ref: "#/$defs/T", $defs: { T: OBJ } }), false).schema) === "object");
+
+  // Pydantic's `RootModel[Union[A, B]]` verbatim: `{$defs, anyOf:[{$ref},{$ref}], title}`,
+  // no root `type`. Lossless because every branch is already an object.
+  var pyUnion = {
+    title: "P",
+    $defs: { A: OBJ, B: { type: "object", properties: { b: { type: "string" } } } },
+    anyOf: [{ $ref: "#/$defs/A" }, { $ref: "#/$defs/B" }]
+  };
+  ok("#353 an all-object union root gains `type: object` and keeps its branches",
+    (function () {
+      var r = E.toAnthropic(o(pyUnion), false);
+      return rootType(r.schema) === "object" &&
+        Array.isArray(r.schema.anyOf) && r.schema.anyOf.length === 2 &&
+        !blocked(r.ledger);
+    })());
+  ok("#353 an all-object `oneOf` root is repaired the same way",
+    rootType(E.toAnthropic(o({ oneOf: [OBJ, { type: "object" }] }), false).schema) === "object");
+
+  // --- GUARDS. Being stricter than the vendor is this project's most repeated
+  // bug, and adding a type where it narrows is #348's inversion. Both directions. ---
+
+  // A branch that admits a non-object cannot be repaired: `type: "object"` would
+  // be ACCEPTED by the vendor and would silently delete that branch.
+  ok("#353 a union root with a non-object branch is blocked, not repaired",
+    (function () {
+      var r = E.toAnthropic(o({ anyOf: [OBJ, { type: "string" }] }), false);
+      return blocked(r.ledger) && rootType(r.schema) !== "object" &&
+        r.schema.anyOf.length === 2;   // and the branch is left visible (#318)
+    })());
+  // Fail closed (#320): a branch we cannot resolve is not assumed to be an object.
+  ok("#353 a union root with an unresolvable $ref branch fails closed",
+    blocked(E.toAnthropic(o({ anyOf: [OBJ, { $ref: "#/$defs/Nope" }] }), false).ledger));
+  // A root with no type and nothing to read one from is still the #341 blocker,
+  // not a silently-added `type: "object"` that would leave a dead input.
+  ok("#353 a definition bag with no pointer into it is still blocked",
+    blocked(E.toAnthropic(o({ definitions: { T: OBJ } }), false).ledger));
+
+  // OVER-STRICTNESS GUARDS: the tools path applies no transform, and `betaTool()`
+  // forwards a nested `definitions` bag verbatim (measured), so renaming it would
+  // be an edit the destination never asked for.
+  ok("#353 a nested `definitions` bag under a typed root is left alone",
+    (function () {
+      var r = E.toAnthropic(o({
+        type: "object",
+        properties: { a: { $ref: "#/definitions/T" } },
+        definitions: { T: { type: "string" } }
+      }), false);
+      return !blocked(r.ledger) && isDefBag(r.schema) &&
+        r.schema.properties.a.$ref === "#/definitions/T";
+      function isDefBag(s) { return s.definitions && !s.$defs; }
+    })());
+  // Not "draws no root entry" — the tools path always carries one informational
+  // `=` note about applying no transform. The property that matters is that the
+  // document is handed back untouched.
+  ok("#353 an ordinary object root is passed through byte-identical",
+    (function () {
+      var r = E.toAnthropic(o(OBJ), false);
+      return !blocked(r.ledger) &&
+        JSON.stringify(r.schema) === JSON.stringify(OBJ) &&
+        r.ledger.every(function (e) { return e.op === "=" || e.advisory; });
+    })());
+  // The Python SDK deliberately KEEPS a root `$ref` (it pops `$defs` before its
+  // early return), so the outcome-keyed check must not read that as a defect.
+  ok("#353 the Python path's deliberate root `$ref` is not blocked",
+    !blocked(E.toAnthropic(o({ $ref: "#/$defs/T", $defs: { T: OBJ } }), true, "python").ledger));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

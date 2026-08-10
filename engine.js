@@ -923,32 +923,60 @@
     return isPlainObject(s.$defs) && isPlainObject(s.$defs[m[1]]);
   }
 
-  function inlineRootRef(s, ledger, docUrl, why) {
-    if (typeof s.$ref !== "string") return s;
-    var m = /^#\/\$defs\/(.+)$/.exec(s.$ref);
-    if (!m) return s;
-    var name = m[1];
-    if (!isPlainObject(s.$defs) || !isPlainObject(s.$defs[name])) return s;
+  // The container has TWO spellings and so does the pointer into it, and this
+  // resolver knew exactly one. On every path where `normalizeDefs` runs first
+  // that is invisible, because the rename has already made the spelling `$defs`.
+  // The Anthropic TOOLS path does not rename — correctly, since `betaTool()`
+  // forwards a nested `definitions` bag verbatim and editing it would be the
+  // over-strictness bug this project has shipped repeatedly — so there the
+  // draft-07 spelling reached this function untouched, matched nothing, and the
+  // root `$ref` was left in place. That is the DEFAULT output of
+  // zod-to-json-schema, and `betaTool()` throws on it.
+  // Resolve a local pointer against the root document, in BOTH container
+  // spellings. Returns null for anything it cannot resolve, so every caller
+  // fails closed (#320: a keep-rule that cannot read a reference must not
+  // conclude the reference is absent).
+  function resolveLocalDef(root, ref) {
+    if (typeof ref !== "string") return null;
+    var m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
+    if (!m) return null;
+    var bag = root[m[1]];
+    return isPlainObject(bag) && isPlainObject(bag[m[2]]) ? bag[m[2]] : null;
+  }
 
-    var out = clone(s.$defs[name]);
-    var defs = s.$defs;
+  function rootRefTarget(s) {
+    if (typeof s.$ref !== "string") return null;
+    var m = /^#\/(\$defs|definitions)\/(.+)$/.exec(s.$ref);
+    if (!m) return null;
+    var bag = m[1], name = m[2];
+    if (!isPlainObject(s[bag]) || !isPlainObject(s[bag][name])) return null;
+    return { bag: bag, name: name };
+  }
+
+  function inlineRootRef(s, ledger, docUrl, why) {
+    var t = rootRefTarget(s);
+    if (!t) return s;
+    var bag = t.bag, name = t.name;
+
+    var out = clone(s[bag][name]);
+    var defs = s[bag];
 
     // carry over any sibling keys the generator left next to `$ref`
     Object.keys(s).forEach(function (k) {
-      if (k !== "$ref" && k !== "$defs" && !(k in out)) out[k] = s[k];
+      if (k !== "$ref" && k !== bag && !(k in out)) out[k] = s[k];
     });
 
     // keep only the definitions something still points at (recursive schemas
     // reference themselves, so `name` may need to stay)
     var remaining = {};
     Object.keys(defs).forEach(function (k) { if (k !== name) remaining[k] = defs[k]; });
-    if (JSON.stringify([out, remaining]).indexOf('"#/$defs/' + name + '"') !== -1) {
+    if (JSON.stringify([out, remaining]).indexOf('"#/' + bag + '/' + name + '"') !== -1) {
       remaining[name] = defs[name];
     }
-    if (Object.keys(remaining).length) out.$defs = remaining;
+    if (Object.keys(remaining).length) out[bag] = remaining;
 
     ledger.push(entry("~", "root",
-      "Inlined the root `$ref` (`#/$defs/" + name + "`) into the root. " + (why ||
+      "Inlined the root `$ref` (`#/" + bag + "/" + name + "`) into the root. " + (why ||
         "OpenAI requires the root to be an object schema, and a bare `$ref` root leaves " +
         "`additionalProperties`/`required` unset on the real object."),
       docUrl || DOCS.openai));
@@ -2330,7 +2358,13 @@
     // Measured, not inferred — and note the draft-07 spelling `{$ref, definitions}`
     // is destroyed by BOTH, which is why the `definitions` -> `$defs` rename above
     // is unconditional and this skip is not.
+    // Set when the root `$ref` is deliberately LEFT in place below, so the
+    // outcome-keyed root check further down does not read that decision as a
+    // defect. (Only the Python SDK path takes it, and only for `$defs`, because
+    // `normalizeDefs` has already renamed the draft-07 spelling by then.)
+    var rootRefKeptOnPurpose = false;
     if (outputFormatPath && pythonSdk && rootRefResolvesInDefs(s)) {
+      rootRefKeptOnPurpose = true;
       ledger.push(entry("=", "root",
         "Left the root `$ref` (`" + s.$ref + "`) alone. The Python `anthropic` SDK calls " +
         "`transform_schema()` with no root-type guard, and that function pops `$defs` BEFORE its " +
@@ -2390,35 +2424,76 @@
         "The root must be an object on BOTH Anthropic paths — `betaTool()` and " +
         "`jsonSchemaOutputFormat()` each throw on a non-object root. Wrap this schema in an object.",
         url));
-    } else if (!s.type && !s.$ref && !s.anyOf && !s.oneOf && !s.allOf) {
-      // The third arm, and it was missing: a root with NO `type` and nothing to
-      // read a type from. The two arms above cover "typeless but plainly an
-      // object" and "typed as something else"; a root that declares neither fell
-      // through both and `--to anthropic` exited 0 on it. MEASURED on
-      // @anthropic-ai/sdk@0.116.0: `betaTool()` throws `JSON schema for tool "t"
-      // must be an object, but got undefined` and `jsonSchemaOutputFormat()`
-      // throws the same, so this is a rejection on BOTH paths, not just the
-      // transformed one.
+    } else if (!s.type && !rootRefKeptOnPurpose) {
+      // The third arm, and it is now keyed on the OUTCOME rather than on a list
+      // of keywords. Anthropic's root contract is exactly one thing, measured on
+      // @anthropic-ai/sdk@0.116.0 across a shape battery: the root must carry a
+      // literal `type: "object"`. Not "no combinators" — `{type:"object", anyOf:
+      // [...]}` is ACCEPTED by both helpers. Not "no definition bag" — a nested
+      // `definitions` bag is forwarded verbatim. Just the type.
       //
-      // No repair, for the reason #329 gives: supplying `type: "object"` here
-      // would be accepted and would leave an object with no properties, whose
-      // only legal value is `{}`.
-      var abag = isPlainObject(s.$defs) ? "$defs"
-        : (isPlainObject(s.definitions) ? "definitions" : null);
-      ledger.push(entry("!", "root",
-        "The root declares no object shape at all — no `type`, no `properties`, and nothing left " +
-        "to inline. Both Anthropic paths reject it: `betaTool()` and `jsonSchemaOutputFormat()` " +
-        "each throw \"JSON schema ... must be an object, but got undefined\"." +
-        (abag
-          ? " A `" + abag + "` bag is still here, so the definitions survived and the pointer into " +
-            "them — a root `$ref` or `anyOf` — did not. One measured producer: `llama-index-core`'s " +
-            "`ToolMetadata.get_parameters_dict()` keeps only `type`, `properties`, `required`, " +
-            "`definitions` and `$defs`, so a `RootModel` tool schema arrives as its own definition " +
-            "bag with no way in. Restore the root `$ref`, or inline the definition you meant."
-          : " Declare the properties you expect.") +
-        " Do NOT just add `type: \"object\"`: that is accepted, and it leaves an object whose only " +
-        "legal value is `{}` — a tool input that can never be populated.",
-        url));
+      // The previous spelling was `!s.type && !s.$ref && !s.anyOf && !s.oneOf &&
+      // !s.allOf`, which named the keywords that could POSSIBLY have supplied a
+      // type and then excused every one of them. A root that is nothing but
+      // `anyOf` still has no `type`, and both helpers still throw — so the four
+      // most common typeless roots there are went out at exit 0 or 1.
+      var branches = [];
+      var sawCombinator = false;
+      ["anyOf", "oneOf", "allOf"].forEach(function (kw) {
+        if (!Array.isArray(s[kw])) return;
+        sawCombinator = true;
+        s[kw].forEach(function (b) { branches.push(b); });
+      });
+
+      // A combinator root is repairable only when every branch is provably an
+      // object: then `type: "object"` is implied by each branch already and
+      // stating it changes nothing. If any branch admits a non-object, adding
+      // the type DELETES that branch — the #348 inversion — so it is refused.
+      var allObjects = sawCombinator && branches.length > 0 &&
+        branches.every(function (b) {
+          var r = isPlainObject(b) && typeof b.$ref === "string" ? resolveLocalDef(s, b.$ref) : b;
+          return isPlainObject(r) && r.type === "object";
+        });
+
+      if (allObjects) {
+        s.type = "object";
+        ledger.push(entry("+", "root",
+          "Added `type: object` at the root. Both Anthropic helpers throw \"JSON schema ... must " +
+          "be an object, but got undefined\" on a root with no `type`, and a union root has none " +
+          "of its own. This is lossless here because EVERY branch of this union is already " +
+          "`type: \"object\"`, so an instance that satisfies any branch was an object anyway — the " +
+          "set of legal values does not change, and the union itself is preserved. Measured on " +
+          "@anthropic-ai/sdk@0.116.0: `{type: \"object\", anyOf: [...]}` is accepted by " +
+          "`betaTool()` and `betaJSONSchemaOutputFormat()` alike. (Pydantic's " +
+          "`RootModel[Union[A, B]]` emits exactly this shape: `{$defs, anyOf: [{$ref}, {$ref}]}` " +
+          "with no root `type`.)",
+          url));
+      } else {
+        var abag = isPlainObject(s.$defs) ? "$defs"
+          : (isPlainObject(s.definitions) ? "definitions" : null);
+        ledger.push(entry("!", "root",
+          "The root has no `type`, and both Anthropic paths reject that outright: `betaTool()` " +
+          "and `jsonSchemaOutputFormat()` each throw \"JSON schema ... must be an object, but got " +
+          "undefined\"." +
+          (sawCombinator
+            ? " This root is a bare `anyOf`/`oneOf`/`allOf`, and at least one branch is not " +
+              "provably `type: \"object\"` — so `type: \"object\"` cannot just be added here the " +
+              "way it can for an all-object union: it would be accepted, and it would silently " +
+              "DELETE every branch that admits a non-object. Wrap the union in an object instead " +
+              "— `{\"type\":\"object\",\"properties\":{\"result\": <your union>},\"required\":" +
+              "[\"result\"]}` — which keeps every branch. (A single-member `allOf` is the other " +
+              "shape that lands here; flatten it into the root yourself.)"
+            : abag
+            ? " A `" + abag + "` bag is still here, so the definitions survived and the pointer into " +
+              "them — a root `$ref` or `anyOf` — did not. One measured producer: `llama-index-core`'s " +
+              "`ToolMetadata.get_parameters_dict()` keeps only `type`, `properties`, `required`, " +
+              "`definitions` and `$defs`, so a `RootModel` tool schema arrives as its own definition " +
+              "bag with no way in. Restore the root `$ref`, or inline the definition you meant."
+            : " Declare the properties you expect.") +
+          " Do NOT just add `type: \"object\"` to an empty root: that is accepted, and it leaves an " +
+          "object whose only legal value is `{}` — a tool input that can never be populated.",
+          url));
+      }
     }
 
     // A node with no legal values. Anthropic carries all of these — measured on

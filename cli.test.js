@@ -1244,5 +1244,58 @@ var PA_TUPLE_STRICT_TRUE = "{\"properties\": {\"title\": {\"type\": \"string\"},
     fine.status === 0 && (fine.stdout + fine.stderr).indexOf("constrains nothing") === -1);
 })();
 
+// #353 — the verdict change end-to-end. `--check` was answering "Already valid
+// for anthropic. No changes needed." (exit 0) for the DEFAULT output of both
+// dominant generators, on a document `betaTool()` throws on.
+(function () {
+  // Verbatim `zodToJsonSchema(z.object({...}), "Ticket")` on zod-to-json-schema.
+  var ZOD_V3 = JSON.stringify({
+    $ref: "#/definitions/Ticket",
+    definitions: {
+      Ticket: {
+        type: "object",
+        properties: { title: { type: "string" }, n: { type: "number" } },
+        required: ["title", "n"]
+      }
+    }
+  });
+  // Verbatim `RootModel[Union[A, B]].model_json_schema()` on pydantic 2.13.4.
+  var PY_UNION = JSON.stringify({
+    $defs: {
+      A: { type: "object", properties: { kind: { const: "a" } }, required: ["kind"] },
+      B: { type: "object", properties: { kind: { const: "b" } }, required: ["kind"] }
+    },
+    anyOf: [{ $ref: "#/$defs/A" }, { $ref: "#/$defs/B" }],
+    title: "P"
+  });
+
+  ok("#353 zod-to-json-schema's default output no longer passes anthropic silently",
+    run(["--to", "anthropic", "--check"], ZOD_V3).status === 1);
+  ok("#353 a pydantic union root no longer passes anthropic silently",
+    run(["--to", "anthropic", "--check"], PY_UNION).status === 1);
+
+  // The converted output must then be clean: a gate that says "commit my output"
+  // and still fails on the second run is the #330 defect.
+  var fixed = run(["--to", "anthropic"], ZOD_V3);
+  ok("#353 the converted zod output rechecks clean",
+    fixed.status === 0 &&
+    run(["--to", "anthropic", "--check"], fixed.stdout).status === 0);
+  ok("#353 the converted root carries `type: object`",
+    JSON.parse(fixed.stdout).type === "object");
+
+  // A union that cannot be repaired without narrowing is a blocker (exit 3), not
+  // an edit — the one distinction a CI script acts on (#330).
+  ok("#353 a union root with a non-object branch exits 3",
+    run(["--to", "anthropic", "--check"], JSON.stringify({
+      anyOf: [{ type: "object", properties: { a: { type: "string" } } }, { type: "string" }]
+    })).status === 3);
+
+  // Over-block guard through the binary.
+  ok("#353 an ordinary object schema still passes anthropic untouched",
+    run(["--to", "anthropic", "--check"], JSON.stringify({
+      type: "object", properties: { a: { type: "string" } }, required: ["a"]
+    })).status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

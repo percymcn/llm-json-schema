@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 731 engine + 202 CLI + 34 ESM/library assertions = **967** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 741 engine + 208 CLI + 34 ESM/library assertions = **983** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -485,7 +485,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 967 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 983 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -576,7 +576,28 @@ The two cases are treated differently, because what matters is what the root has
 | root | verdict |
 |---|---|
 | declares `properties` | **fixed** — `type: "object"` added; lossless |
+| a `$ref` into a local definition | **fixed** — the definition is inlined into the root. Both container spellings resolve: `#/$defs/X` and draft-07 `#/definitions/X` |
+| `anyOf`/`oneOf`/`allOf` where **every** branch is `type: "object"` | **fixed** — `type: "object"` added. Lossless: an instance satisfying any branch was already an object, so the accept set is unchanged and the union survives. Measured — `{type: "object", anyOf: [...]}` is accepted by both helpers |
+| a combinator with any branch that admits a non-object | **blocked** — adding the type is *also* accepted, and silently deletes that branch. Wrap the union in an object instead |
 | declares nothing | **blocked** — adding `type: "object"` is *also* accepted, and leaves an object whose only legal value is `{}` |
+
+The last three rows are why this check is keyed on the **outcome** (does the root
+end up with `type: "object"`?) rather than on a list of keywords. The earlier
+version asked `!type && !$ref && !anyOf && !oneOf && !allOf` — it named every
+keyword that *could* have supplied a type and then excused all of them, so a root
+that was nothing but `anyOf` still had no `type`, both helpers still threw, and
+`--check --to anthropic` answered **"Already valid. No changes needed."**
+
+That was not an exotic shape. It is the **default output of both dominant
+generators**: `zodToJsonSchema(schema, "Ticket")` emits
+`{"$ref": "#/definitions/Ticket", "definitions": {…}}`, and Pydantic's
+`RootModel[Union[A, B]]` emits `{"$defs": {…}, "anyOf": [{"$ref"}, {"$ref"}]}` —
+neither with a root `type`. The `$ref` case slipped through for a second reason
+worth stating on its own: the root-`$ref` inliner matched only `#/$defs/`, and
+the `definitions` → `$defs` rename runs **only on the `output_format` path**. On
+the tools path that rename is correctly absent — `betaTool()` forwards a nested
+`definitions` bag verbatim, so renaming it would be an edit the destination never
+asked for — which left exactly one spelling of one pointer unresolvable.
 
 A rootless root is not hypothetical. `llama-index-core==0.14.23`'s
 `ToolMetadata.get_parameters_dict()` filters a Pydantic schema down to exactly
