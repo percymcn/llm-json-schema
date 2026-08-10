@@ -5100,5 +5100,110 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     }, "anthropic-json"), MARK));
 })();
 
+// --- #358: Go keeps the map and destroys the value schema ---------------
+// `transformSchema`'s dictionary clause preserves `additionalProperties` and
+// recurses into the value schema (#332 -- the one SDK that gets open maps
+// right). That recursion runs the value through the SAME bail as every other
+// node: no `type` and nothing to stand in for one -> the zero
+// `jsonschema.Schema`, which invopop marshals as the literal `true`. So the map
+// survives with its value type replaced by match-anything.
+//
+// All rows measured 2026-08-10 against anthropic-sdk-go@v1.62.0 through
+// `BetaJSONSchemaOutputFormat` AND `BetaToolInputSchema` (identical output --
+// Go has no verbatim path), with a typed control in the same run.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p);
+    return r && r.ledger;
+  }
+  var MARK = "DESTROYS the value schema";
+
+  // VERBATIM `z.record(z.string(), z.never())` on zod@4.4.3 (#311). A map that
+  // admits NO value; Go returns `additionalProperties: true`, which admits
+  // every value. The strongest inversion in the family.
+  var ZOD_NEVER = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: { not: {} }
+  };
+  ok("#358: zod's `z.record(z.never())` map is reported on anthropic-go",
+    has(conv(ZOD_NEVER, "anthropic-go"), MARK));
+
+  // The walk reaches a nested map -- the position that counts is the one in our
+  // own output (#354), and `properties` is where a real model puts a dictionary.
+  ok("#358: a nested open map with a typeless value is reached",
+    has(conv({
+      type: "object", required: ["m"],
+      properties: { m: { type: "object", additionalProperties: { not: {} } } }
+    }, "anthropic-go"), MARK));
+
+  // A typeless object schema WITH declared properties is the shape that loses
+  // the most: measured, the whole model comes back as `true`.
+  ok("#358: a typeless value schema carrying `properties` is reported",
+    has(conv({
+      type: "object",
+      additionalProperties: { properties: { a: { type: "string" } }, required: ["a"] }
+    }, "anthropic-go"), MARK));
+
+  // Length checks, not presence checks -- the Go guard uses `len()`, so an
+  // empty `enum`/`anyOf` reaches the bail. Both measured as `true`.
+  ok("#358: an empty `enum` value schema reaches the Go bail",
+    has(conv({ type: "object", additionalProperties: { enum: [] } }, "anthropic-go"), MARK));
+  ok("#358: an empty `anyOf` value schema reaches the Go bail",
+    has(conv({ type: "object", additionalProperties: { anyOf: [] } }, "anthropic-go"), MARK));
+
+  // --- over-block guards: every one of these is PRESERVED by the SDK -------
+  // Being stricter than the vendor is this project's most repeated bug
+  // (#312/#314/#317/#322/#329/#337/#343/#344/#348). Each row measured intact.
+  [["a declared `type`", { type: "string" }],
+   ["a non-empty `enum`", { enum: ["a", "b"] }],
+   ["a `const`", { const: "x" }],
+   ["a non-empty `allOf`", { allOf: [{ type: "string" }] }],
+   ["a non-empty `anyOf`", { anyOf: [{ type: "string" }] }],
+   ["a `$ref` (the SDK bails on it before the guard)", { $ref: "#/$defs/T" }]
+  ].forEach(function (row) {
+    ok("#358 guard: a value schema with " + row[0] + " is NOT reported",
+      !has(conv({
+        type: "object", additionalProperties: row[1],
+        $defs: { T: { type: "string" } }
+      }, "anthropic-go"), MARK));
+  });
+
+  // `{}` and `true` are THE SAME SCHEMA, so Go's `true` is a faithful rendering
+  // and there is nothing to report. This is the discriminator that keeps the
+  // rule about meaning rather than about emptiness (#347).
+  ok("#358 guard: an already-unconstrained `{}` value schema stays quiet",
+    !has(conv({ type: "object", additionalProperties: {} }, "anthropic-go"), MARK));
+  ok("#358 guard: `additionalProperties: true` stays quiet",
+    !has(conv({ type: "object", additionalProperties: true }, "anthropic-go"), MARK));
+
+  // Per-target scope, measured not ported (rule 0-bis). The TypeScript and
+  // Python `output_format` transformers rebuild the node as
+  // `{"type":"object","properties":{},"additionalProperties":false}` for EVERY
+  // value schema, typed or not -- they never look at the value at all, so this
+  // loss is Go-only and #329's advisory already owns those two paths. The tools
+  // path returns the schema byte-identical.
+  ["anthropic", "anthropic-json", "anthropic-json-python", "openai",
+   "openai-nonstrict", "gemini", "gemini-json"].forEach(function (t) {
+    ok("#358 scope: " + t + " does not claim the Go-only value loss",
+      !has(conv(ZOD_NEVER, t), MARK));
+  });
+
+  // The typed control must still get the reassuring note -- and must NOT get
+  // the destruction note. This pair is what makes the two branches meaningful.
+  ok("#358: a typed value schema still gets the preservation note",
+    has(conv({ type: "object", additionalProperties: { type: "string" } }, "anthropic-go"),
+      "leaves it intact"));
+
+  // We never strip: the value schema stays in our output, which is what makes
+  // the remedy actionable (#318 -- leave the shape visible).
+  ok("#358: the value schema survives our own output",
+    (function () {
+      var r = E.convert(JSON.parse(JSON.stringify(ZOD_NEVER)), "anthropic-go") || {};
+      var ap = r.schema && r.schema.additionalProperties;
+      return !!ap && typeof ap === "object" && ap.not !== undefined;
+    })());
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

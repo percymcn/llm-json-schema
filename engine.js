@@ -90,6 +90,34 @@
     return false;
   }
 
+  // A node the Go SDK cannot key on, mirroring `transformSchema`'s own guard
+  // (schemautil.go:85, anthropic-sdk-go@v1.62.0):
+  //
+  //   s.Type == "" && len(s.AnyOf) == 0 && len(s.AllOf) == 0 &&
+  //   len(s.Enum) == 0 && s.Const == nil
+  //
+  // The bail is NOT a pass-through. It assigns the zero `jsonschema.Schema`,
+  // and invopop's `MarshalJSON` renders a zero schema as the literal JSON
+  // `true` -- a match-anything schema. So a node that constrains something and
+  // has no `type` does not merely lose its constraint, it INVERTS into the
+  // weakest schema there is. `$ref` is excluded because `transformSchema`
+  // returns on it before the guard runs; `oneOf` because it is rewritten to
+  // `anyOf` first. Length checks rather than presence checks, because the Go
+  // guard uses `len()`: `enum: []` and `anyOf: []` reach the bail.
+  //
+  // A node with NO keys is excluded on purpose: `{}` and `true` are the same
+  // schema, so there is nothing to report. Measured control -- zod 4's
+  // `z.record(z.string(), z.unknown())` emits `additionalProperties: {}` and
+  // Go's `true` is a faithful rendering of it.
+  function goReplacesWithTrue(node) {
+    if (!isPlainObject(node)) return false;
+    if (!Object.keys(node).length) return false;
+    function has(k) { return Array.isArray(node[k]) && node[k].length > 0; }
+    return node.type === undefined && node.$ref === undefined &&
+      !has("anyOf") && !has("oneOf") && !has("allOf") && !has("enum") &&
+      node.const === undefined;
+  }
+
   // A TYPED CATCHALL is the shape isOpenMap deliberately excludes one line
   // above: declared `properties` AND an `additionalProperties` that still
   // carries a schema. `z.object({...}).catchall(...)` emits exactly this
@@ -2787,10 +2815,37 @@
       // into the value schema. Reporting a loss here would be the
       // stricter-than-the-vendor bug this project has shipped four times.
       if (goSdk) {
+        // The dictionary clause preserves the MAP. What it then does to the
+        // VALUE is decided by the same guard every other node goes through, and
+        // "recurses into the value schema" is the mechanism, not a reassurance:
+        // a value schema with no `type` is replaced by the literal `true`, so
+        // the map survives with its value type deleted. Measured on
+        // anthropic-sdk-go@v1.62.0 -- `{"additionalProperties":{"not":{}}}`,
+        // which is what zod@4.4.3 emits for `z.record(z.string(), z.never())`,
+        // comes back as `{"type":"object","additionalProperties":true}`: a map
+        // that admitted NO value now admits every value. Unique to Go; the
+        // TypeScript and Python `output_format` transformers empty the map
+        // itself and never look at the value schema at all.
+        if (goReplacesWithTrue(node.additionalProperties)) {
+          ledger.push(entry("=", path,
+            "This is an open map, and the Go SDK keeps the map but DESTROYS the value schema. " +
+            "`transformSchema`'s dictionary clause recurses into `additionalProperties`, and that " +
+            "value schema has no `type` (and no `anyOf`/`allOf`/`enum`/`const` to stand in for one), " +
+            "so the SDK overwrites it with the zero `jsonschema.Schema`, which marshals as the " +
+            "literal JSON `true`. You get `additionalProperties: true` — every key legal, every " +
+            "value legal. No error is raised, and the output is byte-identical to what a genuinely " +
+            "unconstrained map produces, so nothing downstream can tell the two apart. " +
+            "Give the value schema an explicit `type`. (`z.record(z.string(), z.never())` on zod 4 " +
+            "emits `additionalProperties: {\"not\":{}}`, which means NO key is legal — that one " +
+            "inverts completely.) The `--to anthropic` tools path keeps your value schema verbatim.",
+            url, true));
+          return;
+        }
         ledger.push(entry("=", path,
           "This is an open map (`additionalProperties` with no `properties`), and the Go SDK keeps it " +
           "— `transformSchema` has an explicit dictionary clause that preserves `additionalProperties` " +
-          "and recurses into the value schema. Nothing to fix. Worth knowing only because the other " +
+          "and recurses into the value schema. Your value schema declares a `type`, so that recursion " +
+          "leaves it intact. Worth knowing only because the other " +
           "two paths differ: `--to anthropic-json` (TypeScript) rebuilds this node as " +
           "`{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}`, so the field can " +
           "never be populated, and `--to openai` blocks it outright.",
