@@ -875,7 +875,17 @@
   //     typed-field rows #354 measured on the Go client and deliberately did
   //     not ship, because no generator emits them. Widening to every keyword
   //     would re-litigate that decision by accident. Measured-and-not-shipped
-  //     the same way here: `required: "a"`, `enum: {}`, `type: 5`, `format: null`.
+  //     the same way here: `required: "a"`, `enum: {}`, `format: null`.
+  //
+  //     `type` WAS on that list and #373 deliberately took it off, for a reason
+  //     that does not extend to the other three: BOTH halves of the exclusion
+  //     fail for it. (a) A real generator emits it -- smolagents renders every
+  //     `Any` annotation as `{"type": "any"}`, measured in four positions.
+  //     (b) It is not inert: `type` is the keyword every downstream dialect
+  //     DISPATCHES on (Anthropic's transform #327, Gemini's proto enum #326),
+  //     so an illegal value is a measured hard 400 on the narrow Gemini path
+  //     AND silently defeats every type-keyed rule in this engine. `required`
+  //     and `format` have no such dispatch. See illegalTypeMessage().
   //
   //  2. KIND, NOT MEMBERSHIP. The test is "is this the right KIND of thing?",
   //     NOT the table's isSubschemaMap/isSubschemaArray -- those additionally
@@ -904,6 +914,24 @@
     }
     function visit(node, path) {
       if (!isPlainObject(node)) return;
+      // #373: an illegal `type` VALUE, checked on the same traversal rather than
+      // in a second walker -- a second walker gets its own blind spots, which is
+      // the failure this project has shipped ten times.
+      if ("type" in node) {
+        var tv = Array.isArray(node.type) ? node.type : [node.type];
+        // An EMPTY `type: []` is deliberately out of scope: that is the
+        // empty-collection class (#347), it is a list-valued `type` and so is
+        // already Gemini's repeating-field error (#368), and no probed
+        // generator emits it. Pinned by a scope test so a later widening is a
+        // decision rather than an accident.
+        if (tv.length) {
+          var illegal = tv.filter(function (t) {
+            return !(typeof t === "string" &&
+              Object.prototype.hasOwnProperty.call(JSON_SCHEMA_TYPES, t));
+          });
+          if (illegal.length) bad.push({ path: path, kw: "type", illegalTypes: illegal });
+        }
+      }
       Object.keys(node).forEach(function (k) {
         var shape = Object.prototype.hasOwnProperty.call(CONTAINER_SHAPE, k) ? CONTAINER_SHAPE[k] : null;
         if (!shape) return;                    // unknown / non-container keyword: not ours
@@ -953,7 +981,39 @@
   // "The client forwarded it" is weak evidence here (#354): a decoder cannot be
   // constrained by a `properties` that is a boolean, so acceptance is not
   // correctness (#347).
+  // #373: `type` is not a container, so the shape check above cannot see it --
+  // and it is the ONE keyword every downstream dialect DISPATCHES on, so an
+  // illegal value there is not an inert oddity like `required: "a"`. Measured
+  // 2026-08-10: our own `schemaTypes()` returns null for it, i.e. the engine
+  // already owned the table of legal values (`JSON_SCHEMA_TYPES`) and consulted
+  // it in exactly ONE place, where an illegal value silently became "type
+  // unknown" -- #355's lesson one target over, and #320's fail-open asymmetry.
+  function illegalTypeMessage(hit) {
+    var shown = hit.illegalTypes.map(function (t) { return JSON.stringify(t); }).join(", ");
+    return "`type` here is " + shown + ", which is not one of JSON Schema's seven type " +
+      "values (`string`, `number`, `integer`, `boolean`, `object`, `array`, `null`). This " +
+      "document is not valid JSON Schema -- `ajv` (2020-12) REFUSES TO COMPILE it, so no " +
+      "validator can honour this node. It is a blocker rather than a note because the fix " +
+      "is not ours to guess AND because we measured the two ways it goes wrong. Gemini's " +
+      "narrow `responseSchema` types `type` as a proto ENUM: the live v1beta endpoint " +
+      "rejects it outright (`Invalid value at ... .type`), and it rejects OUR CONVERTED " +
+      "OUTPUT the same way, so without this line `--check` would report changes, you would " +
+      "commit them, and the 400 would still be there. The other clients do NOT complain: " +
+      "`openai` 7.4.0's `toStrictJsonSchema` and `@anthropic-ai/sdk` 0.116.0's `betaTool` " +
+      "both forward it VERBATIM, and being accepted is not being honoured (#347) -- a " +
+      "constrained decoder cannot be constrained by a type it does not know. Where this " +
+      "comes from, measured: `smolagents` builds tool schemas straight from Python type " +
+      "hints, and `_function_type_hints_utils.get_json_schema` emits `{\"type\": \"any\"}` " +
+      "for a bare `Any`, `List[Any]`, `Dict[str, Any]` and `Optional[Any]` alike. THE " +
+      "REMEDY IS NOT TO DELETE `type`: `any` means the match-anything schema, and a " +
+      "typeless / match-anything node is itself refused further down this pipeline " +
+      "(#315/#333) because a constrained decoder cannot express anything-goes. Declare the " +
+      "shape you actually expect, or type the field `{\"type\": \"string\"}` and have the " +
+      "model emit serialized JSON that you parse yourself.";
+  }
+
   function malformedKeywordMessage(hit) {
+    if (hit.illegalTypes) return illegalTypeMessage(hit);
     return "`" + hit.kw + "` must be " + hit.want + ", but here it is " + hit.got + ". " +
       "This document is not valid JSON Schema, so everything inside that keyword was " +
       "SKIPPED -- every rule that would have looked in there never ran. That is why this " +

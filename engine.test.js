@@ -7010,5 +7010,134 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- #373: an illegal `type` VALUE -------------------------------------------
+// `type` is not a container, so #355's shape check could not see it -- and it is
+// the ONE keyword every downstream dialect DISPATCHES on. The engine already
+// owned the table of legal values (JSON_SCHEMA_TYPES) and consulted it in
+// exactly one place, inside schemaTypes(), where an illegal value made it return
+// null = "type unknown". It failed OPEN, so no rule ever said the value was
+// illegal (#320's asymmetry; #355's "a table used in one place is not a rule").
+//
+// MEASURED 2026-08-10. Legality: `ajv` 2020-12 REFUSES TO COMPILE `{type:"any"}`
+// (17/18 agreement between this predicate and ajv over a shape battery; the one
+// disagreement is `type: []`, deliberately out of scope below). Consequence:
+// Gemini's narrow responseSchema types `type` as a proto enum, and the live
+// v1beta endpoint rejects `"any"` exactly as it rejects the `"frobnicate"`
+// control while `"string"` reaches auth -- and it rejected OUR OWN CONVERTED
+// OUTPUT identically, which is #330's invariant break. openai 7.4.0
+// toStrictJsonSchema and @anthropic-ai/sdk 0.116.0 betaTool both forward it
+// VERBATIM, so acceptance is not correctness (#347).
+//
+// Reachability is a real generator, not a hand-written fixture (#311): the
+// verbatim payloads below are smolagents' own output.
+(function () {
+  var TARGETS = Object.keys(E.DOCS);
+  // Keyed on the ledger OP plus a phrase unique to THIS rule -- the generic
+  // #355 message shares "is not valid JSON Schema", so matching that alone
+  // could not tell the two rules apart (#340: the discriminator must discriminate).
+  function badType(l) {
+    return (l || []).some(function (e) {
+      return e.op === "!" && !e.advisory && /seven type values/.test(e.msg);
+    });
+  }
+  function hits(sch, provider) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), provider || "openai");
+    return !!(r && r.ok !== false && badType(r.ledger));
+  }
+  function hitsEvery(sch) { return TARGETS.every(function (t) { return hits(sch, t); }); }
+  function hitsNone(sch) { return TARGETS.every(function (t) { return !hits(sch, t); }); }
+
+  // --- every position the traversal reaches ----------------------------------
+  ok("#373 `type: \"any\"` at the root is caught on all ten targets",
+    hitsEvery({ type: "any" }));
+  ok("#373 caught inside `properties`",
+    hitsEvery({ type: "object", properties: { m: { type: "any" } } }));
+  ok("#373 caught inside `items`",
+    hitsEvery({ type: "array", items: { type: "any" } }));
+  ok("#373 caught inside `additionalProperties`",
+    hitsEvery({ type: "object", additionalProperties: { type: "any" } }));
+  ok("#373 caught inside an `anyOf` branch",
+    hitsEvery({ anyOf: [{ type: "string" }, { type: "any" }] }));
+  ok("#373 caught inside `$defs`",
+    hitsEvery({ type: "object", properties: { a: { $ref: "#/$defs/T" } }, $defs: { T: { type: "any" } } }));
+  ok("#373 caught as ONE MEMBER of a union `type` (the other member is legal)",
+    hitsEvery({ type: ["string", "any"] }));
+  ok("#373 a non-STRING member is the same predicate (`type: 5`)",
+    hitsEvery({ type: "object", properties: { m: { type: 5 } } }));
+  ok("#373 case matters: `\"String\"` is not `\"string\"`",
+    hitsEvery({ type: "object", properties: { m: { type: "String" } } }));
+
+  // --- OVER-BLOCK GUARDS. Being stricter than the destination is the bug this
+  // project has shipped ~10 times, and 0 of 578 captured corpus inputs are
+  // flagged by this rule (control: the four smolagents rows below ARE).
+  ok("#373 guard: a legal scalar type is untouched",
+    hitsNone({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }));
+  ok("#373 guard: a legal union type is untouched",
+    hitsNone({ type: "object", properties: { a: { type: ["string", "null"] } }, required: ["a"] }));
+  ok("#373 guard: a property literally NAMED `type` is not a false positive",
+    hitsNone({ type: "object", properties: { type: { type: "string" } }, required: ["type"] }));
+  ok("#373 guard: `type` inside an `enum` VALUE is data, not a schema position",
+    hitsNone({ type: "object", properties: { a: { enum: [{ type: "any" }] } }, required: ["a"] }));
+  ok("#373 guard: `type` inside a `const` VALUE is data",
+    hitsNone({ type: "object", properties: { a: { "const": { type: "any" } } }, required: ["a"] }));
+  ok("#373 guard: `type` inside a `default` VALUE is data",
+    hitsNone({ type: "object", properties: { a: { type: "object", "default": { type: "any" } } }, required: ["a"] }));
+
+  // --- SCOPE PIN. `type: []` is ajv-illegal too and is deliberately NOT this
+  // rule: it is the empty-collection class (#347), it is a LIST-valued `type`
+  // and so already Gemini's repeating-field error (#368/#369), and no probed
+  // generator emits it. Measured on the live v1beta endpoint 2026-08-10: it is
+  // rejected, but with `Unknown name "type"` (a proto SHAPE error), not the
+  // `Invalid value at ... .type` enum error `"any"` gets. Different cause,
+  // different message, different owner. Pinned so a later widening is a
+  // decision rather than an accident (#355's own corollary).
+  ok("#373 scope: an EMPTY `type: []` is out of scope for this rule",
+    hitsNone({ type: "object", properties: { m: { type: [] } }, required: ["m"] }));
+
+  // An inferred schema is well formed by construction (#355's precedent).
+  ok("#373 an input treated as an EXAMPLE is not reported",
+    !badType((E.convert({ items: [1, 2, 3], total: 12.5 }, "openai") || {}).ledger));
+
+  // --- REACHABILITY: verbatim smolagents output (#311 -- test against the real
+  // generator's input, not a fixture we wrote). get_json_schema() renders EVERY
+  // `Any` annotation this way, in four different positions.
+  var SMOL = {
+    "bare Any": { type: "object", properties: { v: { type: "any", description: "a value" } }, required: ["v"] },
+    "List[Any]": { type: "object", properties: { v: { type: "array", items: { type: "any" }, description: "values" } }, required: ["v"] },
+    "Dict[str, Any]": { type: "object", properties: { v: { type: "object", additionalProperties: { type: "any" }, description: "mapping" } }, required: ["v"] },
+    "Optional[Any]": { type: "object", properties: { v: { type: "any", nullable: true, description: "maybe" } } }
+  };
+  Object.keys(SMOL).forEach(function (k) {
+    ok("#373 smolagents `" + k + "` is caught on all ten targets", hitsEvery(SMOL[k]));
+  });
+  // The control that makes those four mean something: the SAME generator's
+  // output for a function with no `Any` must stay clean.
+  ok("#373 control: smolagents output with no `Any` is NOT flagged",
+    hitsNone({ type: "object", properties: { a: { type: "string", description: "a string" }, b: { type: "integer", description: "an int" } }, required: ["a", "b"] }));
+
+  // The blocker is a real blocker, never an advisory (#317: an advisory must
+  // never fail the gate, and this one must).
+  ok("#373 the entry is a blocker, not an advisory", (function () {
+    var l = (E.convert({ type: "any" }, "openai") || {}).ledger || [];
+    var e = l.filter(function (x) { return /seven type values/.test(x.msg); })[0];
+    return !!e && e.op === "!" && !e.advisory;
+  })());
+  // It must be the FIRST line: every other entry was computed from a document
+  // we could not fully read (#355's unshift).
+  ok("#373 the blocker is the first ledger line", (function () {
+    var l = (E.convert({ type: "object", properties: { m: { type: "any" } } }, "openai") || {}).ledger || [];
+    return l.length > 0 && /seven type values/.test(l[0].msg);
+  })());
+  // The remedy must NOT be "delete `type`" -- a typeless/match-anything node is
+  // itself refused further down this pipeline (#315/#333), so advising it would
+  // send the reader into a second blocker.
+  ok("#373 the remedy does not tell the reader to delete `type`", (function () {
+    var l = (E.convert({ type: "any" }, "openai") || {}).ledger || [];
+    var e = l.filter(function (x) { return /seven type values/.test(x.msg); })[0];
+    return !!e && /NOT TO DELETE/.test(e.msg) && /serialized JSON/.test(e.msg);
+  })());
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

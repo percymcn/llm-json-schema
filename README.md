@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1127 engine + 258 CLI + 42 ESM/library assertions = **1427** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1152 engine + 258 CLI + 42 ESM/library assertions = **1452** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -714,7 +714,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1427 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1452 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1246,6 +1246,42 @@ note `deprecated` is *not* in it), which is the standard Pydantic v1 output for 
 described nested field; and a `$defs`/`definitions` bag beside a `$ref`, which is
 not a constraining sibling at all.
 
+
+## `"any"` is not a type, and one generator writes it everywhere
+
+`type` has exactly seven legal values — `string`, `number`, `integer`, `boolean`,
+`object`, `array`, `null`. `smolagents` builds tool schemas straight from Python
+type hints, and `_function_type_hints_utils.get_json_schema()` renders **every
+`Any` annotation** as `{"type": "any"}` — measured 2026-08-10 for a bare `Any`,
+`List[Any]`, `Dict[str, Any]` and `Optional[Any]`, in four different positions.
+
+`ajv` (2020-12) refuses to compile that schema, so no validator can honour the
+node. The destinations split, and the split is the reason this is a blocker:
+
+| destination | `{"type": "any"}` |
+|---|---|
+| Gemini narrow `responseSchema` | **rejected** — `type` is a proto enum; live v1beta answers `Invalid value at … .type`, exactly as it answers for a `"frobnicate"` control, while `"string"` reaches auth |
+| Gemini `responseJsonSchema` | accepted (payload validation) |
+| `openai` 7.4.0 `toStrictJsonSchema` | forwarded **verbatim** |
+| `@anthropic-ai/sdk` 0.116.0 `betaTool` | forwarded **verbatim** |
+
+Before this rule the tool exited **0** on `--to openai`, `anthropic`,
+`anthropic-json`, `anthropic-go` and `gemini-json`, and affirmatively listed all
+of them under *"already valid as-is for"*. On `--to gemini` it exited 1 for two
+unrelated reasons and never mentioned the illegal value — so the emitted output
+still carried it and was still rejected by the live endpoint with the same
+error. A gate whose fix does not fix it is worse than no gate.
+
+**There is no repair, and in particular the fix is not "delete `type`".** `any`
+means the match-anything schema, and a typeless / match-anything node is itself
+refused further down this pipeline, because a constrained decoder cannot express
+anything-goes. Declare the shape you expect, or type the field
+`{"type": "string"}` and have the model emit serialized JSON you parse yourself.
+
+An empty `type: []` is deliberately **not** this rule: that is a list-valued
+`type` with zero members, which the live endpoint rejects with a proto *shape*
+error rather than the enum-value error, so it belongs to the union-`type`
+handling instead. It is pinned by a scope test.
 
 ## License
 MIT.
