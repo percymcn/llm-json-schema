@@ -4336,5 +4336,172 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     has(emptyR.ledger, "array in that example was empty"));
 })();
 
+// --- #351: the round-trip invariant, executed rather than described ---------
+// #350 established the rule -- an inferred schema must validate the example it
+// was inferred from -- and verified it against ajv 2020 IN THE CYCLE RECORD.
+// The assertions it left behind pin the resulting SHAPES ("items is a union of
+// integer and string"), which is a proxy for the property, not the property. A
+// future change can satisfy every shape assertion and still break the round
+// trip, so the invariant is asserted directly here.
+//
+// The validator below covers EXACTLY the output language of inferSchema (type /
+// properties / required / items / anyOf, plus additionalProperties:false, which
+// conversion adds) and nothing else. It is deliberately not a JSON Schema
+// implementation: the repo ships `dependencies: {}` and that is a product
+// property. It was cross-verified against ajv 2020 over 341 (schema, instance)
+// pairs with 0 disagreements, 285 of them genuine REJECTIONS -- the self-check
+// below keeps it from silently decaying into a permissive stub that says yes to
+// everything and proves nothing.
+(function () {
+  function isType(t, v) {
+    if (t === "null") return v === null;
+    if (t === "string") return typeof v === "string";
+    if (t === "boolean") return typeof v === "boolean";
+    if (t === "integer") return typeof v === "number" && Math.floor(v) === v && isFinite(v);
+    if (t === "number") return typeof v === "number";
+    if (t === "array") return Array.isArray(v);
+    if (t === "object") return v !== null && typeof v === "object" && !Array.isArray(v);
+    return true;
+  }
+  function accepts(schema, value) {
+    if (!schema || typeof schema !== "object") return true;
+    if (Array.isArray(schema.anyOf)) {
+      for (var i = 0; i < schema.anyOf.length; i++) if (accepts(schema.anyOf[i], value)) return true;
+      return false;
+    }
+    if (schema.type !== undefined) {
+      var types = Array.isArray(schema.type) ? schema.type : [schema.type];
+      var okType = false;
+      for (var j = 0; j < types.length; j++) if (isType(types[j], value)) { okType = true; break; }
+      if (!okType) return false;
+    }
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      var req = schema.required || [];
+      for (var r = 0; r < req.length; r++) {
+        if (!Object.prototype.hasOwnProperty.call(value, req[r])) return false;
+      }
+      var props = schema.properties || {};
+      for (var k in props) {
+        if (Object.prototype.hasOwnProperty.call(value, k) && !accepts(props[k], value[k])) return false;
+      }
+      if (schema.additionalProperties === false) {
+        for (var vk in value) if (!Object.prototype.hasOwnProperty.call(props, vk)) return false;
+      }
+    }
+    if (schema.items !== undefined && Array.isArray(value)) {
+      for (var a = 0; a < value.length; a++) if (!accepts(schema.items, value[a])) return false;
+    }
+    return true;
+  }
+
+  // Anti-vacuity self-check. Without this the whole block could pass against a
+  // validator that returns true unconditionally.
+  ok("#351 the round-trip validator rejects a wrong scalar type",
+    accepts({ type: "integer" }, "x") === false);
+  ok("#351 the round-trip validator rejects a missing required key",
+    accepts({ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, {}) === false);
+  ok("#351 the round-trip validator rejects a bad array element",
+    accepts({ type: "array", items: { type: "integer" } }, [1, "x"]) === false);
+  ok("#351 the round-trip validator rejects an undeclared key when closed",
+    accepts({ type: "object", properties: {}, additionalProperties: false }, { a: 1 }) === false);
+  ok("#351 the round-trip validator rejects a value matching no anyOf branch",
+    accepts({ anyOf: [{ type: "string" }, { type: "integer" }] }, true) === false);
+  ok("#351 the round-trip validator still accepts a legal instance",
+    accepts({ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, { a: 1 }) === true);
+
+  // The battery is deliberately wider than #350's six shapes: ragged nested
+  // arrays, disjoint objects, empty-then-populated containers, three-way scalar
+  // unions and deep mixed nesting are all shapes inference had never been run
+  // against. 16 of these fail against the pre-#350 engine.
+  var BATTERY = [
+    { name: "flat object", doc: { id: 1, name: "a", ok: true } },
+    { name: "homogeneous array", doc: { xs: [1, 2, 3] } },
+    { name: "nested object", doc: { a: { b: { c: "x" } } } },
+    { name: "mixed scalar array", doc: { xs: [1, "a"] } },
+    { name: "int beside float", doc: { xs: [1, 2.5] } },
+    { name: "float beside int", doc: { xs: [2.5, 1] } },
+    { name: "null beside string", doc: { xs: [null, "x"] } },
+    { name: "ragged nested arrays", doc: { xs: [[1], [2, "a"]] } },
+    { name: "empty then populated array", doc: { xs: [[], [1, 2]] } },
+    { name: "empty then populated object", doc: { xs: [{}, { a: 1 }] } },
+    { name: "disjoint objects", doc: { xs: [{ a: 1 }, { b: 2 }] } },
+    { name: "object beside scalar", doc: { xs: [{ a: 1 }, "x"] } },
+    { name: "object, scalar, wider object", doc: { xs: [{ a: 1 }, "x", { a: 1, b: 2 }] } },
+    { name: "null beside object", doc: { xs: [null, { a: 1 }] } },
+    { name: "array beside object", doc: { xs: [[1], { a: 1 }] } },
+    { name: "bool beside int", doc: { xs: [true, 1] } },
+    { name: "array property varies in width", doc: { xs: [{ tags: [] }, { tags: ["x"] }] } },
+    { name: "nested property type varies", doc: { xs: [{ v: 1 }, { v: "a" }] } },
+    { name: "nested property int/float", doc: { xs: [{ v: 1 }, { v: 2.5 }] } },
+    { name: "nested property null/string", doc: { xs: [{ v: null }, { v: "a" }] } },
+    { name: "deep mixed nesting", doc: { a: { b: { c: [1, "x", null] } } } },
+    { name: "three-way scalar union", doc: { xs: [1, "a", true] } },
+    { name: "nested objects differing", doc: { xs: [{ o: { a: 1 } }, { o: { a: 1, b: 2 } }] } },
+    { name: "array of nulls", doc: { xs: [null, null] } },
+    { name: "null-valued property", doc: { a: null, b: "x" } },
+    { name: "top-level array", doc: [{ a: 1 }, { a: 1, b: 2 }] },
+    { name: "top-level mixed array", doc: [1, "a"] }
+  ];
+
+  var infFails = [];
+  for (var i = 0; i < BATTERY.length; i++) {
+    if (!accepts(E.inferSchema(BATTERY[i].doc), BATTERY[i].doc)) infFails.push(BATTERY[i].name);
+  }
+  ok("#351 every inferred schema accepts the example it came from (" + BATTERY.length + " shapes)",
+    infFails.length === 0, infFails.join("; "));
+
+  // Conversion must not quietly destroy the invariant either. Scoped by DIALECT,
+  // and the scoping is the non-obvious part: `gemini` alone is excluded because
+  // its output is a Gemini `Schema` PROTO MESSAGE, not JSON Schema (#319's
+  // split), so it legitimately spells a null-typed node `{"nullable": true}`.
+  // Running a JSON Schema validator over it is a category error -- one that this
+  // cycle made before catching it. `gemini-client` keeps JSON Schema spellings
+  // (#336) and so IS in scope.
+  var JSON_DIALECT = ["openai", "openai-nonstrict", "openai-realtime", "anthropic",
+    "anthropic-json", "anthropic-json-python", "anthropic-go", "gemini-json", "gemini-client"];
+  // The assertion is a DISJUNCTION rather than a skip-list: a conversion may
+  // narrow below the example only if it SAYS SO. Strict mode legitimately
+  // narrows here (it has no optional fields, so a key absent from one element
+  // becomes required-and-nullable) and states it verbatim. Keying on the ledger
+  // entry that actually fired, rather than on a hand-maintained list of fixture
+  // names, is what keeps this honest -- the name list I wrote first silently
+  // missed a case, which is #340's lesson about keying on the op and not prose.
+  var convFails = [], narrowed = 0;
+  for (var t = 0; t < JSON_DIALECT.length; t++) {
+    for (var b = 0; b < BATTERY.length; b++) {
+      var r = E.convert(BATTERY[b].doc, JSON_DIALECT[t], { mode: "example" });
+      if (!r || !r.ok || !r.schema) continue;
+      if (accepts(r.schema, BATTERY[b].doc)) continue;
+      if (has(r.ledger, "added to required")) { narrowed++; continue; }
+      convFails.push(JSON_DIALECT[t] + "/" + BATTERY[b].name);
+    }
+  }
+  ok("#351 a conversion narrows below its own example only when it says so",
+    convFails.length === 0, convFails.slice(0, 6).join("; "));
+  // Without this the disjunction could pass vacuously by never narrowing at all.
+  ok("#351 GUARD the strict-mode narrowing branch is actually exercised",
+    narrowed > 0);
+
+  // GUARD: `gemini` is excluded for a REASON, not because it is broken. Its
+  // output must still be the proto spelling -- if this ever starts looking like
+  // JSON Schema, the exclusion above is what needs revisiting.
+  var gem = E.convert({ a: null, b: "x" }, "gemini", { mode: "example" });
+  ok("#351 GUARD `gemini` emits the proto spelling, which is why it is excluded",
+    at(gem.schema, "properties.a.nullable") === true && at(gem.schema, "properties.a.type") === undefined);
+
+  // GUARD for the #336/#337 interaction, which was correct but UNPINNED. A
+  // converting client rebuilds the request from its own Schema type and drops
+  // `nullable` outright -- it is not a JSON Schema keyword -- so emitting the
+  // proto spelling here would delete the null constraint with no error anywhere.
+  var gc = E.convert({ a: null, b: "x" }, "gemini-client", { mode: "example" });
+  ok("#351 `gemini-client` keeps `type: \"null\"` rather than the droppable `nullable`",
+    at(gc.schema, "properties.a.type") === "null" && at(gc.schema, "properties.a.nullable") === undefined);
+
+  // The documented strict-mode narrowing must stay REPORTED, never silent.
+  var opt = E.convert({ xs: [{ a: 1 }, { a: 1, b: 2 }] }, "openai", { mode: "example" });
+  ok("#351 strict mode's optional-key narrowing is stated, not silent",
+    has(opt.ledger, "added to required"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
