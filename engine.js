@@ -127,6 +127,35 @@
     return o != null && Object.prototype.hasOwnProperty.call(o, k);
   }
 
+  // The MIRROR of `hasOwn`, and the half #380 did not fix. `hasOwn` made every
+  // membership READ ask about the object rather than about Object.prototype;
+  // this makes every WRITE actually create the property it names. A plain
+  // `o[k] = v` is an own-property assignment for every key in JSON except one:
+  // `__proto__` is an ACCESSOR inherited from Object.prototype, so `o["__proto__"] = v`
+  // invokes its setter and silently sets the object's prototype instead --
+  // creating no property at all (and doing nothing whatsoever when `v` is a
+  // primitive). Measured: `toString`, `constructor`, `valueOf` and
+  // `hasOwnProperty` are DATA properties and assign fine, so `__proto__` is the
+  // entire failure set on the write side, which is exactly why it survived a
+  // sweep aimed at the read side.
+  //
+  // The consequence was not "unfixed", it was DELETION: the node rebuild in
+  // `resolveRefSiblings` does `out[k] = visit(node[k])` for every key, so any
+  // document containing a `$ref` lost a property (or a definition) named
+  // `__proto__` outright, while `required` went on naming it. Six of ten
+  // targets, five of them at ZERO blockers.
+  //
+  // Keyed on the one bad name rather than always going through
+  // `defineProperty`, so the ordinary path stays a plain assignment.
+  function setOwn(o, k, v) {
+    if (k === "__proto__") {
+      Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+      return v;
+    }
+    o[k] = v;
+    return v;
+  }
+
   // Every keyword allowlist below is consulted with a key taken from the
   // CALLER'S document, so `TABLE[k]` has the same prototype hole: an unknown
   // keyword named `toString` reads as a truthy member of every table and is
@@ -728,11 +757,11 @@
       // demonstrably optional. (Strict mode has no optional fields, so the
       // openai converter will later force it required-and-nullable and say so.)
       var props = {};
-      Object.keys(a.properties).forEach(function (k) { props[k] = a.properties[k]; });
+      Object.keys(a.properties).forEach(function (k) { setOwn(props, k, a.properties[k]); });
       Object.keys(b.properties).forEach(function (k) {
-        props[k] = props[k] === undefined
+        setOwn(props, k, props[k] === undefined
           ? b.properties[k]
-          : joinInferred(props[k], b.properties[k]);
+          : joinInferred(props[k], b.properties[k]));
       });
       var bReq = b.required || [];
       var req = (a.required || []).filter(function (k) { return bReq.indexOf(k) !== -1; });
@@ -784,7 +813,7 @@
       var props = {};
       var required = [];
       Object.keys(value).forEach(function (k) {
-        props[k] = inferSchema(value[k]);
+        setOwn(props, k, inferSchema(value[k]));
         required.push(k);
       });
       return { type: "object", properties: props, required: required };
@@ -1479,7 +1508,7 @@
     if (isPlainObject(s.$defs)) {
       // both present — merge `definitions` in without clobbering `$defs`
       Object.keys(s.definitions).forEach(function (k) {
-        if (!hasOwn(s.$defs, k)) s.$defs[k] = s.definitions[k];
+        if (!hasOwn(s.$defs, k)) setOwn(s.$defs, k, s.definitions[k]);
       });
     } else {
       s.$defs = s.definitions;
@@ -1604,7 +1633,7 @@
           } else {
             name = toks[1];
           }
-          if (name !== null) names[name] = true;
+          if (name !== null) setOwn(names, name, true);
         } else if (v.$ref.charAt(0) === "#" && v.$ref !== "#") {
           bailOut = true;
         }
@@ -1742,13 +1771,13 @@
 
     // carry over any sibling keys the generator left next to `$ref`
     Object.keys(s).forEach(function (k) {
-      if (k !== "$ref" && k !== bag && !hasOwn(out, k)) out[k] = s[k];
+      if (k !== "$ref" && k !== bag && !hasOwn(out, k)) setOwn(out, k, s[k]);
     });
 
     // keep only the definitions something still points at (recursive schemas
     // reference themselves, so `name` may need to stay)
     var remaining = {};
-    Object.keys(defs).forEach(function (k) { if (k !== name) remaining[k] = defs[k]; });
+    Object.keys(defs).forEach(function (k) { if (k !== name) setOwn(remaining, k, defs[k]); });
     // Structurally, via the SAME helper the orphan pruner uses. This used to be
     // `JSON.stringify([out, remaining]).indexOf('"#/' + bag + '/' + name + '"')`
     // -- a literal match that only ever recognised the plain spelling, so a
@@ -1763,7 +1792,7 @@
     // until we removed what it resolved to.
     var refs = localDefRefs([out, remaining], bag, defs);
     if (refs.bailOut || refs.names[name]) {
-      remaining[name] = defs[name];
+      setOwn(remaining, name, defs[name]);
     }
     if (Object.keys(remaining).length) out[bag] = remaining;
 
@@ -1883,13 +1912,13 @@
     if (nProps) {
       if (!isPlainObject(out.properties)) out.properties = {};
       Object.keys(nProps).forEach(function (k) {
-        if (!hasOwn(out.properties, k)) out.properties[k] = clone(nProps[k]);
+        if (!hasOwn(out.properties, k)) setOwn(out.properties, k, clone(nProps[k]));
       });
     }
     if (req.length) out.required = req.slice();
     siblings.forEach(function (k) {
       if (k === "properties" || k === "required") return;
-      out[k] = clone(node[k]);
+      setOwn(out, k, clone(node[k]));
     });
 
     // Lossless by construction: every name removed here is one a closed side
@@ -1947,7 +1976,7 @@
           // the whole definition instead of the part the caller pointed at.
           var target = visit(clone(t.node), stack.concat([name]), path);
           var visited = {};
-          siblings.forEach(function (k) { visited[k] = visit(node[k], stack, path); });
+          siblings.forEach(function (k) { setOwn(visited, k, visit(node[k], stack, path)); });
           var merged = intersectRef(target, visited, siblings, path, ledger, docUrl);
           if (merged) {
             fixed++;
@@ -1968,7 +1997,7 @@
       }
 
       var out = {};
-      Object.keys(node).forEach(function (k) { out[k] = visit(node[k], stack, path + "/" + k); });
+      Object.keys(node).forEach(function (k) { setOwn(out, k, visit(node[k], stack, path + "/" + k)); });
       // Track the object we hand back BY IDENTITY, not by a snapshot: the rest
       // of the pipeline mutates this node (it gains `additionalProperties`, its
       // `required` is rewritten), so a structural fingerprint taken here would
@@ -2008,7 +2037,7 @@
       if (!found.bailOut) {
         var kept = {};
         Object.keys(result.$defs).forEach(function (k) {
-          if (hasOwn(found.names, k) && found.names[k]) kept[k] = result.$defs[k];
+          if (hasOwn(found.names, k) && found.names[k]) setOwn(kept, k, result.$defs[k]);
         });
         if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
       }
@@ -2187,8 +2216,8 @@
       var target = derefLocal(root, node.$ref);
       if (target === undefined) return undefined;
       var next = {};
-      Object.keys(seen).forEach(function (k) { next[k] = 1; });
-      next[node.$ref] = 1;
+      Object.keys(seen).forEach(function (k) { setOwn(next, k, 1); });
+      setOwn(next, node.$ref, 1);
       return exclResolve(target, root, next);
     }
     return node;
@@ -2516,7 +2545,7 @@
             if (!(tgt.type === "object" || isPlainObject(tgt.properties))) return m;
             if (JSON.stringify(tgt).indexOf(m.$ref) !== -1) return m; // recursive
             var res = clone(tgt);
-            extra.forEach(function (k) { if (!hasOwn(res, k)) res[k] = clone(m[k]); });
+            extra.forEach(function (k) { if (!hasOwn(res, k)) setOwn(res, k, clone(m[k])); });
             refMembersResolved++;
             return res;
           });
@@ -2661,7 +2690,7 @@
               // Merge, do not overwrite. Union of `properties` and of `required`.
               if (!node.properties) node.properties = {};
               Object.keys(onlyProps).forEach(function (k) {
-                if (!hasOwn(node.properties, k)) node.properties[k] = clone(onlyProps[k]);
+                if (!hasOwn(node.properties, k)) setOwn(node.properties, k, clone(onlyProps[k]));
               });
               var oneReq = Array.isArray(only.required) ? only.required : [];
               var baseReq = Array.isArray(node.required) ? node.required : [];
@@ -2676,7 +2705,7 @@
               // `$ref` beside metadata, the form the vendor accepts.
               Object.keys(only).forEach(function (k) {
                 if (k === "properties" || k === "required") return;
-                if (!hasOwn(node, k)) node[k] = clone(only[k]);
+                if (!hasOwn(node, k)) setOwn(node, k, clone(only[k]));
               });
             }
             delete node.allOf;
@@ -2692,7 +2721,7 @@
           var mergedProps = {}, mergedReq = [];
           members.forEach(function (m) {
             Object.keys(m.properties).forEach(function (k) {
-              if (!hasOwn(mergedProps, k)) mergedProps[k] = clone(m.properties[k]);
+              if (!hasOwn(mergedProps, k)) setOwn(mergedProps, k, clone(m.properties[k]));
             });
             (Array.isArray(m.required) ? m.required : []).forEach(function (k) {
               if (mergedReq.indexOf(k) === -1) mergedReq.push(k);
@@ -2700,7 +2729,7 @@
           });
           Object.keys(mergedProps).forEach(function (k) {
             if (!node.properties) node.properties = {};
-            if (!hasOwn(node.properties, k)) node.properties[k] = mergedProps[k];
+            if (!hasOwn(node.properties, k)) setOwn(node.properties, k, mergedProps[k]);
           });
           var nodeReq = Array.isArray(node.required) ? node.required : [];
           mergedReq.forEach(function (k) { if (nodeReq.indexOf(k) === -1) nodeReq.push(k); });
@@ -3599,7 +3628,7 @@
       // Annotations are recognised at any node, including an `anyOf` node, so
       // they stay where the reader put them.
       if (k === "description" || k === "title") return;
-      moved[k] = node[k];
+      setOwn(moved, k, node[k]);
       delete node[k];
     });
 
@@ -3607,16 +3636,16 @@
     if (nonNull.length === 0) {
       // `["null"]` — the scalar spelling is accepted verbatim by both SDKs.
       node.type = "null";
-      Object.keys(moved).forEach(function (k) { node[k] = moved[k]; });
+      Object.keys(moved).forEach(function (k) { setOwn(node, k, moved[k]); });
       shape = "`type: \"null\"`";
     } else if (nonNull.length === 1 && !hasNull) {
       // `["string"]` — a one-element list means exactly the scalar.
       node.type = nonNull[0];
-      Object.keys(moved).forEach(function (k) { node[k] = moved[k]; });
+      Object.keys(moved).forEach(function (k) { setOwn(node, k, moved[k]); });
       shape = "`type: " + JSON.stringify(nonNull[0]) + "`";
     } else if (nonNull.length === 1) {
       var branch = { type: nonNull[0] };
-      Object.keys(moved).forEach(function (k) { branch[k] = moved[k]; });
+      Object.keys(moved).forEach(function (k) { setOwn(branch, k, moved[k]); });
       delete node.type;
       node.anyOf = [branch, { type: "null" }];
       shape = "`anyOf: [{type: " + JSON.stringify(nonNull[0]) + ", …}, {type: \"null\"}]`";
@@ -4749,7 +4778,7 @@
   function inlineRefs(s, ledger, docUrl) {
     var defs = {};
     [s.$defs, s.definitions].forEach(function (bag) {
-      if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { defs[k] = bag[k]; });
+      if (isPlainObject(bag)) Object.keys(bag).forEach(function (k) { setOwn(defs, k, bag[k]); });
     });
     if (!Object.keys(defs).length) return s;
 
@@ -4791,7 +4820,7 @@
         // saying only "Inlined 1 `$ref` reference".
         var sibs = Object.keys(node).filter(function (k) { return k !== "$ref"; });
         var visited = {};
-        sibs.forEach(function (k) { visited[k] = resolve(node[k], stack, path); });
+        sibs.forEach(function (k) { setOwn(visited, k, resolve(node[k], stack, path)); });
         var merged = intersectRef(target, visited, sibs, path, ledger, docUrl || DOCS.gemini);
         if (!merged) return node; // blocked: leave the shape visible (#318)
         merged.dropped.forEach(function (k) {
@@ -4802,7 +4831,7 @@
       }
 
       var out = {};
-      Object.keys(node).forEach(function (k) { out[k] = resolve(node[k], stack, path + "/" + k); });
+      Object.keys(node).forEach(function (k) { setOwn(out, k, resolve(node[k], stack, path + "/" + k)); });
       return out;
     }
 
@@ -5451,11 +5480,11 @@
           if (refTgt && constrains && !selfRef) {
             var gSibs = Object.keys(node).filter(function (k) { return k !== "$ref"; });
             var gView = {};
-            gSibs.forEach(function (k) { gView[k] = node[k]; });
+            gSibs.forEach(function (k) { setOwn(gView, k, node[k]); });
             var gMerged = intersectRef(clone(refTgt), gView, gSibs, path, ledger, DOCS.gemini);
             if (gMerged) {
               Object.keys(node).forEach(function (k) { delete node[k]; });
-              Object.keys(gMerged.schema).forEach(function (k) { node[k] = gMerged.schema[k]; });
+              Object.keys(gMerged.schema).forEach(function (k) { setOwn(node, k, gMerged.schema[k]); });
               ledger.push(entry("~", path,
                 "Inlined this `$ref` and merged it with its siblings — on the `responseJsonSchema` " +
                 "path a `$ref` sub-schema may carry no properties except ones starting with `$`, " +
@@ -5604,7 +5633,7 @@
               // had, a client that drops it leaves a property constraining
               // nothing — #329's question asked about the layer downstream.
               var withoutKw = {};
-              Object.keys(node).forEach(function (kk) { if (kk !== k) withoutKw[kk] = node[kk]; });
+              Object.keys(node).forEach(function (kk) { if (kk !== k) setOwn(withoutKw, kk, node[kk]); });
               var emptied = !constrainsSomething(withoutKw);
               ledger.push(entry("=", path,
                 GEMINI_ANYOF_REMEDY[k]

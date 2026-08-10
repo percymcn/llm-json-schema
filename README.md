@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1268 engine + 275 CLI + 44 ESM/library assertions = **1587** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1301 engine + 275 CLI + 44 ESM/library assertions = **1620** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -741,12 +741,50 @@ than one provider.
 With **Pydantic**, `Model.model_json_schema()` gives you the same object — pipe
 it through the CLI (`--to openai --check`) in your test suite.
 
+
+### A property may be called `__proto__` — and *writing* one deletes it
+
+JSON Schema property names are arbitrary strings. `k in obj` walks the prototype
+chain, so a membership test answers "yes" for `toString`, `constructor` and
+friends; that half was fixed earlier. The **write** half is narrower and worse.
+
+`o[k] = v` creates an own property for every JSON key except one. `__proto__` is
+an inherited *accessor*, so `o["__proto__"] = v` invokes its setter, sets the
+object's prototype and creates **no property at all** (and does nothing
+whatsoever when `v` is a primitive). `toString`, `constructor`, `valueOf` and
+`hasOwnProperty` are data properties and assign fine — so `__proto__` is the
+entire failure set on the write side, which is exactly why it survived a sweep
+aimed at the read side.
+
+The node rebuild does `out[k] = visit(node[k])` for every key, and it runs
+whenever the document contains a `$ref`. Measured on one document carrying a
+`$ref` plus a property named `__proto__`:
+
+| target | before | after |
+|---|---|---|
+| `openai` | property **deleted**, `required` still named it → a manufactured "requires a property it does not declare" blocker | preserved, 0 blockers |
+| `anthropic-json`, `anthropic-json-python`, `anthropic-go`, `gemini`, `gemini-client` | property **deleted**, `required` still named it, **0 blockers** | preserved, 0 blockers |
+| `anthropic`, `gemini-json`, `openai-nonstrict`, `openai-realtime` | preserved (these paths never rebuild) | unchanged |
+
+The same defect one container over emptied the `$defs` bag while leaving the
+`$ref` pointing into it — a dangling pointer handed back as valid.
+
+Scope, stated honestly: **neither dominant generator emits this.** Measured,
+`z.object({"__proto__": …})` on zod 4 and the pydantic equivalent both drop the
+field themselves before it ever reaches a schema, so the reachable population is
+hand-authored / OpenAPI / MCP tool schemas — and schemas that *describe* arbitrary
+JSON, where `__proto__` is an ordinary key. Nor is this a rejection being
+avoided: `toStrictJsonSchema()` accepts the raw document with the property
+intact. OpenAI's own transformer gets `__proto__` right; we did not. The value
+is that the tool stopped deleting a property the destination accepts.
+
+
 ## How it's built
 - `engine.js` — dependency-free transform + lint logic (the product's value). Every rule cites its source doc URL. UMD, so the same bytes run in the browser.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1587 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1620 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

@@ -8015,5 +8015,107 @@ function fanoutSchema(depth, cyclic) {
   ok("#380 control: an ordinary closed object is still clean", blk(plain).length === 0);
 })();
 
+// ---------------------------------------------------------------------------
+// #381: a property may be called `__proto__`, and WRITING one deletes it.
+//
+// #380 fixed the READ half (`k in obj`, `TABLE[k]`) and left the WRITE half.
+// `o[k] = v` creates an own property for every JSON key except `__proto__`,
+// which is an inherited ACCESSOR: the assignment invokes its setter, sets the
+// object's prototype, and creates no property at all. `resolveRefSiblings`
+// rebuilds every node with `out[k] = visit(node[k])`, so ANY document carrying
+// a `$ref` lost a property (or a definition) named `__proto__` outright while
+// `required` went on naming it -- six of ten targets, five at ZERO blockers.
+//
+// Fixtures are built from JSON TEXT on purpose: a JS object literal with a
+// `__proto__:` key is ALSO the prototype-setter syntax, so a hand-written
+// fixture loses the property before the engine ever sees it.
+(function () {
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function blk(r) { return led(r).filter(function (l) { return l.op === "!" && !l.advisory; }); }
+  function sch(r) { return (r && r.schema && typeof r.schema === "object") ? r.schema : {}; }
+  function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
+  function propsOf(r) { var s = sch(r); return isObj(s.properties) ? Object.keys(s.properties) : []; }
+  function convText(txt, p) { return E.convert(JSON.parse(txt), p); }
+  var ALL = ["openai", "openai-nonstrict", "openai-realtime", "anthropic", "anthropic-json",
+             "anthropic-json-python", "anthropic-go", "gemini", "gemini-json", "gemini-client"];
+
+  // A `$ref` with a sibling is what makes the node rebuild run. Without one the
+  // bug does not fire at all, which is why 1268 assertions never caught it.
+  var REF_DOC = '{"type":"object","properties":{"own":{"type":"string"},' +
+    '"__proto__":{"type":"string","minLength":3},' +
+    '"r":{"$ref":"#/$defs/T","description":"d"}},' +
+    '"required":["own","__proto__","r"],"additionalProperties":false,' +
+    '"$defs":{"T":{"type":"object","properties":{"z":{"type":"string"}},' +
+    '"required":["z"],"additionalProperties":false}}}';
+
+  // THE DISCRIMINATOR: the same document with the property renamed. Without this
+  // pair the assertions below could pass on a build that simply never rebuilds.
+  var CTL_DOC = REF_DOC.replace(/__proto__/g, "zzz");
+
+  ALL.forEach(function (t) {
+    var got = propsOf(convText(REF_DOC, t));
+    var want = propsOf(convText(CTL_DOC, t));
+    ok("#381 " + t + ": a `__proto__` property survives the node rebuild",
+       got.indexOf("__proto__") !== -1);
+    ok("#381 " + t + ": it survives exactly as the ordinary-name control does",
+       got.length === want.length);
+  });
+
+  // The deletion also MANUFACTURED a blocker: `required` still named the
+  // property we had just removed, so #330's required-mismatch rule fired on
+  // openai and blamed the caller for a mismatch we created.
+  ok("#381 openai: no manufactured required-mismatch blocker",
+     blk(convText(REF_DOC, "openai")).length === 0);
+
+  // The write half's failure set is EXACTLY `__proto__`: every other
+  // Object.prototype member is a DATA property and assigns fine. Pinned so a
+  // later cycle does not widen `setOwn` on a guess.
+  ["toString", "constructor", "valueOf", "hasOwnProperty"].forEach(function (n) {
+    var doc = REF_DOC.replace(/__proto__/g, n);
+    ok("#381 a property named `" + n + "` was never affected (data property)",
+       propsOf(convText(doc, "openai")).indexOf(n) !== -1);
+  });
+
+  // The `$defs` bag is the same defect one container over: the bag came back
+  // EMPTY while the `$ref` to it stayed in the output -- a dangling pointer at
+  // zero blockers (#320's inversion, #342's dangling ref).
+  var DEF_DOC = '{"type":"object","properties":{"a":{"$ref":"#/$defs/__proto__"}},' +
+    '"required":["a"],"additionalProperties":false,' +
+    '"$defs":{"__proto__":{"type":"string","minLength":3}}}';
+  ["anthropic-json", "anthropic-go", "gemini-json", "openai-nonstrict"].forEach(function (t) {
+    var s = sch(convText(DEF_DOC, t));
+    var bag = isObj(s.$defs) ? s.$defs : (isObj(s.definitions) ? s.definitions : null);
+    ok("#381 " + t + ": a definition named `__proto__` is not pruned as unreferenced",
+       !!bag && Object.prototype.hasOwnProperty.call(bag, "__proto__"));
+  });
+
+  // OVER-BLOCK GUARDS -- these hold both ways and are stated as guards, not as
+  // new coverage. A genuinely dangling pointer must STILL be caught: the fix
+  // must not turn the pruner into something that keeps everything.
+  var DANGLING = '{"type":"object","properties":{"a":{"$ref":"#/$defs/__proto__"}},' +
+    '"required":["a"],"additionalProperties":false,"$defs":{"other":{"type":"string"}}}';
+  ok("#381 guard: a genuinely unresolvable `#/$defs/__proto__` still blocks",
+     blk(convText(DANGLING, "openai")).length > 0);
+
+  var ORPHAN = '{"type":"object","properties":{"a":{"type":"string"}},' +
+    '"required":["a"],"additionalProperties":false,' +
+    '"$defs":{"__proto__":{"type":"string"}}}';
+  var orphanOut = sch(convText(ORPHAN, "openai"));
+  ok("#381 guard: a genuinely orphaned `__proto__` definition is still pruned",
+     !orphanOut.$defs || !Object.prototype.hasOwnProperty.call(orphanOut.$defs, "__proto__"));
+
+  var PLAIN = '{"type":"object","properties":{"a":{"type":"string"}},' +
+    '"required":["a"],"additionalProperties":false}';
+  ok("#381 guard: an ordinary closed object is still clean",
+     blk(convText(PLAIN, "openai")).length === 0);
+
+  // Idempotence: the second pass must be byte-identical, so the property is not
+  // merely surviving one hop.
+  var once = sch(convText(REF_DOC, "openai"));
+  var twice = sch(E.convert(JSON.parse(JSON.stringify(once)), "openai"));
+  ok("#381 conversion carrying a `__proto__` property is idempotent",
+     JSON.stringify(once) === JSON.stringify(twice));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
