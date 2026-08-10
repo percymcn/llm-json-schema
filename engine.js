@@ -6271,6 +6271,7 @@
           "(`crewai/utilities/pydantic_schema_utils.py`) overwrites the value schema of a " +
           "`Dict[str, str]` with `false` and then ADDS `properties: {}` and `required: []`, so " +
           "an emptied map and a genuinely empty model come out byte-identical on its tool path. " +
+          "dspy 3.3.0 emits the same three keys from the same rewrite. " +
           "Whichever it is, the field is dead: check the source model."
         : "";
       result.ledger.push(entry("=", path,
@@ -6284,8 +6285,16 @@
         "compatibility layer that ran AFTER your schema was generated: `@mastra/schema-compat`'s " +
         "`prepareJsonSchemaForOpenAIStrictMode` does this to an ordinary `z.record(z.string())`, " +
         "and agno 2.8.7's `make_nested_strict` (`agno/tools/function.py`) does it to a " +
-        "`Dict[str, str]` TOOL PARAMETER. There the open map still existed at some point, so " +
-        "check the schema BEFORE that layer runs. (b) The GENERATOR ITSELF, where the open form " +
+        "`Dict[str, str]` TOOL PARAMETER. dspy 3.3.0's `enforce_required` " +
+        "(`dspy/adapters/json_adapter.py`) does it to any `dict[str, str]` NESTED inside an " +
+        "output model, or inside a list — it has two guards against exactly this, and both test " +
+        "the top-level Python ANNOTATION (`get_origin(annotation) is dict`) rather than the " +
+        "generated schema, so a nested one walks past both. There the open map still existed at " +
+        "some point, so check the schema BEFORE that layer runs. dspy additionally has a " +
+        "measured escape that costs no remodelling: make the dict a TOP-LEVEL output field and " +
+        "both guards fire, so it drops to plain JSON mode and leaves the map alone — you lose " +
+        "grammar enforcement for the whole output and keep a field that can hold data, which is " +
+        "the better half of that trade. (b) The GENERATOR ITSELF, where the open form " +
         "was never emitted at all and there is no earlier point to check: semantic-kernel " +
         "1.44.1's `KernelJsonSchemaBuilder.build(..., structured_output=True)` builds the value " +
         "schema for a `Dict[str, str]` and then overwrites it with `false` three lines later in " +

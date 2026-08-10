@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1315 engine + 281 CLI + 44 ESM/library assertions = **1640** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1327 engine + 281 CLI + 44 ESM/library assertions = **1652** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -789,7 +789,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1640 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1652 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1640,3 +1640,36 @@ Reachability is honest and narrow: the CLI cannot produce it, so this is the
 **library** surface — a service doing `convert(doc, req.query.provider)` got an
 uncaught throw (a 500) where the documented contract says a clean rejection (a
 400), for exactly the strings that arrive from query parameters and config files.
+
+### Two guards against one hazard, both at depth 1
+
+dspy 3.3.0 builds an OpenAI-strict response schema in
+`dspy/adapters/json_adapter.py`. It knows an open-ended mapping cannot be
+expressed there, and it says so twice — `_has_open_ended_mapping` at the call
+site, and a second check inside the builder whose comment reads *"Although we've
+already performed an early check, we keep this here as a final guard."* Both
+guards ask the same question of the same thing: `get_origin(annotation) is dict`,
+on the **top-level** output-field annotations.
+
+Two ordinary shapes walk past both, and they fail in opposite directions.
+Measured on dspy 3.3.0 / pydantic 2.13.4, with verdicts from
+`toStrictJsonSchema()` (openai@7.4.0) on the exact emitted bytes:
+
+| output field | reaches the builder? | emitted | OpenAI | our `--check --to openai` |
+|---|---|---|---|---|
+| `dict[str, str]` (top level) | no — guard fires | *(falls back to JSON mode)* | — | — |
+| `dict[str, str]` **nested in a model** | yes | `{"type":"object","properties":{},"required":[],"additionalProperties":false}` | **accepts verbatim** | exit 0 + emptied-map note |
+| `list[dict[str, str]]` | yes | same, under `items` | **accepts verbatim** | exit 0 + note |
+| `Optional[dict[str, str]]` | yes — `get_origin` is `Union` | open map, inside `anyOf` | **throws** | exit 3, blocker at `anyOf[0]` |
+| `tuple[int, int, int, int]` | yes | `prefixItems` | **throws** | exit 1, collapsed losslessly |
+| `set[str]` | yes | `uniqueItems` | **throws** | exit 1, removed and named |
+
+The nested rows are the bad ones: the rewrite does not close the map, it
+**empties** it, so the field's only legal value is `{}` — and because OpenAI
+accepts that byte-for-byte, nothing anywhere reports it. With `strict: true` the
+decoder is then grammar-constrained to leave the field blank.
+
+The tuple and set rows are worth separating out, because they are *not* open
+mappings: no open-mapping preflight, however deep, can see them. They are a
+different reason the same schema is strict-invalid, and they fail loudly at the
+provider rather than silently in the document.

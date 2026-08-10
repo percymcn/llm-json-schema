@@ -8201,5 +8201,102 @@ function fanoutSchema(depth, cyclic) {
      }));
 })();
 
+// --- dspy 3.3.0 structured outputs (#383) -----------------------------------
+//
+// Verbatim `_get_structured_outputs_response_format(...).model_json_schema()`
+// output, captured by running the REAL function (dspy 3.3.0 / pydantic 2.13.4),
+// not hand-written. dspy is the fifth framework measured to produce an emptied
+// map and the first whose guard against it is DUPLICATED — `_has_open_ended_mapping`
+// at the call site and a "final guard" inside the builder, both testing
+// `get_origin(annotation) is dict` on top-level output fields, so both miss the
+// same two things: a dict nested inside a model (silently emptied, and OpenAI
+// ACCEPTS that verbatim) and a dict under `Optional[...]` (`get_origin` is
+// `Union`, the open map survives, and OpenAI THROWS).
+//
+// Vendor verdicts below are from `toStrictJsonSchema()` (openai@7.4.0) run on
+// these exact bytes, with a plain model as the control that must be accepted.
+(function () {
+  var DSPY_NESTED_DICT = {"$defs":{"Inner":{"properties":{"label":{"title":"Label","type":"string"},"meta":{"additionalProperties":false,"title":"Meta","type":"object","properties":{},"required":[]}},"required":["label","meta"],"title":"Inner","type":"object","additionalProperties":false}},"additionalProperties":false,"properties":{"answer":{"$ref":"#/$defs/Inner"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  var DSPY_OPT_DICT = {"additionalProperties":false,"properties":{"answer":{"anyOf":[{"additionalProperties":{"type":"string"},"type":"object"},{"type":"null"}],"title":"Answer"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  var DSPY_TUPLE = {"additionalProperties":false,"properties":{"answer":{"maxItems":4,"minItems":4,"prefixItems":[{"type":"integer"},{"type":"integer"},{"type":"integer"},{"type":"integer"}],"title":"Answer","type":"array"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  var DSPY_LIST_OF_DICT = {"additionalProperties":false,"properties":{"answer":{"items":{"additionalProperties":false,"type":"object","properties":{},"required":[]},"title":"Answer","type":"array"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  var DSPY_TUPLE_NESTED = {"$defs":{"TupInner":{"properties":{"box":{"maxItems":2,"minItems":2,"prefixItems":[{"type":"integer"},{"type":"integer"}],"title":"Box","type":"array"}},"required":["box"],"title":"TupInner","type":"object","additionalProperties":false}},"additionalProperties":false,"properties":{"answer":{"$ref":"#/$defs/TupInner"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  var DSPY_SET = {"$defs":{"SetInner":{"properties":{"tags":{"items":{"type":"string"},"title":"Tags","type":"array","uniqueItems":true}},"required":["tags"],"title":"SetInner","type":"object","additionalProperties":false}},"additionalProperties":false,"properties":{"answer":{"$ref":"#/$defs/SetInner"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+  // The CONTROL, and it is what makes the rows above mean anything: the same
+  // shape with a plain `str` where the dict was. dspy's rewrite runs over it
+  // identically, the vendor accepts it verbatim, and we must stay silent.
+  var DSPY_PLAIN = {"$defs":{"Inner":{"properties":{"label":{"title":"Label","type":"string"},"meta":{"title":"Meta","type":"string"}},"required":["label","meta"],"title":"Inner","type":"object","additionalProperties":false}},"additionalProperties":false,"properties":{"answer":{"$ref":"#/$defs/Inner"}},"required":["answer"],"title":"DSPyProgramOutputs","type":"object"};
+
+  function conv(doc) {
+    var r = E.convert(JSON.parse(JSON.stringify(doc)), "openai");
+    return (r && r.ledger) ? r : { ok: false, ledger: [], schema: {} };
+  }
+  function blockers(r) {
+    return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function emptied(r) {
+    return r.ledger.filter(function (l) {
+      return l.advisory && l.msg.indexOf("its only legal value is `{}`") !== -1;
+    });
+  }
+
+  var nested = conv(DSPY_NESTED_DICT);
+  ok("#383 dspy nested dict: no blocker (the vendor accepts these bytes verbatim)",
+    blockers(nested).length === 0);
+  ok("#383 dspy nested dict: the emptied map is reported, at its own path",
+    emptied(nested).length === 1 &&
+    emptied(nested)[0].path.indexOf("meta") !== -1);
+  ok("#383 dspy nested dict: the advisory names dspy and its two-guard cause",
+    has(nested.ledger, "dspy 3.3.0's `enforce_required`") &&
+    has(nested.ledger, "get_origin(annotation) is dict"));
+  ok("#383 dspy nested dict: the advisory gives the measured dspy-specific escape",
+    has(nested.ledger, "make the dict a TOP-LEVEL output field"));
+
+  // THE DISCRIMINATOR. Identical document except one property's type. Without
+  // it the rule could be firing on any `$defs` model at all and every other
+  // assertion here would still pass.
+  var plain = conv(DSPY_PLAIN);
+  ok("#383 CONTROL dspy plain model: no emptied-map advisory",
+    emptied(plain).length === 0);
+  ok("#383 CONTROL dspy plain model: no blockers either",
+    blockers(plain).length === 0);
+
+  // `Optional[dict[str, str]]` — `get_origin` is `Union`, so BOTH dspy guards
+  // miss it and the open map reaches the wire. The vendor throws at
+  // `properties/answer/anyOf/0`; we must find it in the same position, which is
+  // also the pin that our walk descends `anyOf` members.
+  var optDict = conv(DSPY_OPT_DICT);
+  ok("#383 dspy Optional[dict] : open map blocked inside the anyOf member",
+    blockers(optDict).length === 1 &&
+    blockers(optDict)[0].path.indexOf("anyOf[0]") !== -1);
+  ok("#383 dspy Optional[dict] : blocker names the open map",
+    has(optDict.ledger, "This is an open map"));
+
+  // `tuple` and `set` are NOT open mappings, so no open-mapping preflight can
+  // see them; they survive dspy's rewrite and the vendor rejects both. Ours are
+  // repairs rather than blockers, and the tuple one is lossless.
+  var tup = conv(DSPY_TUPLE);
+  ok("#383 dspy tuple: collapsed losslessly, no blocker",
+    blockers(tup).length === 0 &&
+    at(tup, "schema.properties.answer.prefixItems") === undefined &&
+    at(tup, "schema.properties.answer.items.type") === "integer" &&
+    at(tup, "schema.properties.answer.minItems") === 4 &&
+    at(tup, "schema.properties.answer.maxItems") === 4);
+
+  var tupNested = conv(DSPY_TUPLE_NESTED);
+  ok("#383 dspy tuple nested in $defs: collapsed there too",
+    at(tupNested, "schema.$defs.TupInner.properties.box.prefixItems") === undefined &&
+    at(tupNested, "schema.$defs.TupInner.properties.box.minItems") === 2);
+
+  var set = conv(DSPY_SET);
+  ok("#383 dspy set: uniqueItems removed and named",
+    at(set, "schema.$defs.SetInner.properties.tags.uniqueItems") === undefined &&
+    has(set.ledger, "uniqueItems"));
+
+  var listOfDict = conv(DSPY_LIST_OF_DICT);
+  ok("#383 dspy list[dict]: the emptied map under `items` is reported too",
+    emptied(listOfDict).length === 1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
