@@ -137,6 +137,20 @@ export const GEMINI_ALLOWED_KEYS: string[];
 export const REF_INLINE_MAX_NODES: number;
 
 /**
+ * Maximum JSON nesting depth this tool will analyse. Past this, every target
+ * reports a blocker instead of recursing.
+ *
+ * Every pass here recurses once per level, so beyond roughly 1,900 levels V8
+ * raises `RangeError: Maximum call stack size exceeded` -- and the exact point
+ * moves run to run, so the bound sits ~4x below the lowest observed cliff. The
+ * deepest schema in this project's 600-input corpus is 9 levels, so it cannot
+ * fire on generator output. This is not stricter than the destination: measured
+ * on openai@7.4.0 and @anthropic-ai/sdk@0.116.0, the vendors' own transformers
+ * throw the same RangeError on these shapes.
+ */
+export const SCHEMA_MAX_DEPTH: number;
+
+/**
  * Keys `@ai-sdk/google`'s `convertJSONSchemaToOpenAPISchema` destructures, i.e.
  * everything that can reach Gemini's narrow `responseSchema` path through that
  * client. Snapshot of @ai-sdk/google 4.0.39 — re-measure after a version bump.
@@ -258,6 +272,7 @@ declare const api: {
   DOCS: typeof DOCS;
   GEMINI_ALLOWED_KEYS: typeof GEMINI_ALLOWED_KEYS;
   REF_INLINE_MAX_NODES: typeof REF_INLINE_MAX_NODES;
+  SCHEMA_MAX_DEPTH: typeof SCHEMA_MAX_DEPTH;
   AI_SDK_GOOGLE_FORWARDED_KEYS: typeof AI_SDK_GOOGLE_FORWARDED_KEYS;
   GEMINI_CLIENT_CARRIED_KEYS: typeof GEMINI_CLIENT_CARRIED_KEYS;
   GEMINI_CLIENT_MEMBERS: typeof GEMINI_CLIENT_MEMBERS;

@@ -7264,5 +7264,175 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// --- #376: a gate owes a VERDICT, not a stack trace ------------------------
+// Every pass in engine.js recurses once per level, so past ~1,900 JSON levels
+// V8 raised `RangeError: Maximum call stack size exceeded`. That crash exited
+// 1 with ZERO bytes on stdout -- and 1 is the code this CLI documents as "not
+// compliant, here are your changes" (#330), so a dead gate was indistinguishable
+// from a normal verdict.
+(function () {
+  // Built TEXTUALLY: JSON.stringify cannot serialise a document this deep
+  // either, which is itself part of why no repair is offered.
+  function deepText(levels) {
+    return '{"type":"object","properties":{"a":'.repeat(levels) +
+           '{"type":"string"}' + '},"required":["a"]}'.repeat(levels);
+  }
+  var TARGETS = ["openai", "openai-nonstrict", "openai-realtime", "anthropic",
+                 "anthropic-json", "anthropic-json-python", "anthropic-go",
+                 "gemini", "gemini-json", "gemini-client"];
+
+  // THE DISCRIMINATOR for this whole block: 2,000 schema levels is an input that
+  // CRASHED every one of these targets before the bound. Asserting only that a
+  // deep document is blocked would pass against an engine that blocks it and
+  // then dies; the load-bearing property is that a verdict comes back at all.
+  var crashed = [], notBlocked = [];
+  TARGETS.forEach(function (t) {
+    var r;
+    try {
+      r = E.convert(deepText(2000), t);
+    } catch (e) {
+      crashed.push(t);
+      return;
+    }
+    if (!has(r.ledger, "nests more than")) notBlocked.push(t);
+  });
+  ok("#376 a 2,000-level document returns a verdict rather than crashing, on all 10 targets",
+     crashed.length === 0);
+  ok("#376 ...and that verdict is a blocker on all 10, not a silent pass",
+     notBlocked.length === 0);
+
+  // 20,000 levels must cost no more than 501 -- the probe early-exits at the cap
+  // instead of measuring the whole document.
+  var wild;
+  try { wild = E.convert(deepText(20000), "openai"); } catch (e) { wild = null; }
+  ok("#376 a 20,000-level document is bounded too (the depth probe early-exits)",
+     !!wild && has(wild.ledger, "nests more than"));
+
+  // OVER-BLOCK GUARDS. The corpus maximum is 9 JSON levels; these must not fire.
+  var shallow = E.convert(deepText(100), "openai");
+  ok("#376 over-block guard: 100 schema levels (200 JSON) is NOT depth-blocked",
+     !has(shallow.ledger, "nests more than"));
+  var ordinary = E.convert({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "openai");
+  ok("#376 over-block guard: an ordinary schema is untouched by the bound",
+     !has(ordinary.ledger, "nests more than"));
+
+  // Boundary pin, both ways, so the rule cannot silently drift into over-blocking.
+  // deepText(n) is 2 JSON levels per schema level (the node plus its `properties`
+  // bag), so it steps in twos and 500 itself is not representable -- these
+  // BRACKET the bound at 499 and 501 rather than claiming to sit on it.
+  ok("#376 boundary: 499 JSON levels is allowed",
+     !has(E.convert(deepText(249), "openai").ledger, "nests more than"));
+  ok("#376 boundary: 501 JSON levels is blocked",
+     has(E.convert(deepText(250), "openai").ledger, "nests more than"));
+
+  // The four converters are EXPORTED, so a library caller reaches `clone` --
+  // the first recursive thing in the file -- without passing through convert().
+  // #374 was bitten by exactly this asymmetry.
+  var directCrashed = [];
+  [["toOpenAI", function (s) { return E.toOpenAI(s); }],
+   ["toAnthropic", function (s) { return E.toAnthropic(s, true); }],
+   ["toGemini", function (s) { return E.toGemini(s, false); }]].forEach(function (pair) {
+    try {
+      var r = pair[1](JSON.parse(deepText(2000)));
+      if (!has(r.ledger, "nests more than")) directCrashed.push(pair[0] + ":unblocked");
+    } catch (e) { directCrashed.push(pair[0] + ":crash"); }
+  });
+  ok("#376 direct converter calls are guarded too, not just convert()",
+     directCrashed.length === 0);
+
+  // The EXAMPLE path recurses through inferSchema before any schema exists, so
+  // the guard has to read the raw parsed input rather than the inferred schema.
+  function chain(n) { return '{"a":'.repeat(n) + "1" + "}".repeat(n); }
+  var ex;
+  try { ex = E.convert(chain(2000), "openai"); } catch (e) { ex = null; }
+  ok("#376 a deep EXAMPLE object is bounded before inferSchema recurses",
+     !!ex && has(ex.ledger, "nests more than"));
+
+  // BOTH guards are load-bearing, and this is the pair that proves it: an
+  // example INFLATES -- inferSchema turns each `{a: ...}` level into
+  // `{type, properties:{a: ...}, required}`, i.e. ~2 JSON levels per input
+  // level. So a 400-level example is UNDER the bound as input and ~800 levels
+  // as a schema. Guarding only the caller's input would let that straight
+  // through to the walkers; it is the converter-entry guard that catches it.
+  // A tool that MANUFACTURES depth cannot bound only what it was handed.
+  var inflated = E.convert(chain(400), "openai");
+  ok("#376 an example UNDER the bound that infers OVER it is still caught",
+     has(inflated.ledger, "nests more than"));
+  ok("#376 ...while a shallow example still infers normally (no over-block)",
+     !has(E.convert(chain(100), "openai").ledger, "nests more than"));
+
+  // Pin the justification, not just the behaviour. This is the sentence that
+  // stops a later cycle re-framing the bound as us being stricter than the
+  // destination: the vendors' own transformers die on the same shapes.
+  var msg = E.convert(deepText(2000), "openai").ledger[0].msg;
+  ok("#376 the blocker states the measured vendor fact (they crash too)",
+     msg.indexOf("openai@7.4.0") !== -1 && msg.indexOf("RangeError") !== -1);
+  ok("#376 the bound is exported so it can be diffed against the corpus",
+     E.SCHEMA_MAX_DEPTH === 500);
+})();
+
+// --- #376: openai-agents MCP payloads (owed by #375) -----------------------
+// Verbatim third-party shapes from openai-agents-python's MCP path, which
+// forwards CALLER-SUPPLIED tool schemas through `ensure_strict_json_schema`.
+// #375 measured that its fallback stamps `strict: true` on 15 of these; these
+// pin that we catch what it misses.
+(function () {
+  function conv(sch) { return E.convert(JSON.parse(JSON.stringify(sch)), "openai"); }
+  function blockers(r) {
+    return (r.ledger || []).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+
+  // THE DISCRIMINATOR (#375 named it explicitly): openai-agents' `strict_schema.py:221`
+  // does `json_schema.update({**resolved, **json_schema})` -- PARENT-WINS -- so the
+  // referent's `b` is DELETED and the object then CLOSED, making a property the
+  // schema REQUIRED into one it FORBIDS. Draft 2020-12 applies the referent AND
+  // the siblings, so the correct merge keeps both. Without this pair every other
+  // assertion in this block still passes.
+  var refSib = conv({
+    "$defs": { "T": { type: "object", properties: { b: { type: "string" } }, required: ["b"] } },
+    type: "object",
+    properties: { node: { properties: { a: { type: "string" } }, required: ["a"], "$ref": "#/$defs/T" } }
+  });
+  var node = refSib.schema && refSib.schema.properties && refSib.schema.properties.node;
+  var props = node && node.properties ? Object.keys(node.properties).sort() : [];
+  ok("#376 openai-agents `$ref`-sibling: we KEEP both `a` and `b` (they keep only `a`)",
+     props.length === 2 && props[0] === "a" && props[1] === "b");
+  ok("#376 ...and both survive into `required` rather than one being forbidden",
+     !!node && (node.required || []).indexOf("a") !== -1 && (node.required || []).indexOf("b") !== -1);
+
+  // A 2-member `allOf` -- one of the 15 shapes their fallback passes through as
+  // strict-valid. We merge it rather than shipping it.
+  var allOf2 = conv({
+    type: "object", properties: { id: { type: "string" } },
+    allOf: [{ type: "object", properties: { a: { type: "string" } } },
+            { type: "object", properties: { b: { type: "string" } } }]
+  });
+  ok("#376 openai-agents 2-member `allOf` is merged, not forwarded",
+     has(allOf2.ledger, "Merged an `allOf`") && blockers(allOf2).length === 0);
+
+  // The OpenAPI `allOf:[{$ref},{$ref}]` idiom -- the shape #371 established must
+  // be resolved through the pointers before mergeability is decided.
+  var allOfRefs = conv({
+    "$defs": { Base: { type: "object", properties: { id: { type: "string" } } },
+               Extra: { type: "object", properties: { note: { type: "string" } } } },
+    type: "object", properties: { item: { allOf: [{ "$ref": "#/$defs/Base" }, { "$ref": "#/$defs/Extra" }] } }
+  });
+  var item = allOfRefs.schema && allOfRefs.schema.properties && allOfRefs.schema.properties.item;
+  var itemProps = item && item.properties ? Object.keys(item.properties).sort() : [];
+  ok("#376 openai-agents OpenAPI `allOf:[{$ref},{$ref}]` resolves through both pointers",
+     itemProps.length === 2 && itemProps[0] === "id" && itemProps[1] === "note");
+
+  // A genuinely MCP-ONLY shape: `mcp/util.py:536-538` inserts `properties: {}`
+  // because "MCP spec doesn't require the inputSchema to have `properties`, but
+  // OpenAI spec does". Our answer must match the vendor's own repair, which #330
+  // measured as exactly `{"type":"object","additionalProperties":false}` -- so
+  // this is an over-block guard, not a defect to report.
+  var noProps = conv({ type: "object" });
+  ok("#376 openai-agents MCP `{\"type\":\"object\"}` with no `properties` is not a blocker",
+     blockers(noProps).length === 0 &&
+     noProps.schema.type === "object" && noProps.schema.additionalProperties === false);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

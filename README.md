@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1165 engine + 264 CLI + 43 ESM/library assertions = **1472** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1183 engine + 264 CLI + 44 ESM/library assertions = **1491** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -714,7 +714,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1472 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1491 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1344,6 +1344,66 @@ server)."
 
 The other seven targets never inline and were never affected (~40 ms at depth 26);
 that is asserted, not assumed.
+
+## …and a deep one that killed the gate on **all ten** targets
+
+The bound above is about the *output* being exponential. This one is about the
+*input* being deep, and it needed a different answer — a `$ref` DAG that expands to
+2^N nodes trips a node budget, but a plain 1,000-level chain is only 1,000 nodes,
+three orders of magnitude under it. Nothing caught that.
+
+Every pass here recurses once per level — `clone`, the keyword walk,
+well-formedness, `inferSchema`, `$ref` resolution — so past roughly 1,900 JSON
+levels V8 raises `RangeError: Maximum call stack size exceeded`. Measured before
+the fix, on a 74 KB file:
+
+| JSON depth | before | now |
+|---|---|---|
+| 200 | normal verdict | unchanged |
+| 1,002 | `RangeError`, **exit 1**, 0 bytes on stdout | exit 3, blocker |
+| 4,002 | `RangeError`, **exit 1**, 0 bytes on stdout | exit 3, blocker |
+| 40,002 | `RangeError`, **exit 1**, 0 bytes on stdout | exit 3, blocker, 1 ms |
+
+**Exit 1 is the sharp part, and it is worse than #374's exit 134.** An undocumented
+code at least looks wrong. `1` is the code this CLI *documents* as "not compliant,
+here are your changes" — so a dead gate was indistinguishable, by exit code, from a
+normal verdict, while writing nothing at all to stdout. All ten targets crashed,
+because the recursion is in the shared walkers rather than in one path's inliner.
+
+**This is not us being stricter than the destination.** Measured on `openai@7.4.0`
+and `@anthropic-ai/sdk@0.116.0` with a clean strict-valid fixture so depth is the
+only variable, the vendors' own transformers (`toStrictJsonSchema`,
+`betaJSONSchemaOutputFormat`) accept ~900 schema levels and then throw the *same*
+`RangeError` — and `JSON.stringify` cannot serialise a document that deep back out
+either. There is no target here and no destination anywhere that can take it, so
+no repair is invented and none is named (#329): the blocker says to cap the nesting
+where it is produced.
+
+**Why the bound is 500 and not nearer the cliff.** The corpus maximum is **9** JSON
+levels across the 600 distinct schemas this suite feeds a converter, median **4** —
+so 500 is ~55× anything a real generator has produced and cannot fire on organic
+input. It is not set higher because *the cliff is non-deterministic*: the same input
+crashed at 969 schema levels in one run and survived 1,200 in another, moving with
+whatever else is on the stack. You cannot bound safely just under a cliff whose
+position is a coin flip.
+
+The trade is deliberate and is about the **shape of the harm**, not strictness:
+between 500 and ~1,900 levels the vendors can still process a document this now
+refuses. Nothing organic lives there, and the alternative in that band is not a
+better verdict — it is a stack trace wearing a verdict's exit code.
+
+Two placements are load-bearing, and the second is easy to miss: the guard reads
+the **caller's raw input** (before `inferSchema`, which is itself recursive), *and*
+sits at each converter entry — because the four converters are exported, so a
+library caller reaches `clone` without passing through `convert()`. It also has to
+be both because **the example path inflates**: `inferSchema` turns each `{a: …}`
+level into `{type, properties, required}`, roughly doubling depth, so a 400-level
+example is under the bound as input and over it as a schema. A tool that
+*manufactures* depth cannot bound only what it was handed.
+
+The bound is exported as `SCHEMA_MAX_DEPTH`. The probe that enforces it is
+iterative on purpose — a recursive depth-measurer blows the very stack it exists to
+protect, one frame before the walker it is guarding.
 
 ## License
 MIT.

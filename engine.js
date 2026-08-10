@@ -36,6 +36,78 @@
 
   // ---- small helpers -------------------------------------------------------
 
+  // How deep a document this tool will analyse, in JSON nesting levels.
+  //
+  // MEASURED, NOT CHOSEN (#374 set the precedent for the `$ref` node budget):
+  //   * corpus maximum is 9 levels across the 600 distinct schemas this suite
+  //     feeds a converter -- every verbatim generator and framework payload
+  //     captured over 70+ cycles. Median 4. So 500 is ~55x the deepest thing
+  //     any real generator has ever handed us and cannot fire on organic input.
+  //   * the cliff it protects against is NON-DETERMINISTIC. Every walker here
+  //     (`clone`, `walk`, `findMalformedKeywords`, `inferSchema`, the `$ref`
+  //     resolver) recurses once per level, so past ~1,900-2,400 JSON levels V8
+  //     gives out with `RangeError: Maximum call stack size exceeded` -- and
+  //     the exact point moves run to run with whatever else is on the stack
+  //     (measured 969 -> >1,200 schema levels for the same input). You cannot
+  //     bound safely just under a cliff whose position is a coin flip, so this
+  //     sits ~4x below the LOWEST observed one.
+  //
+  // The trade is deliberate and is about the SHAPE OF THE HARM (#368), not about
+  // strictness: between 500 and ~1,900 levels the vendors can still process a
+  // document that we now refuse. Nothing organic is in that band, and the
+  // alternative there is not a better verdict -- it is a stack trace on stderr
+  // with ZERO bytes on stdout and exit 1, which is the code this CLI documents
+  // as "not compliant, here are your changes" (#330). A deterministic blocker
+  // beats a non-deterministic crash wearing a verdict's exit code.
+  var SCHEMA_MAX_DEPTH = 500;
+
+  // Iterative ON PURPOSE. A recursive depth-measurer blows the very stack it
+  // exists to protect -- it would crash on exactly the inputs it was added to
+  // catch, one frame before the walker it is guarding. Early-exits at `cap` so
+  // an adversarial 20,000-level document costs the same as a 501-level one.
+  //
+  // Validated as a standalone prototype before `engine.js` was touched (#370):
+  // 3,000 randomly generated structures against a recursive oracle, 0
+  // disagreements, plus the degenerate rows (`{}` and `[]` are 1; `null` and a
+  // scalar are 0).
+  function maxJsonDepth(root, cap) {
+    var stack = [[root, 1]], max = 0;
+    while (stack.length) {
+      var top = stack.pop(), v = top[0], d = top[1];
+      if (!v || typeof v !== "object") continue;
+      if (d > max) {
+        max = d;
+        if (max > cap) return max;
+      }
+      var keys = Object.keys(v);
+      for (var i = 0; i < keys.length; i++) stack.push([v[keys[i]], d + 1]);
+    }
+    return max;
+  }
+
+  // A blocker, never a repair (#329): there is no edit that makes a
+  // 1,000-level document shallower without deciding what to throw away, and
+  // unlike #374 there is NO alternate target to name -- all ten crash, because
+  // the recursion is in the shared walkers rather than in one path's inliner.
+  function tooDeepEntry(schema, docUrl) {
+    var d = maxJsonDepth(schema, SCHEMA_MAX_DEPTH);
+    if (d <= SCHEMA_MAX_DEPTH) return null;
+    return entry("!", "root",
+      "This document nests more than " + SCHEMA_MAX_DEPTH.toLocaleString("en-US") +
+      " levels deep, which is past what this tool will analyse. Every pass here " +
+      "(cloning, the keyword walk, well-formedness, `$ref` resolution) recurses once " +
+      "per level, so beyond roughly 1,900 levels the JavaScript stack gives out and " +
+      "the exact point shifts run to run. Rather than hand you a stack trace with an " +
+      "exit code that means \"here are your changes\", this is a blocker. " +
+      "IT IS NOT US BEING STRICTER THAN THE DESTINATION: measured on openai@7.4.0 and " +
+      "@anthropic-ai/sdk@0.116.0, the vendors' own transformers (`toStrictJsonSchema`, " +
+      "`betaJSONSchemaOutputFormat`) throw the same `RangeError: Maximum call stack size " +
+      "exceeded` on these shapes, and `JSON.stringify` cannot even serialise the document " +
+      "back out — so there is no target here and no destination anywhere that can take it. " +
+      "A schema this deep is machine-generated or hostile rather than authored; cap the " +
+      "nesting where it is produced.", docUrl);
+  }
+
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
 
   function isPlainObject(v) {
@@ -2075,6 +2147,12 @@
   }
 
   function toOpenAI(schema) {
+    // `convert()` guards this too, but these four converters are EXPORTED, so a
+    // library caller reaches `clone` -- the first recursive thing in the file --
+    // without passing through it. #374 hit exactly this when its corpus sweep
+    // called `toOpenAI` directly and got answers `convert()` would never give.
+    var tooDeep = tooDeepEntry(schema, DOCS.openai);
+    if (tooDeep) return { schema: schema, ledger: [tooDeep] };
     var s = clone(schema);
     var ledger = [];
 
@@ -3355,6 +3433,8 @@
   // (tuple field, maxLength, $defs) is perfectly valid on the wire while the
   // old single target exited 1 and proposed a lossy tuple collapse.
   function toAnthropic(schema, outputFormatPath, sdk) {
+    var tooDeepAnth = tooDeepEntry(schema, DOCS.anthropic);
+    if (tooDeepAnth) return { schema: schema, ledger: [tooDeepAnth] };
     sdk = sdk || "js";
     var goSdk = sdk === "go";
     var pythonSdk = sdk === "python";
@@ -4931,6 +5011,8 @@
   }
 
   function toGemini(schema, jsonPath, clientConverts) {
+    var tooDeepGem = tooDeepEntry(schema, jsonPath ? DOCS["gemini-json"] : DOCS.gemini);
+    if (tooDeepGem) return { schema: schema, ledger: [tooDeepGem] };
     var s = clone(schema);
     var ledger = [];
 
@@ -5626,6 +5708,9 @@
   // this stays one target — but the DIAGNOSIS is the deliverable here, so it
   // forks per group instead of asserting one group's answer for everyone.
   function toOpenAINonStrict(input, surfaceHasNoStrictField) {
+    var tooDeepNs = tooDeepEntry(input, surfaceHasNoStrictField
+      ? DOCS["openai-realtime"] : DOCS["openai-nonstrict"]);
+    if (tooDeepNs) return { schema: input, ledger: [tooDeepNs] };
     var schema = clone(input);
     var ledger = [];
     var url = surfaceHasNoStrictField
@@ -5801,6 +5886,20 @@
     var conv = CONVERTERS[provider];
     if (!conv) return { ok: false, error: "Unknown provider: " + provider };
 
+    // Depth, FIRST -- before `looksLikeSchema`, before `inferSchema`, before the
+    // converter, and before the two post-`conv` passes below. Every one of those
+    // recurses, so a guard placed anywhere later is a guard that crashes on its
+    // way to being useful: the converter would return the blocker correctly and
+    // then `findMalformedKeywords(schema)` would blow the stack anyway.
+    //
+    // It reads the RAW parsed input rather than the inferred schema on purpose:
+    // `inferSchema` is itself recursive, so a deeply nested EXAMPLE object (the
+    // paste-a-payload path) crashes before any schema exists to measure.
+    var deepEntry = tooDeepEntry(parsed, DOCS[provider]);
+    if (deepEntry) {
+      return { ok: true, schema: parsed, ledger: [deepEntry], inferred: false };
+    }
+
     var inferred = false;
     var schema = parsed;
     var treatAsExample = opts.mode === "example" || (opts.mode !== "schema" && !looksLikeSchema(parsed));
@@ -5962,6 +6061,14 @@
     // diff it against the corpus maximum (21 nodes) and against the vendor-adjacent
     // precedent it matches, instead of re-deriving why 100,000.
     REF_INLINE_MAX_NODES: REF_INLINE_MAX_NODES,
+
+    // Exported for the same reason as REF_INLINE_MAX_NODES: so a later cycle can
+    // diff the bound against the corpus maximum (9 JSON levels across 600
+    // schemas) and against the measured crash cliff, rather than re-deriving why
+    // 500. Unlike the node budget, this one has a NARROW margin above it -- the
+    // vendors themselves die around 1,900 levels -- so if it is ever raised, the
+    // thing to re-measure is the cliff, not the corpus.
+    SCHEMA_MAX_DEPTH: SCHEMA_MAX_DEPTH,
 
     // The keys @ai-sdk/google's `convertJSONSchemaToOpenAPISchema` destructures,
     // i.e. everything that can reach Gemini's narrow `responseSchema` path
