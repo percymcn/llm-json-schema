@@ -1430,5 +1430,29 @@ console.log("\n" + pass + " passed, " + fail + " failed");
 })();
 
 
+// --- #366 the per-surface diagnosis reaches the installed binary -------------
+(function () {
+  var loose = run(["--to", "openai-nonstrict", "--check"], INSTRUCTOR_OPENAI);
+  ok("#366 CLI: the AUTO surfaces reach the reader",
+    /responses namespace tools/.test(loose.stderr), loose.stderr.slice(0, 300));
+  ok("#366 CLI: ...with the vendor's own fallback wording",
+    /falls back to non-strict validation otherwise/.test(loose.stderr));
+  ok("#366 CLI: ...and the silent downgrade is named",
+    /SILENT/.test(loose.stderr));
+  // #317's property: the schema is legal on every one of these surfaces, so the
+  // whole diagnosis must stay advisory.
+  ok("#366 CLI: the new diagnosis never fails the gate",
+    loose.status === 0, "status=" + loose.status);
+
+  // The discriminator, end to end on the SAME file: Realtime has no `strict`
+  // field, so it keeps the categorical claim and must NOT be told about a
+  // negotiation that cannot happen there.
+  var rt = run(["--to", "openai-realtime", "--check"], INSTRUCTOR_OPENAI);
+  ok("#366 CLI: realtime is not told about the AUTO surfaces",
+    !/NOT non-strict everywhere/.test(rt.stderr), rt.stderr.slice(0, 300));
+  ok("#366 CLI: realtime still exits 0", rt.status === 0, "status=" + rt.status);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -1024,6 +1024,53 @@
   // Note `deprecated` is NOT here even though it reads like an annotation, and
   // `readOnly`/`writeOnly` ARE — both measured, both surprising, and getting
   // either wrong silently changes which schemas we flatten.
+  // #366 — `openai-nonstrict` is named for a CONDITION ("`strict` is not set"),
+  // and #322 counted FOUR optional declaration sites and treated them as one
+  // class meaning "nothing is enforced". Enumerating EVERY `strict` field in
+  // openai@7.4.0's `resources/**.d.ts` with its enclosing interface and doc
+  // comment (measured 2026-08-10) gives EIGHT sites in THREE groups, and one of
+  // #322's own four disagrees with the other three.
+  //
+  //   "off"      — omitting the flag means nothing is enforced. The doc says
+  //                "If set to true, the model will follow the exact schema",
+  //                i.e. it only ever describes the true branch.
+  //   "auto"     — omitting the flag does NOT mean non-strict. Doc, verbatim:
+  //                "If omitted, Responses attempts to use strict validation when
+  //                the schema is compatible, and falls back to non-strict
+  //                validation otherwise." Note the fallback is SILENT.
+  //   "required" — the field is not optional at all (`strict:` not `strict?:`),
+  //                so there is no "omitted" state to be in; a caller here passed
+  //                `false` or `null` deliberately.
+  //
+  // Realtime is a fourth case and is not in this table because it has no
+  // `strict` field anywhere (#317); that is what `openai-realtime` selects.
+  //
+  // Honest limit, stated the way #361 states its tables: the suite is
+  // dependency-free and cannot run the SDK, so this pins a MEASURED SNAPSHOT of
+  // one version and re-measuring after a bump is a manual step.
+  var OPENAI_STRICT_SURFACES = [
+    { path: "FunctionDefinition", file: "resources/shared.d.ts", line: 112,
+      unset: "off", api: "chat.completions tools[].function" },
+    { path: "ResponseFormatJSONSchema.JSONSchema", file: "resources/shared.d.ts", line: 251,
+      unset: "off", api: "chat.completions response_format" },
+    { path: "ResponseFormatTextJSONSchemaConfig", file: "resources/responses/responses.d.ts", line: 2456,
+      unset: "off", api: "responses text.format" },
+    { path: "BetaResponseFormatTextJSONSchemaConfig", file: "resources/beta/responses/responses.d.ts", line: 2855,
+      unset: "off", api: "beta responses text.format" },
+    { path: "NamespaceTool.Function", file: "resources/responses/responses.d.ts", line: 741,
+      unset: "auto", api: "responses namespace tools" },
+    { path: "BetaNamespaceTool.Function", file: "resources/beta/responses/responses.d.ts", line: 820,
+      unset: "auto", api: "beta responses namespace tools" },
+    { path: "FunctionTool", file: "resources/responses/responses.d.ts", line: 609,
+      unset: "required", api: "responses tools[] function" },
+    { path: "BetaFunctionTool", file: "resources/beta/responses/responses.d.ts", line: 688,
+      unset: "required", api: "beta responses tools[] function" }
+  ];
+
+  function openaiSurfacesWhereUnsetIs(kind) {
+    return OPENAI_STRICT_SURFACES.filter(function (s) { return s.unset === kind; });
+  }
+
   var OPENAI_ANNOTATION_KEYWORDS = {
     $comment: 1, "default": 1, description: 1, examples: 1,
     readOnly: 1, title: 1, writeOnly: 1
@@ -4703,6 +4750,15 @@
   // the reader needs the true one: on Realtime there is no `strict` field to set;
   // elsewhere the field exists and is simply unset, which means the fix for someone
   // who WANTED enforcement is "set strict: true and re-run `--to openai`".
+  //
+  // #366 CORRECTION — "elsewhere the field exists and is simply unset" is itself
+  // one member's story. Measured, the non-Realtime surfaces split three ways
+  // (OPENAI_STRICT_SURFACES): four where unset means off, two where OMITTING it
+  // means the service auto-negotiates strict and silently falls back, and two
+  // where the field is REQUIRED so there is no unset state at all. The output is
+  // byte-identical for all of them — the schema is legal either way, which is why
+  // this stays one target — but the DIAGNOSIS is the deliverable here, so it
+  // forks per group instead of asserting one group's answer for everyone.
   function toOpenAINonStrict(input, surfaceHasNoStrictField) {
     var schema = clone(input);
     var ledger = [];
@@ -4734,10 +4790,58 @@
       });
     });
 
-    ledger.push(entry("!", "root",
-      "Without `strict`, the model is not grammar-constrained: every constraint here is " +
-      "guidance the model can violate, so keep validating the response yourself.",
-      url, true));
+    // #366 — this claim used to be unconditional, and it is FALSE on two of the
+    // surfaces it was covering. `strict` unset does not mean the same thing
+    // everywhere (see OPENAI_STRICT_SURFACES), so the sentence is scoped to the
+    // surfaces where it holds and the other groups get their own, true, one.
+    if (surfaceHasNoStrictField) {
+      ledger.push(entry("!", "root",
+        "Without `strict`, the model is not grammar-constrained: every constraint here is " +
+        "guidance the model can violate, so keep validating the response yourself.",
+        url, true));
+    } else {
+      var offs = openaiSurfacesWhereUnsetIs("off");
+      var autos = openaiSurfacesWhereUnsetIs("auto");
+      var reqs = openaiSurfacesWhereUnsetIs("required");
+
+      ledger.push(entry("!", "root",
+        "On " + offs.length + " of the surfaces where `strict` is optional (" +
+        offs.map(function (s) { return s.api; }).join(", ") + "), leaving it unset means the " +
+        "model is not grammar-constrained: every constraint here is guidance the model can " +
+        "violate, so keep validating the response yourself.",
+        url, true));
+
+      // The group that makes the target's NAME wrong. Quote the vendor rather
+      // than paraphrase, because the surprising half is that OMITTING the flag
+      // is not the same as disabling it.
+      ledger.push(entry("!", "root",
+        "But `strict` unset is NOT non-strict everywhere. On " +
+        autos.map(function (s) { return s.api; }).join(" and ") + " the SDK documents the " +
+        "opposite: \"If omitted, Responses attempts to use strict validation when the schema " +
+        "is compatible, and falls back to non-strict validation otherwise.\" So on those " +
+        "surfaces this schema may well be enforced — and if it is not, the downgrade is " +
+        "SILENT, with no error to tell you the constraints stopped applying.",
+        url, true));
+
+      // Deliberately does NOT predict which branch. Measured across 528 captured
+      // schemas, our own ledger ops are not a sound proxy for the vendor's
+      // compatibility test (a `~` covers both a lossless `definitions`->`$defs`
+      // rename and a real optional->required+nullable repair), and the service's
+      // exact notion of "compatible" is not observable without an API key. So
+      // this names the check the reader can run instead of guessing for them.
+      ledger.push(entry("=", "root",
+        "To find out which branch you land on, run `--to openai`: if it reports no changes, " +
+        "the schema is already strict-valid. If it reports changes, it is not valid as " +
+        "written — whether the service repairs it or falls back is its call, not something " +
+        "this tool can see from the schema.",
+        url, true));
+
+      ledger.push(entry("=", "root",
+        "Note also that `strict` is not optional on every surface: on " +
+        reqs.map(function (s) { return s.api; }).join(" and ") + " the field is required, so " +
+        "there is no \"omitted\" state — a caller there passed `false` or `null` on purpose.",
+        url, true));
+    }
 
     // Name the sibling target, the same way the Anthropic and Gemini pairs do. The
     // reader picked a target from a flag they may not control (Instructor omits
@@ -4748,8 +4852,11 @@
         "re-run with `--to openai`."
       : "If you want the constraints actually enforced, set `strict: true` on the tool or " +
         "response_format and re-run with `--to openai` — but that dialect is a subset, so " +
-        "expect real edits. Note that some clients omit `strict` for you: Instructor's " +
-        "`Mode.TOOLS_STRICT` is deprecated and sends a non-strict payload.",
+        "expect real edits. On namespace tools that edit may be unnecessary, since omitting " +
+        "the flag there already attempts strict validation; setting it to `true` turns the " +
+        "silent fallback into a loud rejection, which is usually what you want in CI. Note " +
+        "that some clients omit `strict` for you: Instructor's `Mode.TOOLS_STRICT` is " +
+        "deprecated and sends a non-strict payload.",
       url, true));
 
     noteEmptiedDocument(input, schema, ledger, url,
@@ -4997,6 +5104,15 @@
     // gemini-client` used to decide by itself: the two members of that class
     // disagree here, so the rule reports instead of choosing (#365).
     GEMINI_CLIENT_CARRIED_KEYS: Object.keys(GEMINI_CLIENT_CARRIED),
+
+    // Every `strict` declaration in openai@7.4.0's resources, with what OMITTING
+    // it means on that surface. Exported for #361's reason and one more: this is
+    // the table that shows `openai-nonstrict` is named for a condition whose
+    // meaning is per-surface, so the grouping is the finding and should be
+    // re-diffable rather than re-derived.
+    OPENAI_STRICT_SURFACES: OPENAI_STRICT_SURFACES.map(function (s) {
+      return { path: s.path, file: s.file, line: s.line, unset: s.unset, api: s.api };
+    }),
 
     // The `format` VALUES Anthropic's transformer keeps on a string. Exported
     // for the same reason as GEMINI_ALLOWED_KEYS: so "all three SDKs agree" is a

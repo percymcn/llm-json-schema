@@ -6071,5 +6071,104 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// --- #366 `strict` unset does not mean the same thing on every surface -------
+// `openai-nonstrict` is named for a CONDITION, and #322 read that condition's
+// meaning off some of the surfaces that share it. The output is byte-identical
+// on all of them (the schema is legal either way), so what is under test here is
+// the DIAGNOSIS, which is this target's entire deliverable.
+(function () {
+  var SCH = {
+    type: "object", additionalProperties: false,
+    properties: { a: { type: "string" } }, required: ["a"]
+  };
+  var loose = E.convert(SCH, "openai-nonstrict");
+  var rt = E.convert(SCH, "openai-realtime");
+
+  // The claim that used to be unconditional is now scoped to the surfaces where
+  // it is true, and says which those are.
+  ok("#366 the not-enforced claim is scoped to named surfaces",
+    has(loose.ledger, "chat.completions tools[].function") &&
+    has(loose.ledger, "not grammar-constrained"));
+
+  // The group that made the old wording false. Quote, not paraphrase.
+  ok("#366 the AUTO surfaces are named",
+    has(loose.ledger, "responses namespace tools"));
+  ok("#366 ...with the vendor's own wording",
+    has(loose.ledger, "falls back to non-strict validation otherwise"));
+  ok("#366 ...and the fallback is called out as SILENT",
+    has(loose.ledger, "SILENT"));
+  ok("#366 `strict` unset is not treated as non-strict everywhere",
+    has(loose.ledger, "NOT non-strict everywhere"));
+
+  // The two REQUIRED sites: there is no omitted state to be in.
+  ok("#366 the required-field surfaces are named",
+    has(loose.ledger, "responses tools[] function") &&
+    has(loose.ledger, "the field is required"));
+
+  // Deliberately does NOT predict the branch — measured, our ledger ops are not
+  // a sound proxy for the vendor's compatibility test. Pin that it points at the
+  // check instead of guessing, so a later cycle does not quietly add a guess.
+  ok("#366 the branch is not predicted, the check is named",
+    has(loose.ledger, "run `--to openai`") &&
+    has(loose.ledger, "not something this tool can see from the schema"));
+
+  // THE DISCRIMINATOR. Realtime has no `strict` field at all, so there is no
+  // omitted-vs-set distinction and the categorical claim is correct there.
+  // Without this pair the new rule could be firing blanket and every assertion
+  // above would still pass (#364's pattern).
+  ok("#366 Realtime keeps the categorical claim",
+    has(rt.ledger, "Without `strict`, the model is not grammar-constrained"));
+  ok("#366 Realtime does NOT get the AUTO clause",
+    !has(rt.ledger, "NOT non-strict everywhere") &&
+    !has(rt.ledger, "falls back to non-strict validation otherwise"));
+  ok("#366 ...and is not told about a required-field surface",
+    !has(rt.ledger, "the field is required"));
+
+  // #317's property: advisory, never a gate failure. The schema is accepted on
+  // every one of these surfaces, so failing CI here would be the exact mistake.
+  ok("#366 none of the new entries fails the gate",
+    loose.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+
+  // The remedy no longer tells a namespace-tool caller to make an edit that may
+  // be unnecessary; it says what setting the flag actually buys them.
+  ok("#366 the remedy is qualified for namespace tools",
+    has(loose.ledger, "that edit may be unnecessary") &&
+    has(loose.ledger, "silent fallback into a loud rejection"));
+
+  // The table itself, so the grouping is re-diffable rather than re-derived.
+  var T = E.OPENAI_STRICT_SURFACES;
+  ok("#366 the surface table has all eight measured sites",
+    Array.isArray(T) && T.length === 8);
+  var by = function (k) {
+    return (T || []).filter(function (s) { return s.unset === k; }).length;
+  };
+  ok("#366 the table splits 4 off / 2 auto / 2 required",
+    by("off") === 4 && by("auto") === 2 && by("required") === 2);
+  ok("#366 every entry cites a file and a line",
+    Array.isArray(T) && T.length > 0 && T.every(function (s) {
+      return typeof s.file === "string" && s.file.length > 0 &&
+             typeof s.line === "number" && s.line > 0;
+    }));
+  // The AUTO rows are the finding; pin WHICH interfaces they are, since a table
+  // that merely has two auto rows would pass the count check above.
+  ok("#366 the AUTO rows are the namespace-tool interfaces",
+    Array.isArray(T) && ["NamespaceTool.Function", "BetaNamespaceTool.Function"]
+      .every(function (p) {
+        return T.some(function (s) { return s.path === p && s.unset === "auto"; });
+      }));
+  // ...and that a STABLE surface is among them. "It is only beta" would make the
+  // whole finding much weaker, so assert it is not.
+  ok("#366 at least one AUTO surface is not beta",
+    Array.isArray(T) && T.some(function (s) {
+      return s.unset === "auto" && s.file.indexOf("beta") === -1;
+    }));
+
+  // Over-block guard: the pass-through contract is untouched by all of this.
+  ok("#366 the schema still passes through byte-identical",
+    JSON.stringify(loose.schema) === JSON.stringify(SCH) &&
+    JSON.stringify(rt.schema) === JSON.stringify(SCH));
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

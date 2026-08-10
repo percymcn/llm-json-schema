@@ -175,6 +175,28 @@ export const GO_INVOPOP_MODELLED_KEYS: string[];
  */
 export const OPENAI_ANNOTATION_KEYWORDS_LIST: string[];
 
+/**
+ * Every `strict` declaration in openai@7.4.0's `resources/**`, with what
+ * OMITTING the flag means on that surface. `unset` is one of:
+ *
+ *  - `"off"`      nothing is enforced (4 sites)
+ *  - `"auto"`     the service attempts strict validation when the schema is
+ *                 compatible and SILENTLY falls back otherwise (2 sites,
+ *                 namespace tools — stable and beta)
+ *  - `"required"` the field is not optional, so there is no omitted state
+ *                 (2 sites)
+ *
+ * Realtime is absent because it has no `strict` field at all; that is the
+ * `openai-realtime` target. Measured snapshot — re-measure after a bump.
+ */
+export const OPENAI_STRICT_SURFACES: Array<{
+  path: string;
+  file: string;
+  line: number;
+  unset: "off" | "auto" | "required";
+  api: string;
+}>;
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -190,6 +212,7 @@ declare const api: {
   ANTHROPIC_GO_SUPPORTED_KEYS: typeof ANTHROPIC_GO_SUPPORTED_KEYS;
   GO_INVOPOP_MODELLED_KEYS: typeof GO_INVOPOP_MODELLED_KEYS;
   OPENAI_ANNOTATION_KEYWORDS_LIST: typeof OPENAI_ANNOTATION_KEYWORDS_LIST;
+  OPENAI_STRICT_SURFACES: typeof OPENAI_STRICT_SURFACES;
 };
 
 export default api;
