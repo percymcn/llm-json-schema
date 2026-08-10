@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1105 engine + 258 CLI + 42 ESM/library assertions = **1405** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1127 engine + 258 CLI + 42 ESM/library assertions = **1427** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -55,6 +55,23 @@ failed CI on them. `$ref` members are now resolved before the merge, but only
 where the node itself constrains: a bare `{allOf: [{$ref}]}` and the Pydantic v1
 `{description, allOf: [{$ref}]}` still come out as a `$ref` beside annotations,
 which is the form the vendor accepts.
+
+**…and the root is the same node.** The fix above landed at nested positions and
+left the root running the old referent-wins carry-over — a gap recorded at the
+time and measured now. On the identical shape at the root, whose raw accept set
+again requires both `a` and `b`, **four of ten targets** (`openai`, `anthropic`,
+`anthropic-json`, `anthropic-go`) dropped the node's own `a` and stopped
+requiring it, silently, at zero blockers — while the same schema one level down
+was already correct. **The two positions disagreed with each other about one
+logical schema**, which is the tell that a position, not a dialect, was the
+variable. All ten now emit the raw accept set at both positions.
+
+Annotation-only siblings deliberately keep the old path: precedence is correct
+for annotations, and `{$ref, $defs, title}` — what Pydantic's `RootModel` emits
+(measured, 2.13.4) — is the commonest root shape there is, so it stays
+byte-identical. The reachable population for the constraining form is
+hand-authored and OpenAPI-composition schemas; the reason to fix it anyway is
+that the failure is a silent accept-set change in a CI gate.
 
 Reachability, stated at its true strength: neither pydantic 2.13.4, pydantic
 1.10.22, zod 3 + `zod-to-json-schema@3.24.5` nor zod 4 emits a constraining
@@ -697,7 +714,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1405 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1427 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

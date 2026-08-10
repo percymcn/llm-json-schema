@@ -6803,5 +6803,212 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 
 
 
+// --- #372: a root `$ref` is a member of the intersection too -------------
+// #371 fixed the NESTED position and banked the root as a known, measured gap:
+// `inlineRootRef` carried siblings with `if (!(k in out)) out[k] = s[k]`, i.e.
+// REFERENT-WINS. Precedence is only ever correct for annotations; for anything
+// that constrains, "the referent wins" means "the node's own declarations are
+// deleted". Measured at the root on a shape whose raw accept set is `0001` (an
+// object must carry BOTH `a` and `b`), FOUR of ten targets emitted `0010`/`0011`
+// — the node's own `a` gone and no longer required — at ZERO blockers, while the
+// SAME shape one level down was already correct. The two positions disagreed
+// with each other about one logical schema, which is the tell.
+(function () {
+  // Guarded reads: a converter that throws or returns no ledger must REPORT as a
+  // failure rather than abort the file and hide every assertion after it (#322).
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function props(r) {
+    var s = r && r.schema;
+    return (s && s.properties && typeof s.properties === "object") ? Object.keys(s.properties) : [];
+  }
+  function req(r) { return (r && r.schema && Array.isArray(r.schema.required)) ? r.schema.required : []; }
+  function blk(r) {
+    return led(r).filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function hasAll(list, names) {
+    return names.every(function (n) { return list.indexOf(n) !== -1; });
+  }
+  function T(extra) {
+    var t = { type: "object", properties: { b: { type: "string" } }, required: ["b"] };
+    Object.keys(extra || {}).forEach(function (k) { t[k] = extra[k]; });
+    return t;
+  }
+  function root(sib, tExtra) {
+    var s = { $ref: "#/$defs/T" };
+    Object.keys(sib).forEach(function (k) { s[k] = sib[k]; });
+    s.$defs = { T: T(tExtra) };
+    return s;
+  }
+  function conv(s, target) {
+    try { return E.convert(JSON.parse(JSON.stringify(s)), target); } catch (e) { return null; }
+  }
+
+  var CONSTRAINING = { properties: { a: { type: "string" } }, required: ["a"] };
+
+  // (1) the four targets that DELETED the node's own declarations now keep both
+  ["openai", "anthropic", "anthropic-json", "anthropic-go"].forEach(function (t) {
+    var r = conv(root(CONSTRAINING), null);
+    r = conv(root(CONSTRAINING), t);
+    ok("#372 " + t + ": a constraining sibling at the ROOT is merged, not overwritten",
+      hasAll(props(r), ["a", "b"]) && hasAll(req(r), ["a", "b"]) && blk(r).length === 0);
+  });
+
+  // (2) the merge is NAMED in the ledger — a reader must be able to see that two
+  // sides were combined rather than one silently winning (#318)
+  ok("#372 the root merge is reported as an intersection",
+    has(led(conv(root(CONSTRAINING), "openai")),
+      "which is an INTERSECTION rather than a decoration"));
+
+  // (3) THE DISCRIMINATOR: the same logical schema at the ROOT and one level
+  // down must now AGREE. Without this pin the rule could be firing on any root
+  // `$ref` at all, or on any `$ref` sibling anywhere, and every other assertion
+  // here would still pass (#364/#366).
+  ok("#372 DISCRIMINATOR: root and nested now agree about one logical schema",
+    (function () {
+      var atRoot = conv(root(CONSTRAINING), "openai");
+      var nested = conv({
+        type: "object",
+        properties: { p: { $ref: "#/$defs/T", properties: { a: { type: "string" } }, required: ["a"] } },
+        required: ["p"],
+        $defs: { T: T() }
+      }, "openai");
+      var n = nested && nested.schema && nested.schema.properties && nested.schema.properties.p;
+      var nProps = (n && n.properties) ? Object.keys(n.properties) : [];
+      return hasAll(props(atRoot), ["a", "b"]) && hasAll(nProps, ["a", "b"]);
+    })());
+
+  // (4) #370's closed-branch restriction applies at the root: a required name
+  // outside the intersection has NO repair, so it is named rather than merged
+  ok("#372 root: a required name outside a closed referent is a BLOCKER",
+    (function () {
+      var r = conv(root(CONSTRAINING, { additionalProperties: false }), "openai");
+      return blk(r).length === 1 && has(led(r), "cannot both be satisfied");
+    })());
+
+  // (5) two sides declaring the same property with DIFFERENT shapes: picking
+  // either silently changes what is accepted (#347), so it is a blocker
+  ok("#372 root: the same property with different shapes is a BLOCKER",
+    (function () {
+      var r = conv(root({ properties: { b: { type: "integer" } }, required: ["b"] }), "openai");
+      return blk(r).length === 1 && has(led(r), "with different shapes");
+    })());
+
+  // (6) an IDENTICAL restatement is a duplication, not a conflict (#349)
+  ok("#372 root: an identical restatement of the same property still merges",
+    (function () {
+      var r = conv(root({ properties: { b: { type: "string" } }, required: ["b"] }), "openai");
+      return blk(r).length === 0 && props(r).indexOf("b") !== -1;
+    })());
+
+  // (7) an excluded OPTIONAL name is lossless (no object could have carried it)
+  // and is dropped WITH a report rather than silently (#318)
+  ok("#372 root: an excluded optional name is dropped and reported",
+    (function () {
+      var r = conv(root({ properties: { a: { type: "string" } } }, { additionalProperties: false }), "openai");
+      return blk(r).length === 0 && props(r).indexOf("a") === -1 && has(led(r), "Dropped `a`");
+    })());
+
+  // (8) NOT reported twice. `inlineRootRef` runs again after the walk (#363) and
+  // `resolveRefSiblings` visits the root as well, so three separate passes can
+  // reach this one node. The suppression is keyed on OBJECT IDENTITY and has to
+  // be re-keyed onto the rebuilt object, because the walk rebuilds every node.
+  ["openai", "anthropic-json"].forEach(function (t) {
+    ok("#372 " + t + ": a blocked root is reported exactly ONCE",
+      (function () {
+        var r = conv(root(CONSTRAINING, { additionalProperties: false }), t);
+        var msgs = blk(r).map(function (l) { return l.path + "|" + l.msg.slice(0, 40); });
+        return msgs.length === 1 && msgs.length === msgs.filter(function (m, i) {
+          return msgs.indexOf(m) === i;
+        }).length;
+      })());
+  });
+
+  // --- over-block guards: these hold BOTH ways and are stated as guards -----
+
+  // (9) ANNOTATION-only siblings keep the legacy path byte-for-byte. Precedence
+  // is correct for annotations, and `{$ref, $defs, title}` is exactly what
+  // pydantic's `RootModel` emits (measured, 2.13.4) — the commonest root shape
+  // there is. It must not acquire an intersection note.
+  ok("#372 root: an annotation-only sibling is NOT treated as an intersection",
+    (function () {
+      var r = conv(root({ description: "d", title: "W" }), "openai");
+      return blk(r).length === 0 && props(r).length === 1 && props(r)[0] === "b" &&
+        !has(led(r), "which is an INTERSECTION rather than a decoration");
+    })());
+
+  // (10) the vendor's root variant additionally tolerates `$schema`/`$id`
+  ok("#372 root: `$schema`/`$id` beside a `$ref` are tolerated, not constraints",
+    (function () {
+      var r = conv(root({ $schema: "https://json-schema.org/draft/2020-12/schema", $id: "x" }), "openai");
+      return blk(r).length === 0 && !has(led(r), "which is an INTERSECTION rather than a decoration");
+    })());
+
+  // (11) a bare root `$ref` is the canonical generator shape and is untouched
+  ok("#372 root: a bare `$ref` still inlines with no intersection note",
+    (function () {
+      var r = conv(root({}), "openai");
+      return blk(r).length === 0 && props(r).indexOf("b") !== -1;
+    })());
+
+  // (12) the definition bag is NOT a constraining sibling, and definitions the
+  // merged root still points at must survive the orphan pruner (#342)
+  ok("#372 root: a definition still referenced from the merged root survives",
+    (function () {
+      var r = conv({
+        $ref: "#/$defs/T",
+        properties: { a: { $ref: "#/$defs/U" } },
+        required: ["a"],
+        $defs: { T: T(), U: { type: "string" } }
+      }, "openai");
+      var d = r && r.schema && r.schema.$defs;
+      return blk(r).length === 0 && d && d.U && !d.T;
+    })());
+
+  // (13) the draft-07 spelling of the bag reaches the same merge (#311/#320)
+  ok("#372 root: the `definitions` spelling merges identically",
+    (function () {
+      var r = conv({
+        $ref: "#/definitions/T",
+        properties: { a: { type: "string" } },
+        required: ["a"],
+        definitions: { T: T() }
+      }, "openai");
+      return blk(r).length === 0 && hasAll(props(r), ["a", "b"]);
+    })());
+
+  // (14) ORDERING PINS. Changing the root inliner owes a re-probe of the two
+  // checks that run around it (#362's root-union blocker and #341's typeless
+  // root), and of the second inliner pass #363 added after the walk.
+  ok("#372 ordering: #362's root union blocker still fires",
+    (function () {
+      var r = conv({ oneOf: [{ type: "object", properties: { a: {} } }, { type: "string" }] }, "openai");
+      return blk(r).length === 1 && has(led(r), "Root schema cannot use `oneOf`");
+    })());
+
+  ok("#372 ordering: #341's typeless root is still REPAIRED, not blocked",
+    (function () {
+      var r = conv({ properties: { a: { type: "string" } }, required: ["a"] }, "openai");
+      return blk(r).length === 0 && r.schema.type === "object";
+    })());
+
+  ok("#372 ordering: #363's post-walk root inline still runs",
+    (function () {
+      var r = conv({ allOf: [{ $ref: "#/$defs/T" }], $defs: { T: T() } }, "openai");
+      return blk(r).length === 0 && props(r).indexOf("b") !== -1;
+    })());
+
+  // (15) the two targets that forward the document verbatim must keep doing so —
+  // there is nothing to merge when nothing is rewritten, and a merge there would
+  // be this project's over-strictness class (#312/#314/#317/#322/#337)
+  ["openai-nonstrict", "openai-realtime"].forEach(function (t) {
+    ok("#372 " + t + ": still forwards the root `$ref` untouched",
+      (function () {
+        var r = conv(root(CONSTRAINING), t);
+        return blk(r).length === 0 && r.schema && r.schema.$ref === "#/$defs/T";
+      })());
+  });
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -1330,13 +1330,44 @@
     return { bag: bag, name: name };
   }
 
-  function inlineRootRef(s, ledger, docUrl, why) {
+  function inlineRootRef(s, ledger, docUrl, why, blockedOut) {
     var t = rootRefTarget(s);
     if (!t) return s;
     var bag = t.bag, name = t.name;
 
-    var out = clone(s[bag][name]);
+    var out, merged = null;
     var defs = s[bag];
+
+    // A `$ref` beside CONSTRAINING siblings is an INTERSECTION here too — the
+    // root is not a different dialect, only a different position (#371). The
+    // referent-wins carry-over below is a PRECEDENCE rule, and precedence is
+    // only ever correct for annotations: for anything that constrains, "the
+    // referent wins" means "the node's own declarations are deleted". Measured
+    // at the root on `{properties:{a}, required:["a"], $ref:T}` whose raw accept
+    // set is `0001` (an object must carry BOTH), FOUR of ten targets emitted
+    // `0010`/`0011` — the node's own `a` gone, no longer required, at ZERO
+    // blockers — while the SAME shape one level down was correct. The two
+    // positions disagreed with each other, which is the tell.
+    var constraining = Object.keys(s).filter(function (k) {
+      return k !== "$ref" && !toleratedRefSibling(k, true, s);
+    });
+
+    if (constraining.length) {
+      // Already reported by an earlier pass over this same object — compare
+      // references, not a structural snapshot: the pipeline mutates this node
+      // in between (#371).
+      if (Array.isArray(blockedOut) && blockedOut.indexOf(s) !== -1) return s;
+      merged = intersectRef(clone(defs[name]), s, constraining, "root", ledger, docUrl);
+      if (!merged) {
+        // No merge preserves the meaning, so the remodelling is NAMED and the
+        // shape is left exactly as written for the reader to see (#318/#329).
+        if (Array.isArray(blockedOut)) blockedOut.push(s);
+        return s;
+      }
+      out = merged.schema;
+    } else {
+      out = clone(defs[name]);
+    }
 
     // carry over any sibling keys the generator left next to `$ref`
     Object.keys(s).forEach(function (k) {
@@ -1355,7 +1386,19 @@
     ledger.push(entry("~", "root",
       "Inlined the root `$ref` (`#/" + bag + "/" + name + "`) into the root. " + (why ||
         "OpenAI requires the root to be an object schema, and a bare `$ref` root leaves " +
-        "`additionalProperties`/`required` unset on the real object."),
+        "`additionalProperties`/`required` unset on the real object.") +
+      (merged
+        ? " The root also declared `" + constraining.join("`, `") + "` beside the `$ref`, which is " +
+          "an INTERSECTION rather than a decoration — draft 2020-12 applies the referenced schema " +
+          "AND these siblings — so both sides' declarations were merged instead of letting the " +
+          "referent overwrite them." +
+          (merged.dropped.length
+            ? " Dropped `" + merged.dropped.join("`, `") + "`: a side declaring " +
+              "`additionalProperties: false` already forbade " +
+              (merged.dropped.length > 1 ? "those properties" : "that property") + ", so no object " +
+              "could have carried " + (merged.dropped.length > 1 ? "them" : "it") + " and nothing is lost."
+            : "")
+        : ""),
       docUrl || DOCS.openai));
     return out;
   }
@@ -1501,7 +1544,12 @@
       });
       var m = typeof node.$ref === "string" ? /^#\/\$defs\/(.+)$/.exec(node.$ref) : null;
 
-      if (m && siblings.length && isPlainObject(defs[m[1]])) {
+      // `inlineRootRef` owns the root and may already have blocked this exact
+      // object. Compare REFERENCES (#371): re-reporting it here would print the
+      // same finding twice, and the two functions build paths differently, so a
+      // path-string agreement is not available to key on.
+      var alreadyBlocked = Array.isArray(blockedOut) && blockedOut.indexOf(node) !== -1;
+      if (m && siblings.length && isPlainObject(defs[m[1]]) && !alreadyBlocked) {
         var name = m[1];
         if (stack.indexOf(name) !== -1) {
           if (unresolved.indexOf(name) === -1) unresolved.push(name);
@@ -1534,7 +1582,12 @@
       // of the pipeline mutates this node (it gains `additionalProperties`, its
       // `required` is rewritten), so a structural fingerprint taken here would
       // no longer match by the time the exit-side check runs.
-      if (blockedHere && Array.isArray(blockedOut)) blockedOut.push(out);
+      // Chain the identity onto the object we actually hand back. This walk
+      // REBUILDS every node, so a reference recorded upstream stops matching the
+      // moment we return — and the root inliner runs again after us (#363), on
+      // the rebuilt object. Re-keying here is what makes the suppression
+      // survive the rebuild; without it the same blocker prints twice.
+      if ((blockedHere || alreadyBlocked) && Array.isArray(blockedOut)) blockedOut.push(out);
       return out;
     }
 
@@ -1972,8 +2025,8 @@
 
     s = normalizeRefSpelling(s, ledger);
     s = normalizeDefs(s, ledger);
-    s = inlineRootRef(s, ledger);
     var refIntersectBlocked = [];
+    s = inlineRootRef(s, ledger, undefined, undefined, refIntersectBlocked);
     s = resolveRefSiblings(s, ledger, undefined, undefined, undefined, refIntersectBlocked);
 
     // These two entry-side blockers are kept for their PROVENANCE: they can say
@@ -2655,7 +2708,7 @@
     // had simply run the inliner before the pointer existed. Re-running is safe:
     // it is a lossless inline, a no-op when there is nothing to inline, and it
     // reports what it did.
-    s = inlineRootRef(s, ledger);
+    s = inlineRootRef(s, ledger, undefined, undefined, refIntersectBlocked);
 
     // The ROOT `type` check runs LAST, because the walk above can supply the
     // `type` itself — a single-member object `allOf` is flattened there, and the
@@ -3244,6 +3297,7 @@
     var pythonSdk = sdk === "python";
     var s = clone(schema);
     var ledger = [];
+    var antRefBlocked = [];
     var url = outputFormatPath ? DOCS["anthropic-json"] : DOCS.anthropic;
     // Go has no verbatim surface at all (#332), so the remedy every other
     // Anthropic message can offer does not exist there.
@@ -3434,7 +3488,7 @@
         : "A root `$ref` has no `type` of its own, and `betaTool()` throws \"JSON schema for tool ... " +
           "must be an object, but got undefined\" on any root that is not `type: \"object\"`. Inlining " +
           "the referenced definition gives the root its object type back. (Measured against " +
-          "@anthropic-ai/sdk@0.116.0.)");
+          "@anthropic-ai/sdk@0.116.0.)", antRefBlocked);
     }
 
     if (outputFormatPath) {
@@ -3443,7 +3497,7 @@
       s = resolveRefSiblings(s, ledger, url,
         "Anthropic's transformer returns immediately on `$ref` and drops every sibling key silently — " +
         "a `description` next to a `$ref` simply vanishes rather than being demoted to prose",
-        "Anthropic's transformer drops silently");
+        "Anthropic's transformer drops silently", antRefBlocked);
     }
 
     if (!s.type && isObjectSchema(s)) {
