@@ -5374,5 +5374,100 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
     })());
 })();
 
+// --- #360: the OpenAI keyword layer, diffed WHOLE and in BOTH directions ----
+// #313's rule is "diff the vendor's WHOLE blocklist, don't spot-check it". That
+// had never been executed as a TEST -- the vendor's set lived in a comment
+// (#312), which is #351's "verified in prose is not verified" one target over.
+//
+// Measured 2026-08-10 against openai@7.4.0 `lib/transform.js`, reading the
+// three recursion tables and the unsupported set out of the SDK rather than
+// guessing. Result was a CLEAN NEGATIVE in both directions, banked here as a
+// test (#347's precedent) so a vendor bump or an allowlist edit is detectable:
+//
+//   forward  28/28 verdict agreement, and all 28 of our converted outputs
+//            round-trip ACCEPTED by toStrictJsonSchema (the exit-1 promise --
+//            "commit my output" -- actually holds; #330 found it broken once).
+//   reverse  of the whole JSON Schema vocabulary, exactly three keywords are
+//            PRESERVED by the vendor while absent from our allowlist. Two are
+//            owned by dedicated rules and MUST NOT become strips; one is inert.
+(function () {
+  function conv(s, t) { return E.convert(s, t); }
+  function nested(k, v) {
+    var n = { type: "object", properties: { a: { type: "string" } },
+              required: ["a"], additionalProperties: false };
+    n[k] = v;
+    return { type: "object", properties: { f: n }, required: ["f"],
+             additionalProperties: false };
+  }
+
+  // Transcribed from openai@7.4.0's JSON_SCHEMA_UNSUPPORTED_SCHEMA_KEYWORDS,
+  // plus `additionalItems` -- which the SDK DESCENDS into and does NOT list,
+  // yet still throws on. We agree on it for a different reason than the table
+  // gives, so it is pinned separately from the table's own membership.
+  var VENDOR_THROWS = {
+    "$anchor": "a", "$dynamicAnchor": "a", "$dynamicRef": "#a",
+    "$recursiveAnchor": true, "$recursiveRef": "#",
+    "allOf": [{ type: "string" }], "contains": { type: "string" },
+    "contentEncoding": "base64", "contentMediaType": "text/plain",
+    "contentSchema": { type: "string" }, "dependentRequired": { x: ["y"] },
+    "dependentSchemas": { x: { type: "object" } }, "dependencies": { x: ["y"] },
+    "else": { type: "string" }, "if": { type: "string" },
+    "maxContains": 2, "maxProperties": 3, "minContains": 1, "minProperties": 1,
+    "not": { type: "string" }, "patternProperties": { "^a": { type: "string" } },
+    "prefixItems": [{ type: "string" }], "propertyNames": { type: "string" },
+    "then": { type: "string" }, "unevaluatedItems": { type: "string" },
+    "unevaluatedProperties": false, "uniqueItems": true,
+    "additionalItems": { type: "string" }
+  };
+
+  // No silent pass. The assertion is on the LEDGER rather than on the output,
+  // because a blocker deliberately LEAVES the keyword visible (#318) while a
+  // strip removes it -- keying on absence would pass vacuously for blockers.
+  //
+  // Sensitivity measured, not assumed (#340): allowlisting all 28 at once makes
+  // 24 of these fail. The other four -- `allOf`, `patternProperties`,
+  // `prefixItems`, `propertyNames` -- still pass, because a DEDICATED rule
+  // reports them independently of the allowlist (#318's conditional allOf,
+  // #348's four spellings of a map, #346's tuple). That is two independent
+  // guards on one node rather than a vacuous assertion (#359's second
+  // corollary: when two rules can reach a node, say which owns it) -- but it
+  // does mean these four are pinned by the OTHER rule's tests, not by this one.
+  Object.keys(VENDOR_THROWS).forEach(function (k) {
+    ok("#360 openai: `" + k + "` is reported, never passed through silently",
+      has(conv(nested(k, VENDOR_THROWS[k]), "openai").ledger, k));
+  });
+
+  // --- the reverse direction, which is the one that bites --------------------
+  // Our OPENAI_SUPPORTED is an ALLOWLIST, so agreeing with the vendor's
+  // blocklist is nearly free; the failure mode that actually shipped (#312, ten
+  // keywords) is over-stripping something the vendor KEEPS. These two are
+  // absent from the allowlist and so LOOK strippable, and are not: each is
+  // owned by a dedicated rule that must survive.
+  ok("#360 openai: `definitions` is renamed to `$defs`, not stripped (#311)",
+    (function () {
+      var r = conv({ type: "object", properties: { f: { $ref: "#/definitions/D" } },
+        required: ["f"], additionalProperties: false,
+        definitions: { D: { type: "object", properties: { a: { type: "string" } },
+          required: ["a"] } } }, "openai");
+      var d = r.schema && r.schema.$defs;
+      return !!(d && d.D && d.D.properties && d.D.properties.a);
+    })());
+
+  ok("#360 openai: `oneOf` is rewritten to `anyOf`, not stripped (#318)",
+    (function () {
+      var r = conv(nested("oneOf", [{ type: "string" }, { type: "number" }]), "openai");
+      var f = r.schema && r.schema.properties && r.schema.properties.f;
+      return !!(f && Array.isArray(f.anyOf) && f.anyOf.length === 2);
+    })());
+
+  // The ONE measured divergence, recorded as deliberate rather than left to
+  // look like an oversight: the vendor PRESERVES `$vocabulary` and we strip it.
+  // Not fixed, and the reason is reachability (#346's filter): `$vocabulary` is
+  // legal only on a meta-schema, and no generator this project has probed
+  // emits one. If that ever changes, this assertion is where to start.
+  ok("#360 openai: `$vocabulary` is stripped -- known, deliberate divergence",
+    has(conv(nested("$vocabulary", { "https://x": true }), "openai").ledger, "$vocabulary"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
