@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1068 engine + 258 CLI + 42 ESM/library assertions = **1368** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1085 engine + 258 CLI + 42 ESM/library assertions = **1385** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -662,7 +662,7 @@ it through the CLI (`--to openai --check`) in your test suite.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1368 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1385 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1060,6 +1060,62 @@ this shape at all, and neither zod 3 + `zod-to-json-schema` nor zod 4's native
 `z.toJSONSchema()` emit a single-member `allOf`. So the deleting shape is a
 hand-authored / OpenAPI-composition idiom rather than something the common
 generators hand you — which is most likely why it survived this long.
+
+
+## …and the merge it was fixed to use was a union, where the vendor intersects
+
+Fixing the single-member branch to merge left a second, larger question nobody
+asked: **is the union the right merge at all?**
+
+An `allOf` is an *intersection*, and a branch that declares
+`additionalProperties: false` **forbids every property it does not itself
+declare**. So the merged property set is not the union of the branches — it is
+that union *restricted to every closed branch's own declarations*. OpenAI's
+transformer computes exactly this and says so in a comment
+(`lib/transform.js`, "A closed branch forbids every property it does not
+declare"), then **refuses the merge outright** when a *required* property falls
+outside the intersection, because no object could then satisfy the schema.
+
+We took the plain union, and never looked at any branch's
+`additionalProperties` at all: the N-member guard checks the **members'**, and
+the single-member path short-circuits past it entirely. Measured on
+`openai@7.4.0` across the 16-cell node × member grid at a **nested** position
+(root rules contaminate the verdict), with accept sets computed by
+`ajv/dist/2020`:
+
+- **Eight** shapes whose raw accept set is **empty** — no object can ever
+  satisfy them — came out **satisfiable**, at **zero blockers**, while the
+  ledger claimed *"OpenAI's own transformer performs the same merge"*, which
+  the same run measures as false: the vendor throws on every one.
+- **One** shape the vendor **accepts and preserves exactly** (a closed node
+  beside a member declaring a new *optional* property) came out with a
+  **different accept set**, because we admitted a property the schema forbade.
+
+Acceptance bought by changing what the schema means is not a repair. So:
+
+| the intersection | what happens now |
+|---|---|
+| a **required** property falls outside it | **blocker** — no edit preserves the meaning, so the remodelling is named instead of invented |
+| an **optional** property falls outside it | **dropped, and reported** — no object could have carried it, so removing it is lossless; keeping it would *widen* the schema. The vendor discards the same names. |
+| no branch is closed | **nothing changes** — the plain union is correct, and this rule is a no-op |
+
+That last row is what makes the change safe: the rule cannot fire unless some
+branch is closed, so every previously-passing shape is byte-identical. Verified
+across the corpus — 544 captured inputs × 10 targets = **5,440 pairs, 0
+changed** — with a control proving the differential can detect a change at all.
+After the fix our verdict matches the vendor on **14 of 14** cells where the
+vendor rules on the merge, and every non-blocked closed-branch case preserves
+the accept set **exactly**.
+
+Reachability, stated honestly: `pydantic` 2.13.4 emits `additionalProperties:
+false` for `extra="forbid"` but never emits `allOf` — inheritance is flattened
+and a described `$ref` field stays a plain `$ref` — and neither zod 3 nor zod 4
+emits a single-member `allOf`. So this is the same hand-authored /
+OpenAPI-composition population as the section above, where closing a schema and
+composing it are both ordinary. That is weaker than "everyone hits this", and
+the reason to fix it anyway is that the failure is a **false pass in a CI
+gate**: a schema no object can satisfy, silently rewritten into one that looks
+fine and that the vendor then accepts.
 
 
 ## When the conversion deletes everything

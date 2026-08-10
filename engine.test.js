@@ -6482,5 +6482,162 @@ var PY_EXTRA_ALLOW = { additionalProperties: true, properties: { name: { title: 
 })();
 
 
+// ---------------------------------------------------------------------------
+// #370 — an `allOf` is an INTERSECTION, and a closed branch shrinks it.
+//
+// A branch declaring `additionalProperties: false` FORBIDS every property it
+// does not itself declare, so the merged property set is the union RESTRICTED
+// to every closed branch's declarations. We took the plain union and never
+// looked at any branch's `additionalProperties` — the N-member guard checks the
+// MEMBERS' and the single-member path short-circuits past it (#349's shape: the
+// N=1 special case skipping a condition the general path enforces).
+//
+// Measured on openai@7.4.0 over the 16-cell node x member grid at a NESTED
+// position (root rules contaminate — #363), with accept sets from ajv 2020-12:
+// EIGHT shapes whose raw accept set is EMPTY came out SATISFIABLE at zero
+// blockers, and one the vendor ACCEPTS and preserves EXACTLY came out with a
+// different accept set. 14/14 agreement with the vendor after the fix.
+(function () {
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function P(props, req, closed) {
+    var o = { type: "object", properties: props };
+    if (req) o.required = req;
+    if (closed) o.additionalProperties = false;
+    return o;
+  }
+  function S() { return { type: "string" }; }
+  // NESTED so the typeless/non-object ROOT rules cannot contaminate the verdict.
+  function nest(inner) {
+    return { type: "object", properties: { n: inner }, required: ["n"] };
+  }
+  function conv(inner) {
+    try { return E.convert(clone(nest(inner)), "openai"); } catch (e) { return null; }
+  }
+  function blk(r) {
+    if (!r || !Array.isArray(r.ledger)) return -1;
+    return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length;
+  }
+  // Guarded: with engine.js reverted these reads must REPORT, not abort the
+  // file (#322's trap).
+  function props(r) {
+    var n = r && r.schema && r.schema.properties && r.schema.properties.n;
+    if (!n || !n.properties) return "(none)";
+    return Object.keys(n.properties).sort().join(",");
+  }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+
+  // --- The unsatisfiable family: a REQUIRED property outside the intersection.
+  // Raw accept set is EMPTY (no object can satisfy it) and the vendor throws
+  // "Object allOf ... cannot be merged without changing Draft 7 validation".
+  // We used to merge these into a satisfiable schema at ZERO blockers.
+  var closedNodeReqMember = P({ a: S() }, ["a"], true);
+  closedNodeReqMember.allOf = [P({ b: S() }, ["b"], false)];
+  ok("#370 closed node + member requiring an excluded property is a BLOCKER",
+    blk(conv(closedNodeReqMember)) === 1);
+  ok("#370 the blocker says no object can satisfy it, and names the culprit",
+    has(led(conv(closedNodeReqMember)), "cannot be satisfied by any object") &&
+    has(led(conv(closedNodeReqMember)), "`b`"));
+  ok("#370 the blocker explains that merging would ADMIT a forbidden property",
+    has(led(conv(closedNodeReqMember)), "would silently ADMIT"));
+
+  var openNodeClosedMember = P({ a: S() }, ["a"], false);
+  openNodeClosedMember.allOf = [P({ b: S() }, ["b"], true)];
+  ok("#370 the mirror (closed MEMBER, open node) blocks too",
+    blk(conv(openNodeClosedMember)) === 1);
+
+  // The N-member path had the same hole: `mergeable` checks the MEMBERS'
+  // `additionalProperties` and never the NODE's.
+  var closedNodeTwoMembers = P({ a: S() }, ["a"], true);
+  closedNodeTwoMembers.allOf = [P({ b: S() }, ["b"], false), P({ c: S() }, ["c"], false)];
+  ok("#370 N-member path: closed node + open required members blocks",
+    blk(conv(closedNodeTwoMembers)) === 1);
+
+  // --- The silent-widening family: an OPTIONAL property outside the
+  // intersection. The vendor ACCEPTS these and DISCARDS the excluded name; we
+  // admitted it, which widened what the schema accepts.
+  var closedNodeOptMember = P({ a: S() }, ["a"], true);
+  closedNodeOptMember.allOf = [P({ b: S() }, null, false)];
+  ok("#370 an excluded OPTIONAL property is dropped, not admitted",
+    props(conv(closedNodeOptMember)) === "a");
+  ok("#370 dropping an excluded property is REPORTED, never silent",
+    has(led(conv(closedNodeOptMember)), "Dropped `b`"));
+  ok("#370 the drop note explains it would have WIDENED the schema",
+    has(led(conv(closedNodeOptMember)), "WIDEN what this schema"));
+  ok("#370 an excluded optional property is not a gate failure",
+    blk(conv(closedNodeOptMember)) === 0);
+
+  // The node's OWN property is dropped when a closed MEMBER forbids it —
+  // the rule is about the intersection, not about who declared the name.
+  var openNodeClosedMemberOpt = P({ a: S() }, null, false);
+  openNodeClosedMemberOpt.allOf = [P({ b: S() }, ["b"], true)];
+  ok("#370 a closed MEMBER drops the NODE's own excluded property",
+    props(conv(openNodeClosedMemberOpt)) === "b");
+
+  // Two closed branches with disjoint declarations intersect to nothing.
+  var bothClosedDisjoint = P({ a: S() }, null, true);
+  bothClosedDisjoint.allOf = [P({ b: S() }, null, true)];
+  // The intersection of two disjoint closed branches admits only `{}`. That is
+  // what the vendor emits for the same input, byte-identical, so matching it is
+  // correct rather than a #329 "repair that deletes" — the raw schema already
+  // accepted nothing else. (This assertion originally read "(none)"; the code
+  // was right and the TEST was wrong — an empty `properties` object is not a
+  // missing one.)
+  ok("#370 two disjoint closed branches leave an empty object (vendor agrees)",
+    props(conv(bothClosedDisjoint)) === "" &&
+    (function () {
+      var n = conv(bothClosedDisjoint);
+      n = n && n.schema && n.schema.properties && n.schema.properties.n;
+      return !!(n && n.properties && n.additionalProperties === false);
+    })());
+
+  // --- OVER-BLOCK GUARDS. Being stricter than the vendor is this project's
+  // most repeated bug (#312/#314/#317/#322/#329/#337/#343/#344/#348/#365).
+  // These hold BOTH ways and are stated rather than counted as new coverage.
+  var openBoth = P({ a: S() }, ["a"], false);
+  openBoth.allOf = [P({ b: S() }, ["b"], false)];
+  ok("#370 over-block guard: no closed branch -> plain union, unchanged",
+    props(conv(openBoth)) === "a,b" && blk(conv(openBoth)) === 0);
+  ok("#370 over-block guard: an all-open merge reports no drop",
+    !has(led(conv(openBoth)), "Dropped"));
+
+  // A closed branch that DOES declare the required name is perfectly fine.
+  var closedNodeAllowed = P({ a: S() }, ["a"], true);
+  closedNodeAllowed.allOf = [P({ a: S() }, ["a"], false)];
+  ok("#370 over-block guard: a closed branch declaring the name still merges",
+    props(conv(closedNodeAllowed)) === "a" && blk(conv(closedNodeAllowed)) === 0);
+
+  // A closed branch with NO properties forbids everything, but if nothing is
+  // required the intersection is the empty object — legal, not a blocker.
+  var closedNoProps = P({}, null, true);
+  closedNoProps.allOf = [P({ b: S() }, null, false)];
+  ok("#370 over-block guard: closed-with-no-properties + optional is not blocked",
+    blk(conv(closedNoProps)) === 0);
+
+  // THE DISCRIMINATOR. Without this pair the rule could be firing on any
+  // `allOf` at all and every assertion above would still pass: the SAME two
+  // branches differ only in whether one is closed, and must reach opposite
+  // verdicts (#364/#366's pattern).
+  ok("#370 DISCRIMINATOR: identical branches, closed vs open, disagree",
+    (function () {
+      var closed = P({ a: S() }, ["a"], true);
+      closed.allOf = [P({ b: S() }, ["b"], false)];
+      var open = P({ a: S() }, ["a"], false);
+      open.allOf = [P({ b: S() }, ["b"], false)];
+      return blk(conv(closed)) === 1 && blk(conv(open)) === 0 &&
+        props(conv(open)) === "a,b";
+    })());
+
+  // Scope pin: this is an OpenAI strict-mode rule. Anthropic's tools path
+  // applies no transform at all (#315/#321), so it must stay silent there.
+  ok("#370 scope pin: `--to anthropic` does not inherit the closed-branch rule",
+    (function () {
+      var r;
+      try { r = E.convert(clone(nest(closedNodeReqMember)), "anthropic"); }
+      catch (e) { return false; }
+      return blk(r) === 0 && !has(led(r), "cannot be satisfied by any object");
+    })());
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

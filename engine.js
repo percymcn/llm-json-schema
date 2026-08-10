@@ -1892,13 +1892,85 @@
       var allOfBlocked = false;
       if (Array.isArray(node.allOf) && node.allOf.length) {
         var members = node.allOf;
+
+        // An `allOf` is an INTERSECTION, and a branch that declares
+        // `additionalProperties: false` FORBIDS every property it does not
+        // itself declare. So the merged property set is not the UNION of the
+        // branches — it is the union RESTRICTED to every closed branch's own
+        // declarations. openai@7.4.0 computes exactly that
+        // (transform.js:1496-1505, "A closed branch forbids every property it
+        // does not declare") and REFUSES the merge outright when a REQUIRED
+        // property falls outside the intersection, because no object can then
+        // satisfy the schema.
+        //
+        // We unioned, and never looked at any branch's `additionalProperties`
+        // at all — the N-member guard below checks the MEMBERS' and the
+        // single-member path short-circuits past it entirely (#349's shape: the
+        // N=1 special case skipping a condition the general path enforces).
+        // Measured on openai@7.4.0 over the 16-cell node×member grid at a
+        // NESTED position: 8 shapes whose raw accept set is EMPTY (ajv 2020-12,
+        // i.e. no instance can ever satisfy them) came out SATISFIABLE, at zero
+        // blockers, with the ledger claiming "OpenAI's own transformer performs
+        // the same merge" — which the same run measures as false, the vendor
+        // throws on every one. And one shape the vendor ACCEPTS and preserves
+        // EXACTLY (closed node + an optional member property) came out with a
+        // different accept set, because we admitted a property the schema
+        // forbade. Acceptance bought by changing what the schema means is not a
+        // repair (#347).
+        var allOfBranches = [node].concat(members);
+        var closedSets = [];
+        allOfBranches.forEach(function (b) {
+          if (isPlainObject(b) && b.additionalProperties === false) {
+            closedSets.push(Object.keys(isPlainObject(b.properties) ? b.properties : {}));
+          }
+        });
+        // `null` means no branch is closed -> nothing is forbidden -> the plain
+        // union is correct and this whole rule is a no-op, which is what keeps
+        // every currently-passing shape byte-identical.
+        var allowedProps = null;
+        if (closedSets.length) {
+          allowedProps = closedSets[0].slice();
+          closedSets.slice(1).forEach(function (st) {
+            allowedProps = allowedProps.filter(function (k) { return st.indexOf(k) !== -1; });
+          });
+        }
+        var isAllowed = function (k) {
+          return allowedProps === null || allowedProps.indexOf(k) !== -1;
+        };
+        var allOfRequired = [];
+        allOfBranches.forEach(function (b) {
+          (Array.isArray(b && b.required) ? b.required : []).forEach(function (k) {
+            if (allOfRequired.indexOf(k) === -1) allOfRequired.push(k);
+          });
+        });
+        var excludedRequired = allOfRequired.filter(function (k) { return !isAllowed(k); });
+
         var mergeable =
           members.length === 1 ||
           members.every(function (m) {
             return isPlainObject(m) && m.type === "object" &&
               isPlainObject(m.properties) && m.additionalProperties !== false;
           });
-        if (!mergeable) {
+        if (excludedRequired.length) {
+          // No repair exists, so name the remodelling rather than invent one
+          // (#329). Merging anyway is what we used to do and it manufactures a
+          // schema the author never wrote: every one of these is unsatisfiable
+          // as written, and the union silently makes it satisfiable.
+          allOfBlocked = true;
+          ledger.push(entry("!", path,
+            "This `allOf` cannot be satisfied by any object. A branch here declares " +
+            "`additionalProperties: false`, which forbids every property that branch does not itself " +
+            "declare — so the properties allowed by ALL branches together are [" +
+            (allowedProps.length ? "`" + allowedProps.join("`, `") + "`" : "none") + "], while `" +
+            excludedRequired.join("`, `") + "` " + (excludedRequired.length > 1 ? "are" : "is") +
+            " required. OpenAI's transformer refuses exactly this (\"Object allOf ... cannot be " +
+            "merged without changing Draft 7 validation\"). We will not merge it for you: taking the " +
+            "union of the branches would silently ADMIT " + (excludedRequired.length > 1 ? "properties" : "a property") +
+            " the schema forbids, turning a schema no object can satisfy into one that looks fine. " +
+            "Either drop `additionalProperties: false` from the closed branch, or declare `" +
+            excludedRequired.join("`, `") + "` there too.",
+            DOCS.openai));
+        } else if (!mergeable) {
           allOfBlocked = true;
           ledger.push(entry("!", path,
             "`allOf` with " + members.length + " members that OpenAI cannot merge. Its transformer " +
@@ -2000,6 +2072,33 @@
             "union of their properties and of their `required` lists. This is what OpenAI's " +
             "transformer does with the same input.",
             DOCS.openai));
+        }
+
+        // The merge above is a union; a closed branch makes the intersection
+        // SMALLER than that union. Drop what no object could have carried
+        // anyway. This is lossless BY CONSTRUCTION — every name removed here is
+        // one some branch already forbade, so no instance that was legal before
+        // becomes illegal — and it is what the vendor does with the same input.
+        // It is reported rather than done silently, because a property vanishing
+        // from the output is exactly the kind of edit a reader must be able to
+        // see (#318).
+        if (!allOfBlocked && allowedProps !== null && isPlainObject(node.properties)) {
+          var dropped = Object.keys(node.properties).filter(function (k) { return !isAllowed(k); });
+          if (dropped.length) {
+            dropped.forEach(function (k) { delete node.properties[k]; });
+            if (Array.isArray(node.required)) {
+              node.required = node.required.filter(function (k) { return isAllowed(k); });
+            }
+            ledger.push(entry("~", path,
+              "Dropped `" + dropped.join("`, `") + "` while merging this `allOf`: a branch declares " +
+              "`additionalProperties: false` without declaring " + (dropped.length > 1 ? "them" : "it") +
+              ", so no object could ever have carried " + (dropped.length > 1 ? "them" : "it") +
+              " and keeping " + (dropped.length > 1 ? "them" : "it") + " would WIDEN what this schema " +
+              "accepts. OpenAI's transformer discards the same names. If you meant " +
+              (dropped.length > 1 ? "these" : "this") + " to be usable, declare " +
+              (dropped.length > 1 ? "them" : "it") + " on the closed branch too.",
+              DOCS.openai));
+          }
         }
       }
 
