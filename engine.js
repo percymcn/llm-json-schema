@@ -6465,10 +6465,95 @@
     maxProperties: 1, propertyNames: 1, dependentRequired: 1
   };
 
-  // Keywords `build_regex_from_schema` REFUSES outright (ValueError). Loud, and
-  // therefore far less dangerous than the silent set above: the guide is never
-  // built, so nothing ships believing it is constrained.
-  var OUTLINES_REJECTED = { allOf: 1, not: 1, patternProperties: 1 };
+  // Keywords whose fate on outlines-core is CONDITIONAL, not fixed.
+  //
+  // #397: this was a flat set — `{allOf, not, patternProperties}` — carrying the
+  // claim "`build_regex_from_schema` REFUSES these outright (ValueError). Loud,
+  // and therefore far less dangerous than the silent set above: the guide is
+  // never built, so nothing ships believing it is constrained."
+  //
+  // That justifying clause is CHECKABLE, and re-measuring it against
+  // outlines-core 0.2.14 falsified it for every member of the set. The refusal
+  // is a property of the NODE, not of the keyword: `build_regex_from_schema`
+  // raises only when the node gives it no object shape to build from. Add the
+  // `type: "object"` that every generator emits and the SAME keyword compiles
+  // — and the emitted regex is BYTE-IDENTICAL to the one for the node with the
+  // keyword deleted, i.e. it is silently consumed. Measured, with the
+  // keyword-deleted regex as the oracle (#384's own method):
+  //
+  //   patternProperties alone .................. REFUSED   (ValueError)
+  //   patternProperties + type:"object" ........ IGNORED   regex == bare
+  //   patternProperties + type + properties .... IGNORED   regex == with it deleted
+  //   not alone ................................ REFUSED
+  //   not + type:"object" ...................... IGNORED   regex == bare
+  //   not + type + properties .................. IGNORED
+  //   allOf, 1 member (object/scalar/$ref) ..... ENFORCED  correct accept set
+  //   allOf, 2+ object members ................. ACCEPTS NOTHING (no legal doc)
+  //   allOf, 2+ non-object members ............. REFUSED
+  //
+  // So the flat table was wrong in three different directions at once: `allOf`
+  // is never refused at one member and is fully ENFORCED there (we were failing
+  // the gate on a document outlines handles perfectly); `not` and
+  // `patternProperties` beside an object shape land in the SILENT set, which is
+  // the dangerous one, while our message told the reader they were in the loud
+  // one. #318's rule — ask whether the vendor's answer is yes/no or "it
+  // depends", and if it depends, find what on before shipping the flat version.
+  //
+  // Reachability is the dominant generator, measured rather than argued:
+  // pydantic 2.13.4 renders `Dict[Annotated[str, StringConstraints(pattern=...)],
+  // str]` as `{"patternProperties": {...}, "title": "M", "type": "object"}` —
+  // `type` present, so it is the IGNORED row, not the refused one.
+  var OUTLINES_CONDITIONAL = { allOf: 1, not: 1, patternProperties: 1 };
+
+  // Does the node give outlines-core an object shape to build a regex from?
+  // This is the discriminator between "raises" and "silently consumes".
+  function outlinesHasObjectShape(node) {
+    return node.type === "object" ||
+      (isPlainObject(node.properties) && Object.keys(node.properties).length > 0);
+  }
+
+  // "refused" | "ignored" | "enforced" | "owned", or null if absent.
+  // Validated against outlines-core 0.2.14 over a 13-shape battery before it
+  // was written into this file: 13 agree, 0 mismatch (#370).
+  function outlinesFate(node, kw) {
+    if (!hasOwn(node, kw)) return null;
+    if (kw === "allOf") {
+      if (!Array.isArray(node.allOf)) return null;
+      // ONE member is applied directly and correctly — measured ENFORCED at the
+      // root and nested, with object, scalar and `$ref` members, and with the
+      // member's own constraints applied. Reporting anything here is the
+      // over-block this rule shipped for thirteen cycles.
+      //
+      // TWO OR MORE is a real failure on this engine (all-object members
+      // compile to a guide that accepts NO document; non-object members raise)
+      // — but `mergeAllOf` (#396) already reaches every one of those nodes
+      // first and either merges them or blocks them with its own reason.
+      // Measured: a conflicting merge, a closed branch and two scalar members
+      // all carry a blocker before this rule runs. Speaking again here produced
+      // a SECOND blocker saying the same thing in different words, which is the
+      // ownership bug #359 and #371 both hit. The merge owns it; this stays out.
+      //
+      // ZERO members is neither, and it is the one case a dialect-neutral rule
+      // CANNOT own: in JSON Schema `allOf: []` is vacuously TRUE — it matches
+      // everything — which is exactly why #347 flags `anyOf: []`/`oneOf: []`
+      // and deliberately does not flag this one. On outlines-core it is not
+      // vacuous. Measured, with the keyword-deleted node as the control:
+      //
+      //   {type:"string", allOf:[]} ............ accepts NOTHING (control: 1110)
+      //   nested {type:"string", allOf:[]} ..... accepts NOTHING (control: 10)
+      //   {type:"object", properties, allOf:[]}  identical to the control
+      //
+      // So it destroys a node that is not an object and is absorbed by one that
+      // is — the same discriminator as above. Caught only because the corpus
+      // differential newly un-blocked it: the old blocker was there for a false
+      // reason ("cannot compile") and removing it would have left this silent.
+      if (node.allOf.length === 0) {
+        return outlinesHasObjectShape(node) ? "enforced" : "destroys";
+      }
+      return node.allOf.length === 1 ? "enforced" : "owned";
+    }
+    return outlinesHasObjectShape(node) ? "ignored" : "refused";
+  }
 
   // #395: `outlines` HAS A SECOND SURFACE, AND IT IS THE ONE THAT CONVERTS.
   //
@@ -7097,13 +7182,48 @@
       }
 
       // 3. Refused outright. Loud — the guide is never built.
-      Object.keys(OUTLINES_REJECTED).forEach(function (k) {
-        if (!hasOwn(node, k)) return;
-        ledger.push(entry("!", path,
-          "outlines-core cannot compile `" + k + "` — `build_regex_from_schema` raises " +
-          "`ValueError: Unsupported JSON Schema structure`, so no guide is produced at all. " +
-          "This one is loud, which makes it much safer than the keywords it silently ignores.",
-          url));
+      Object.keys(OUTLINES_CONDITIONAL).forEach(function (k) {
+        var fate = outlinesFate(node, k);
+        // ENFORCED: outlines applies it correctly, so there is nothing to say.
+        // OWNED: a multi-member `allOf`, which `mergeAllOf` has already merged
+        // or blocked with its own reason — speaking here double-reports.
+        if (fate === null || fate === "enforced" || fate === "owned") return;
+
+        if (fate === "destroys") {
+          ledger.push(entry("!", path,
+            "`allOf: []` is vacuously TRUE in JSON Schema — it matches everything — but " +
+            "outlines-core does not treat it that way on a node that is not an object: the " +
+            "guide compiles without error and then accepts NO VALUE AT ALL, so this field can " +
+            "never be generated. Measured against the same node with the keyword deleted, " +
+            "which accepts normally. Delete the empty `allOf`; it constrains nothing anywhere " +
+            "else either, so removing it is lossless.",
+            url));
+          return;
+        }
+
+        if (fate === "refused") {
+          ledger.push(entry("!", path,
+            "outlines-core cannot compile `" + k + "` on this node — " +
+            "`build_regex_from_schema` raises `ValueError: Unsupported JSON Schema " +
+            "structure`, so no guide is produced at all. This one is loud, which makes it " +
+            "much safer than the same keyword one line over: give this node a " +
+            "`\"type\": \"object\"` and outlines compiles it and then IGNORES it silently.",
+            url));
+          return;
+        }
+
+        // "ignored" — the silent set, and the reason the flat table was worse
+        // than useless: this is the DANGEROUS class, and it used to be reported
+        // as the safe one. Advisory, never a gate failure: the guide builds and
+        // the request succeeds. What is lost is enforcement.
+        ledger.push(entry("=", path,
+          "`" + k + "` is kept here but outlines-core does NOT enforce it: this node declares " +
+          "an object shape, so the keyword compiles without error and the emitted regex is " +
+          "BYTE-IDENTICAL to the one it produces with the keyword deleted. The model is free " +
+          "to violate it and nothing errors. Validate this constraint yourself after " +
+          "generation. (Without that object shape the same keyword RAISES instead — the " +
+          "failure is a property of the node, not of the keyword.)",
+          url, true));
       });
 
       // 4. The silent set. NEVER stripped: outlines ignores these rather than
@@ -7928,7 +8048,7 @@
     // is loud, ENFORCED is the control that stops the table from being read as
     // "constrained decoders ignore bounds" in general.
     OUTLINES_DROPPED_KEYS: Object.keys(OUTLINES_DROPPED),
-    OUTLINES_REJECTED_KEYS: Object.keys(OUTLINES_REJECTED),
+    OUTLINES_CONDITIONAL_KEYS: Object.keys(OUTLINES_CONDITIONAL),
     OUTLINES_ENFORCED_KEYS: OUTLINES_ENFORCED.slice(),
     XGRAMMAR_DROPPED_KEYS: Object.keys(XGRAMMAR_DROPPED),
     LMFE_IGNORED_KEYS: Object.keys(LMFE_IGNORED),

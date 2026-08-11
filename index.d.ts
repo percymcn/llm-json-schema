@@ -296,7 +296,7 @@ export const ANTHROPIC_TRANSFORM_SURFACES: Array<{
 export const OUTLINES_DROPPED_KEYS: string[];
 
 /** Keywords `build_regex_from_schema` raises `ValueError` on. Loud, not silent. */
-export const OUTLINES_REJECTED_KEYS: string[];
+export const OUTLINES_CONDITIONAL_KEYS: string[];
 
 /** Positive control: keywords outlines-core genuinely does enforce. */
 export const OUTLINES_ENFORCED_KEYS: string[];
@@ -339,7 +339,7 @@ declare const api: {
   ANTHROPIC_TRANSFORM_SURFACES: typeof ANTHROPIC_TRANSFORM_SURFACES;
   toOutlines: typeof toOutlines;
   OUTLINES_DROPPED_KEYS: typeof OUTLINES_DROPPED_KEYS;
-  OUTLINES_REJECTED_KEYS: typeof OUTLINES_REJECTED_KEYS;
+  OUTLINES_CONDITIONAL_KEYS: typeof OUTLINES_CONDITIONAL_KEYS;
   OUTLINES_ENFORCED_KEYS: typeof OUTLINES_ENFORCED_KEYS;
   toXgrammar: typeof toXgrammar;
   toLmFormatEnforcer: typeof toLmFormatEnforcer;

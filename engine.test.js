@@ -8412,12 +8412,131 @@ function fanoutSchema(depth, cyclic) {
     advisories(minProps).length === 1 && has(minProps.ledger, "minProperties"));
 
   // 5. REFUSED OUTRIGHT — loud, so safer than the silent set.
-  ["allOf", "not", "patternProperties"].forEach(function (k) {
+  //
+  // #397 CORRECTION, and the reason is recorded rather than the assertion
+  // quietly deleted: this loop originally included `allOf`, on #384's premise
+  // that all three keywords raise. Re-measured against outlines-core 0.2.14, a
+  // SINGLE-MEMBER `allOf` never raises at any position — it compiles and is
+  // fully ENFORCED, including the member's own constraints. So the blocker was
+  // a false CI failure on a document outlines handles perfectly, and only the
+  // two keywords below belong here. `allOf` is now pinned separately, both ways.
+  ["not", "patternProperties"].forEach(function (k) {
     var sch = { type: "object", properties: { v: {} }, required: ["v"], additionalProperties: false };
-    sch.properties.v[k] = k === "allOf" ? [{ type: "string" }] :
-      (k === "not" ? { type: "string" } : { "^S_": { type: "string" } });
+    sch.properties.v[k] = k === "not" ? { type: "string" } : { "^S_": { type: "string" } };
     ok("#384 outlines: `" + k + "` is a blocker (build_regex raises)",
       blockers(conv(sch)).length >= 1);
+  });
+
+  // 5b. #397: the fate of these keywords is a property of the NODE, not of the
+  //     keyword. Measured on outlines-core 0.2.14 with the keyword-deleted
+  //     regex as the oracle (#384's own byte-identical method):
+  //
+  //       <kw> alone .................. RAISES        -> blocker (above)
+  //       <kw> + type:"object" ........ compiles, regex == keyword deleted
+  //                                                  -> silently IGNORED
+  //
+  //     The pair is what makes this discriminate: without the second half the
+  //     rule could still be a flat presence check and every assertion above
+  //     would pass. And the second half is the REACHABLE one — pydantic 2.13.4
+  //     emits `{"patternProperties": {...}, "title": ..., "type": "object"}`
+  //     for `Dict[Annotated[str, StringConstraints(pattern=...)], str]`, so the
+  //     shape users actually have is the one that used to fail the gate with a
+  //     message claiming no guide was produced.
+  ["not", "patternProperties"].forEach(function (k) {
+    var inner = { type: "object" };
+    inner[k] = k === "not" ? { type: "string" } : { "^S_": { type: "string" } };
+    var r = conv({ type: "object", properties: { v: inner }, required: ["v"],
+      additionalProperties: false });
+    ok("#397 outlines: `" + k + "` beside an object shape is NOT a blocker",
+      blockers(r).length === 0);
+    ok("#397 outlines: `" + k + "` beside an object shape is an advisory instead",
+      advisories(r).some(function (e) { return e.msg.indexOf("`" + k + "`") !== -1; }));
+    // The keyword must SURVIVE: outlines ignores rather than erroring, so
+    // stripping would destroy a constraint that still holds everywhere else
+    // the document is used and buy nothing here (#314's error-policy rule).
+    ok("#397 outlines: `" + k + "` survives conversion rather than being stripped",
+      propOf(r, "v")[k] !== undefined);
+  });
+
+  // 5c. #397: `allOf` — the member that was never refused at all.
+  //     1 member  -> ENFORCED (all four spellings measured: object, +type,
+  //                  scalar, $ref; and nested, where #396 had pinned a block)
+  //     2 objects -> compiles a guide that accepts NO DOCUMENT AT ALL
+  //     2 scalars -> RAISES
+  var a1root = conv({ allOf: [{ type: "object",
+    properties: { a: { type: "string" } }, required: ["a"] }] });
+  ok("#397 outlines: a single-member `allOf` at the ROOT does not block",
+    blockers(a1root).length === 0);
+  var a1nested = conv({ type: "object", additionalProperties: false, required: ["v"],
+    properties: { v: { allOf: [{ type: "string", minLength: 3 }] } } });
+  ok("#397 outlines: a single-member `allOf` of a NON-object does not block",
+    blockers(a1nested).length === 0);
+  // Over-block guards, both ways. The multi-member shapes must STILL be
+  // handled, or this would read as "stop reporting `allOf`" rather than "stop
+  // over-blocking the ONE member count outlines applies correctly".
+  //
+  // #397 CORRECTION to my own first draft, caught by a failing assertion rather
+  // than by reading: I had this rule emit its own blocker for a multi-member
+  // `allOf`, and every such node ALREADY carries one from `mergeAllOf` (#396) —
+  // measured on a mergeable pair, a conflicting pair, a closed branch and two
+  // scalar members. The result was two blockers on one node saying the same
+  // thing in different words. The merge owns multi-member `allOf`; this rule
+  // owns nothing there. What these pin is that the merge is still doing it.
+  var a2merged = conv({ type: "object", properties: { v: { allOf: [
+    { type: "object", properties: { a: { type: "string" } }, required: ["a"] },
+    { type: "object", properties: { b: { type: "string" } }, required: ["b"] }
+  ] } }, required: ["v"], additionalProperties: false });
+  ok("#397 outlines: a mergeable 2-member `allOf` is still MERGED, not blocked",
+    blockers(a2merged).length === 0 && has(a2merged.ledger, "Merged an `allOf`"));
+  var a2scalar = blockers(conv({ type: "object", properties: { v: { allOf: [
+    { type: "string" }, { minLength: 3 } ] } },
+    required: ["v"], additionalProperties: false }));
+  ok("#397 outlines: an unmergeable 2-member `allOf` still blocks, exactly once",
+    a2scalar.length === 1);
+
+  // 5e. #397: ZERO members. `allOf: []` is vacuously TRUE in JSON Schema, which
+  //     is why #347's dialect-neutral rule flags `anyOf: []`/`oneOf: []` and
+  //     deliberately leaves this one alone. outlines-core disagrees: on a node
+  //     that is not an object it compiles a guide accepting NO value.
+  //
+  //     This was found by the corpus differential, not by reading: removing the
+  //     old (false-reason) blocker newly un-blocked it, and it would have
+  //     shipped as a silent pass on a field that can never be generated.
+  var eScalar = conv({ type: "object", properties: { v: { type: "string", allOf: [] } },
+    required: ["v"], additionalProperties: false });
+  ok("#397 outlines: an empty `allOf` on a non-object node blocks",
+    blockers(eScalar).length === 1 && has(eScalar.ledger, "accepts NO VALUE AT ALL"));
+  // The discriminator, and it is the whole rule: the SAME empty keyword on an
+  // object node is absorbed (measured identical to the keyword deleted), so
+  // firing there would be an over-block. Without this pair the rule could be
+  // "flag every empty allOf" and the assertion above would still pass.
+  var eObject = conv({ type: "object", properties: { a: { type: "string" } },
+    required: ["a"], allOf: [] });
+  ok("#397 outlines: the same empty `allOf` on an OBJECT node does NOT block",
+    blockers(eObject).length === 0);
+  // And #347 must keep owning the two siblings, unchanged — this target must
+  // not start double-reporting what the dialect-neutral rule already says.
+  ["anyOf", "oneOf"].forEach(function (kw) {
+    var sch = { type: "string" }; sch[kw] = [];
+    var r = conv(sch);
+    ok("#397 outlines: `" + kw + ": []` is still owned by #347, reported once",
+      r.ledger.filter(function (e) {
+        return String(e.msg).indexOf("No value can satisfy this node") !== -1;
+      }).length === 1);
+  });
+
+  // 5d. #397 SCOPE PIN. This is an outlines fact. The sibling decoders were
+  //     measured differently (#385/#386) and must not acquire the rule — without
+  //     this the change could be firing on every decoder and every assertion
+  //     above would still pass (#365's discriminator).
+  ["xgrammar", "lmformatenforcer"].forEach(function (t) {
+    var r = conv({ type: "object", properties: { v: { type: "object",
+      patternProperties: { "^S_": { type: "string" } } } },
+      required: ["v"], additionalProperties: false }, t);
+    ok("#397 " + t + " does not acquire outlines' `patternProperties` advisory",
+      !r.ledger.some(function (e) {
+        return e.msg.indexOf("BYTE-IDENTICAL to the one it produces") !== -1;
+      }));
   });
 
   // 6. SCOPE PIN. The alternation rewrite is an outlines fact — no other target
@@ -8431,15 +8550,21 @@ function fanoutSchema(depth, cyclic) {
 
   // 7. The exported tables, so the snapshot is re-diffable rather than trusted.
   var DROPPED = E.OUTLINES_DROPPED_KEYS || [];
-  var REJECTED = E.OUTLINES_REJECTED_KEYS || [];
+  // #397: renamed from OUTLINES_REJECTED_KEYS. The old name asserted a claim
+  // measurement falsified — these keywords are not rejected, their fate is
+  // CONDITIONAL on the node (raises with no object shape, silently ignored with
+  // one, and for `allOf` at one member never a failure at all). A name that
+  // states a false premise is the same defect as a doc that does (#312/#344).
+  var REJECTED = E.OUTLINES_CONDITIONAL_KEYS || [];
   var ENFORCED = E.OUTLINES_ENFORCED_KEYS || [];
   ok("#384 outlines: dropped table is the 11 measured keywords",
     DROPPED.length === 11 && DROPPED.indexOf("minProperties") !== -1 &&
     DROPPED.indexOf("minimum") !== -1 &&
     DROPPED.indexOf("multipleOf") !== -1 &&
     DROPPED.indexOf("dependentRequired") !== -1);
-  ok("#384 outlines: rejected table is the 3 that raise",
-    REJECTED.length === 3 && REJECTED.indexOf("patternProperties") !== -1);
+  ok("#397 outlines: conditional table is the 3 whose fate depends on the node",
+    REJECTED.length === 3 && REJECTED.indexOf("patternProperties") !== -1 &&
+    REJECTED.indexOf("allOf") !== -1 && REJECTED.indexOf("not") !== -1);
   // The three groups must be disjoint — an overlap would mean the same keyword
   // is claimed both enforced and dropped, and the ledger would contradict itself.
   ok("#384 outlines: the three measured groups are disjoint",
@@ -10154,11 +10279,17 @@ function fanoutSchema(depth, cyclic) {
     ok("#396 " + p + ": pydantic v1's annotation-only wrapper draws NO merge (#388/#393 pin)",
       !has(r.ledger, "Flattened a single-member"));
   });
-  // #384's blocker must survive: a bare node whose only content is a
-  // single-member `allOf` of a NON-object is outside what was measured here.
-  ok("#396 outlines: a bare single-member `allOf` of a non-object still blocks (#384 pin)",
-    blk(conv({ type: "object", additionalProperties: false, required: ["v"],
-      properties: { v: { allOf: [{ type: "string" }] } } }, "outlines")).length >= 1);
+  // #397 CORRECTION, reason recorded rather than the assertion deleted: this
+  // pinned #384's premise that outlines refuses `allOf`, and inherited its
+  // error. Re-measured on outlines-core 0.2.14, this exact nested shape
+  // COMPILES and is fully ENFORCED — the member's own `minLength` is applied —
+  // so the block was a false CI failure. The merge still correctly declines to
+  // fire here (a single non-object member has nothing to merge into the node),
+  // which is what this now pins: no merge AND no blocker.
+  var a1 = conv({ type: "object", additionalProperties: false, required: ["v"],
+    properties: { v: { allOf: [{ type: "string" }] } } }, "outlines");
+  ok("#397 outlines: a bare single-member `allOf` of a non-object neither merges nor blocks",
+    blk(a1).length === 0 && !has(a1.ledger, "Merged an `allOf`"));
 
   // The JSON-Schema-dialect targets forward the document and let the
   // destination read `allOf` itself, so merging there would be an edit that
