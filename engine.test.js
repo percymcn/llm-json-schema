@@ -9922,5 +9922,138 @@ function fanoutSchema(depth, cyclic) {
   })();
 })();
 
+
+// ---- #395: outlines has a SECOND surface, and it is the one that converts ---
+//
+// `--to outlines` has modelled `build_regex_from_schema` since #384. But
+// `outlines.models.gemini` routes the SAME output_type through
+// `JsonSchema.convert_to(..., ["dataclass","typeddict","pydantic"])`, whose
+// `schema_type_to_python` dispatches on `enum`/`const`/`type` ONLY -- so a
+// `$ref`/`allOf`/`anyOf`/`oneOf` node becomes `typing.Any`, reaches google-genai
+// as a property with no `type`, and is ACCEPTED. Measured on outlines 1.3.3 /
+// google-genai, live v1beta endpoint, with discriminating controls.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  // Key on the OP + the backend name, never on the surrounding prose (#340).
+  function anyNotes(led) {
+    if (!led || typeof led.filter !== "function") return [];
+    return led.filter(function (l) {
+      return String(l.msg || "").indexOf("outlines.models.gemini") !== -1;
+    });
+  }
+
+  var REF = {
+    type: "object", required: ["f"],
+    properties: { f: { $ref: "#/$defs/T" } },
+    $defs: { T: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } }
+  };
+  var SCALAR_UNION = {
+    type: "object", required: ["f"],
+    properties: { f: { anyOf: [{ type: "string" }, { type: "integer" }] } }
+  };
+  var OBJECT_UNION = {
+    type: "object", required: ["f"],
+    properties: { f: { anyOf: [
+      { type: "object", properties: { k: { type: "string" } }, required: ["k"] },
+      { type: "null" }
+    ] } }
+  };
+  var UNION_TYPE = {
+    type: "object", required: ["f"],
+    properties: { f: { type: ["object", "null"], properties: { k: { type: "string" } }, required: ["k"] } }
+  };
+  var PLAIN = { type: "object", required: ["f"], properties: { f: { type: "string" } } };
+
+  var refNotes = anyNotes(conv(REF, "outlines").ledger);
+  ok("#395 a `$ref` property is reported as `Any` on the converting backend",
+    refNotes.length === 1);
+  ok("#395 the note names the property, not the root",
+    refNotes.length === 1 && refNotes[0].path === "root.f");
+
+  // NEVER a gate failure: on the backend this target models the document is
+  // genuinely fine, and failing CI for it is the over-strictness bug this
+  // project has shipped repeatedly (#317).
+  ok("#395 the note is advisory on every shape it fires for",
+    [REF, SCALAR_UNION, OBJECT_UNION, UNION_TYPE].every(function (s) {
+      var n = anyNotes(conv(s, "outlines").ledger);
+      return n.length >= 1 && n.every(function (l) { return l.advisory === true; });
+    }));
+
+  // The remedy is per-shape and MEASURED, not reasoned: an inline object reads
+  // correctly on both surfaces, and a bare-scalar union re-spells as a list
+  // `type` that both surfaces honour.
+  ok("#395 a `$ref` is told to inline (works on both surfaces)",
+    has(anyNotes(conv(REF, "outlines").ledger), "Inline the definition"));
+  ok("#395 a bare-scalar union is given the lossless list-`type` re-spelling",
+    has(anyNotes(conv(SCALAR_UNION, "outlines").ledger), 'type: ["string", "integer"]'));
+  // ...and where NO form satisfies both surfaces, say that rather than invent one.
+  ok("#395 an object-member union is told no single document satisfies both",
+    has(anyNotes(conv(OBJECT_UNION, "outlines").ledger), "no single document satisfies both"));
+
+  // THE HALF THAT IS OURS. #387's rewrite turns a union `type` into `anyOf`,
+  // which is right for outlines-core (it narrows a union carrying `properties`)
+  // and is precisely the spelling the converting backend cannot read. Measured:
+  // raw -> `AnonymousDataclass | None`, ours -> `typing.Any`.
+  ok("#395 a union `type` WE rewrote is owned in the message",
+    has(anyNotes(conv(UNION_TYPE, "outlines").ledger), "NOTE THIS ONE IS OURS"));
+  // The discriminator for that clause: an `anyOf` the CALLER wrote is the same
+  // shape and must NOT be blamed on us. Without this the flag could be
+  // hardcoded true and every assertion above would still pass.
+  ok("#395 an `anyOf` the caller wrote is NOT claimed as ours",
+    !has(anyNotes(conv(OBJECT_UNION, "outlines").ledger), "NOTE THIS ONE IS OURS"));
+
+  // ---- over-block guards: the mirror must be faithful in BOTH directions ----
+  ok("#395 an ordinary typed property draws nothing",
+    anyNotes(conv(PLAIN, "outlines").ledger).length === 0);
+  ok("#395 `enum` draws nothing (the converter reads it as a Literal)",
+    anyNotes(conv({ type: "object", required: ["f"],
+      properties: { f: { enum: ["a", "b"] } } }, "outlines").ledger).length === 0);
+  ok("#395 `const` draws nothing (Literal, handled before `type`)",
+    anyNotes(conv({ type: "object", required: ["f"],
+      properties: { f: { const: 7 } } }, "outlines").ledger).length === 0);
+  ok("#395 an INLINE nested object draws nothing -- that is the remedy working",
+    anyNotes(conv({ type: "object", required: ["f"], properties: {
+      f: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } } },
+      "outlines").ledger).length === 0);
+
+  // Mirror fidelity: the converter recurses into `items` for an array and into
+  // `properties` for an object, and into NOTHING else -- so a `$ref` under
+  // `items` IS reachable and must be reported.
+  ok("#395 a `$ref` under array `items` is reported (the converter descends there)",
+    anyNotes(conv({ type: "object", required: ["f"], properties: {
+      f: { type: "array", items: { $ref: "#/$defs/T" } } },
+      $defs: { T: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } } },
+      "outlines").ledger).length === 1);
+  // ...and it does NOT descend into a union's branches: the parent is already
+  // `Any`, so a second note about a branch would describe a node the converter
+  // never reaches.
+  ok("#395 a union's branches are not descended into (parent is already `Any`)",
+    anyNotes(conv({ type: "object", required: ["f"], properties: {
+      f: { anyOf: [{ $ref: "#/$defs/T" }, { type: "null" }] } },
+      $defs: { T: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } } },
+      "outlines").ledger).length === 1);
+  // `json_schema_dict_to_pydantic` reads the ROOT's `properties` without ever
+  // consulting the root's own `type`, so a typeless root is still walked.
+  ok("#395 a typeless root still has its properties walked",
+    anyNotes(conv({ properties: { f: { $ref: "#/$defs/T" } }, required: ["f"],
+      $defs: { T: { type: "string" } } }, "outlines").ledger).length === 1);
+
+  // THE #365 DISCRIMINATOR, and it is load-bearing: this is a fact about ONE
+  // BACKEND OF ONE LIBRARY. xgrammar and lm-format-enforcer are different
+  // packages with no such converter, so if they acquired this note the rule
+  // would be firing blanket and every assertion above would still pass.
+  ok("#395 xgrammar does NOT acquire the note",
+    anyNotes(conv(REF, "xgrammar").ledger).length === 0);
+  ok("#395 lmformatenforcer does NOT acquire the note",
+    anyNotes(conv(REF, "lmformatenforcer").ledger).length === 0);
+  ok("#395 the JSON-Schema-dialect targets do NOT acquire the note",
+    ["openai", "anthropic", "gemini-json"].every(function (p) {
+      return anyNotes(conv(REF, p).ledger).length === 0;
+    }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

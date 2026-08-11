@@ -2119,5 +2119,46 @@ function fanout(depth) {
     String(plain.stderr || "").indexOf("No changes needed") !== -1 && plain.status === 0);
 })();
 
+
+// ---- #395: the converting-backend note reaches the CLI --------------------
+(function () {
+  var REF = JSON.stringify({
+    type: "object", required: ["f"], properties: { f: { $ref: "#/$defs/T" } },
+    $defs: { T: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } }
+  });
+  var UNION = JSON.stringify({
+    type: "object", required: ["f"],
+    properties: { f: { type: ["object", "null"], properties: { k: { type: "string" } }, required: ["k"] } }
+  });
+  var PLAIN = JSON.stringify({ type: "object", required: ["f"], properties: { f: { type: "string" } } });
+
+  var r = run(["--to", "outlines", "--check"], REF);
+  var out = r.stdout + r.stderr;
+  ok("#395 cli names the converting backend",
+    out.indexOf("outlines.models.gemini") !== -1);
+  // Advisory, never a gate failure: outlines-core -- the backend this target
+  // models -- enforces the document fine, so failing CI here would be the
+  // over-strictness bug this project has shipped repeatedly (#317).
+  ok("#395 cli does NOT fail the gate for the note alone", r.status === 0);
+  ok("#395 cli prints the note as optional",
+    out.indexOf("[optional]") !== -1);
+
+  var u = run(["--to", "outlines", "--check"], UNION);
+  ok("#395 cli owns the rewrite it performed",
+    (u.stdout + u.stderr).indexOf("NOTE THIS ONE IS OURS") !== -1);
+
+  var p2 = run(["--to", "outlines", "--check"], PLAIN);
+  ok("#395 cli stays silent on an ordinary typed property",
+    (p2.stdout + p2.stderr).indexOf("outlines.models.gemini") === -1 && p2.status === 0);
+
+  // The #365 discriminator at the CLI boundary: same file, three decoder
+  // targets, and only the one whose library HAS that backend says anything.
+  var x = run(["--to", "xgrammar", "--check"], REF);
+  var l = run(["--to", "lmformatenforcer", "--check"], REF);
+  ok("#395 cli the sibling decoder targets do not acquire the note",
+    (x.stdout + x.stderr).indexOf("outlines.models.gemini") === -1 &&
+    (l.stdout + l.stderr).indexOf("outlines.models.gemini") === -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

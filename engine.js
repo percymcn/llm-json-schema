@@ -6388,6 +6388,149 @@
   // built, so nothing ships believing it is constrained.
   var OUTLINES_REJECTED = { allOf: 1, not: 1, patternProperties: 1 };
 
+  // #395: `outlines` HAS A SECOND SURFACE, AND IT IS THE ONE THAT CONVERTS.
+  //
+  // Everything above is measured against `build_regex_from_schema` — the
+  // outlines-core regex backend, which is what `--to outlines` has modelled
+  // since #384. But the SAME `output_type` argument takes a different route
+  // depending on which MODEL object it is handed to, and exactly one backend
+  // does not forward it (measured on outlines 1.3.3):
+  //
+  //   models/gemini.py:197   JsonSchema.convert_to(t, ["dataclass","typeddict","pydantic"])
+  //   models/openai.py:175   ... ["dict"]     <- verbatim
+  //   models/ollama.py:141   ... ["dict"]     <- verbatim
+  //   models/lmstudio.py:155 ... ["dict"]     <- verbatim
+  //   models/dottxt.py:73    ... ["str"]      <- verbatim
+  //   anthropic / vllm / transformers / llamacpp: no convert_to at all
+  //
+  // So this is ONE BACKEND, not the library — #368's "a forwarding client is
+  // not a converting one", inside a single package.
+  //
+  // `schema_type_to_python` (types/json_schema_utils.py:15) dispatches on
+  // `enum`, then `const`, then `type`, and RETURNS `Any` for anything else.
+  // A `$ref`, an `allOf`, an `anyOf` and a `oneOf` all have no `type` key, so
+  // each becomes `Any` — and `json_schema_dict_to_pydantic` iterates
+  // `properties` and never reads `$defs`, so the pointer cannot be resolved
+  // even in principle. Measured end to end: an ordinary pydantic nested model
+  // arrives at google-genai as `"inner": {"title": "Inner"}` — a property with
+  // NO `type` — and the live v1beta endpoint ACCEPTS that (a bogus key in the
+  // same slot is rejected, so the oracle discriminates). The request succeeds
+  // and the field is unconstrained, which is the one failure a constrained
+  // decoder exists to prevent.
+  //
+  // THE HALF THAT IS OURS: #387's `rewriteDecoderUnionType` turns a union
+  // `type` into `anyOf` here, and it is right to — outlines-core NARROWS a
+  // union `type` carrying `properties`, silently dropping the null member, so
+  // an optional field can never be generated as null. But `anyOf` is precisely
+  // the spelling this backend cannot read. Measured on one file:
+  //   raw  -> `AnonymousDataclass | None`   (typed, nullable, correct)
+  //   ours -> `typing.Any`                  (unconstrained)
+  // The two surfaces need OPPOSITE spellings and NO document satisfies both
+  // (#336). The rewrite stays: every non-converting backend is the dominant
+  // population and the narrowing there is a real loss. What was missing is
+  // saying so.
+  //
+  // Advisory, never a gate failure (#317): on the backend this target models
+  // the document is genuinely fine, and failing CI for it would be the
+  // over-strictness bug this project has shipped repeatedly.
+  var OUTLINES_CONVERTING_BACKEND = "outlines.models.gemini";
+
+  // Does `schema_type_to_python` reduce this node to `Any`? Mirrors its
+  // dispatch clause for clause: `enum` -> Literal, `const` -> Literal,
+  // `type` -> a Python type (a list becomes a Union of its members), and
+  // everything else falls off the bottom as `Any`.
+  function outlinesPydanticReadsNode(node) {
+    return hasOwn(node, "enum") || hasOwn(node, "const") || hasOwn(node, "type");
+  }
+
+  // Where a lossless spelling EXISTS, name it — measured, not reasoned.
+  // A `$ref` inlines (an inline object is read correctly on both surfaces); a
+  // union of BARE scalar members re-spells as `type: [...]`, which this
+  // backend reads as a Union and outlines-core still enforces, because #387's
+  // narrowing fires on the `properties` key, which such a node does not carry.
+  function outlinesPydanticRemedy(node) {
+    if (hasOwn(node, "$ref")) {
+      return "Inline the definition: an inline object is read correctly on BOTH surfaces " +
+        "(measured). A self-referential definition has no finite inline, and for that shape " +
+        "no form of this document survives this backend.";
+    }
+    var union = node.anyOf || node.oneOf;
+    if (Array.isArray(union) && union.length) {
+      var allBareScalar = union.every(function (m) {
+        if (!isPlainObject(m) || typeof m.type !== "string") return false;
+        if (m.type === "object" || m.type === "array") return false;
+        return Object.keys(m).every(function (k) {
+          return k === "type" || hasOwn(ANNOTATION_ONLY, k);
+        });
+      });
+      if (allBareScalar) {
+        return "Every member here is a bare scalar, so `type: [" +
+          union.map(function (m) { return "\"" + m.type + "\""; }).join(", ") +
+          "]` is a lossless re-spelling: this backend reads a list `type` as a Union, and " +
+          "outlines-core still enforces it (its narrowing fires on a `properties` sibling, " +
+          "which this node does not carry). Both surfaces, measured.";
+      }
+      return "A member here is an object or carries its own constraints, so the list-`type` " +
+        "re-spelling is NOT available: outlines-core narrows a union `type` that carries " +
+        "`properties`, dropping the other members. The two surfaces need opposite spellings " +
+        "and no single document satisfies both — pick by which backend you run.";
+    }
+    return "Give this node a `type` (or an `enum`/`const`); those are the only three keywords " +
+      "this backend's converter dispatches on.";
+  }
+
+  // Runs on the OUTPUT, at the exit, and that placement is load-bearing rather
+  // than tidy (#342/#363): the lossy `anyOf` is often one WE wrote a few lines
+  // earlier, so a check reading the caller's input would not see it.
+  function noteOutlinesPydanticPath(out, ledger, url, unionRewrites) {
+    if (!isPlainObject(out)) return;
+    var seen = [];
+    function visitValue(node, path) {
+      if (!isPlainObject(node)) return;
+      if (!outlinesPydanticReadsNode(node)) {
+        var weRewroteUnion = !!(unionRewrites && hasOwn(unionRewrites, path));
+        ledger.push(entry("=", path,
+          "This property survives `--to outlines` and is enforced by outlines-core, but it " +
+          "becomes `typing.Any` on `" + OUTLINES_CONVERTING_BACKEND + "` — the one outlines " +
+          "backend that CONVERTS the schema instead of forwarding it " +
+          "(`JsonSchema.convert_to(..., [\"dataclass\",\"typeddict\",\"pydantic\"])`, " +
+          "models/gemini.py:197). Its converter dispatches on `enum`, `const` and `type` only, " +
+          "so a `$ref`/`allOf`/`anyOf`/`oneOf` node falls through, and it never reads `$defs`, " +
+          "so a pointer cannot be resolved even in principle. The field then reaches google-genai " +
+          "as a property with NO `type`, which the API ACCEPTS — so nothing errors and the field " +
+          "is simply unconstrained. " +
+          (weRewroteUnion
+            ? "NOTE THIS ONE IS OURS: the `anyOf` here was written by this tool, from a union " +
+              "`type` that backend reads correctly. The rewrite is still right for outlines-core, " +
+              "which narrows a union `type` and would silently drop a member — the two surfaces " +
+              "need opposite spellings and no document satisfies both. "
+            : "") +
+          outlinesPydanticRemedy(node) +
+          " Every other backend (openai/ollama/lmstudio forward as `dict`, dottxt as `str`, " +
+          "vllm/transformers/llamacpp/anthropic never touch it) is unaffected.",
+          url, true));
+        return;
+      }
+      var t = node.type;
+      var members = Array.isArray(t) ? t : [t];
+      if (members.indexOf("object") !== -1) descendProps(node, path);
+      if (members.indexOf("array") !== -1 && isPlainObject(node.items)) {
+        visitValue(node.items, path + ".items");
+      }
+    }
+    function descendProps(node, path) {
+      if (seen.indexOf(node) !== -1) return;
+      seen.push(node);
+      if (!isPlainObject(node.properties)) return;
+      Object.keys(node.properties).forEach(function (k) {
+        visitValue(node.properties[k], path + "." + k);
+      });
+    }
+    // The converter is handed the ROOT and reads its `properties` without
+    // consulting the root's own `type`, so the walk starts there.
+    descendProps(out, "root");
+  }
+
   // Kept as a positive control. The asymmetry is why this table is measured
   // rather than reasoned: `minItems`/`maxItems` ARE enforced while
   // `minimum`/`maximum` are not — "length bounds work, so value bounds work" is
@@ -6490,7 +6633,10 @@
     });
   }
 
-  function rewriteDecoderUnionType(node, path, ledger, url, engine) {
+  // `onRewrite` (optional) is called with the path whenever this actually fires.
+  // #395 needs it because the `anyOf` it reports is sometimes one WE wrote here,
+  // and keying that on the ledger's PROSE rather than on the op is #340's trap.
+  function rewriteDecoderUnionType(node, path, ledger, url, engine, onRewrite) {
     var raw = node.type;
     if (!Array.isArray(raw) || raw.length < 2) return;
     // A combinator beside the `type` is left ALONE, and deliberately without a
@@ -6536,6 +6682,7 @@
     siblings.forEach(function (k) { delete node[k]; });
     delete node.type;
     setOwn(node, "anyOf", branches);
+    if (typeof onRewrite === "function") onRewrite(path);
 
     ledger.push(entry("~", path,
       "Rewrote the array-valued `type` (`" + JSON.stringify(raw) + "`) to `anyOf`, distributing " +
@@ -6804,6 +6951,7 @@
     var s = clone(schema);
     var ledger = [];
     var url = DOCS.outlines;
+    var unionRewrites = {};
 
     // Before the walk, and the bag is deliberately NOT renamed: all three
     // decoders resolve `#/definitions/X` correctly, so a rename would be an edit
@@ -6893,8 +7041,15 @@
       // LAST in the callback on purpose: every rule above reads the node the
       // CALLER wrote, and the walk descends AFTER this returns, so the branches
       // this creates are still visited (once, via the `anyOf` arm).
-      rewriteDecoderUnionType(node, path, ledger, url, "outlines");
+      rewriteDecoderUnionType(node, path, ledger, url, "outlines", function (p) {
+        unionRewrites[p] = true;
+      });
     });
+
+    // At the EXIT, on the OUTPUT: the `anyOf` this reports is sometimes one the
+    // rewrite above just wrote, so a check reading the caller's input would not
+    // see it (#342/#363).
+    noteOutlinesPydanticPath(s, ledger, url, unionRewrites);
 
     noteEmptiedDocument(schema, s, ledger, url,
       "outlines-core takes standard JSON Schema, so nothing is stripped on this target.");

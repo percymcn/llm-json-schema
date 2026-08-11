@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1687 engine + 381 CLI + 83 ESM/library assertions = **2151** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1705 engine + 387 CLI + 83 ESM/library assertions = **2175** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -911,6 +911,49 @@ manual. And outlines matches `pattern` against the *whole* string where JSON
 Schema defines it as a search, so it is stricter than the spec there; anything
 it generates still satisfies your schema.
 
+### …but `outlines` has a second surface, and it is the one that converts
+
+Everything above is measured against `build_regex_from_schema`. The *same*
+`output_type` takes a different route depending on which **model** you hand it
+to, and on outlines 1.3.3 exactly one backend does not forward it:
+
+| backend | what it does with your JSON Schema |
+|---|---|
+| `models/gemini.py:197` | `convert_to(…, ["dataclass","typeddict","pydantic"])` — **converts** |
+| `openai` · `ollama` · `lmstudio` | `["dict"]` — verbatim |
+| `dottxt` | `["str"]` — verbatim |
+| `anthropic` · `vllm` · `transformers` · `llamacpp` | never touched |
+
+`schema_type_to_python` dispatches on `enum`, `const` and `type` **only**, and
+returns `Any` for everything else — so `$ref`, `allOf`, `anyOf` and `oneOf` all
+fall through, and it never reads `$defs`, so a pointer cannot be resolved even
+in principle. An ordinary Pydantic nested model arrives at google-genai as
+`"inner": {"title": "Inner"}` — a property with **no `type`** — and the live
+v1beta endpoint *accepts* that (a bogus key in the same slot is rejected, so the
+oracle discriminates). Nothing errors; the field is simply unconstrained.
+
+| spelling | outlines-core (regex) | `models.gemini` |
+|---|---|---|
+| `anyOf` of scalars | enforced | **`Any`** |
+| `type: ["string","integer"]` | enforced | `str \| int` |
+| `anyOf` of object + null | enforced | **`Any`** |
+| `type: ["object","null"]` + `properties` | **narrowed** — null rejected | dataclass ✓ |
+
+Read the last two rows together: **the two surfaces need opposite spellings and
+no single document satisfies both.** That matters here because the union-`type`
+→ `anyOf` rewrite this tool performs is *correct* for outlines-core — which
+silently drops the null member, so an optional field could never be generated as
+null — and is precisely the spelling the converting backend cannot read.
+Measured on one file: raw → `AnonymousDataclass | None`, ours → `typing.Any`.
+
+The rewrite stays, because every non-converting backend is the larger population
+and the narrowing there is a real loss. What was missing was saying so, so
+`--to outlines` now flags each property that becomes `Any`, names the backend,
+says when the `anyOf` was **ours**, and gives the lossless re-spelling where one
+exists (inline a `$ref`; a bare-scalar union re-spells as a list `type`). It is
+**advisory** and never fails the gate: on the backend this target models, the
+document is fine.
+
 ## Features
 - Accepts a **JSON Schema** or a **JSON example** (auto-detected → schema inferred).
 - Pick a target provider → get the corrected schema.
@@ -1017,7 +1060,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2151 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2175 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
