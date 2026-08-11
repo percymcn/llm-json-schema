@@ -6541,12 +6541,16 @@
   // written and never inherited by the three decoders added in #384/#385/#386 --
   // a repair is a property of a CODE PATH, and the newest paths carry the fewest
   // (#388/#390). The engines do NOT agree about this spelling, which is why the
-  // gap was invisible: measured on xgrammar 0.2.4, outlines-core 0.2.14 and
+  // gap was invisible: measured identically on xgrammar 0.2.3, 0.2.4 AND 0.2.5
+  // (the latest release) -- the version string matters here, because a
+  // maintainer's own PR mlc-ai/xgrammar#774 fixes exactly this and was CLOSED
+  // WITHOUT MERGING, so it is worth re-checking rather than assuming. Also
+  // measured on outlines-core 0.2.14 and
   // lm-format-enforcer 0.11.3, outlines and lmfe RESOLVE `/$defs/P` correctly
   // while xgrammar compiles it to its match-anything fallback.
   var DECODER_REF_SPELLING_WHY =
     "the three decoders disagree about this spelling, so it is worse than a style nit. " +
-    "Measured on xgrammar 0.2.4: `{\"$ref\": \"/$defs/P\"}` compiles WITHOUT error to " +
+    "Measured on xgrammar 0.2.5: `{\"$ref\": \"/$defs/P\"}` compiles WITHOUT error to " +
     "`root_prop_0 ::= ((ref))`, where `ref ::= basic_number | basic_string | basic_boolean | " +
     "basic_null | basic_array | basic_object` — the referenced constraint is gone and the field " +
     "accepts ANY JSON, with only a `Warning: URI should either be '#' or start with '#/'` on " +
@@ -6563,7 +6567,7 @@
   var DECODER_REF_EXTERNAL_WHY =
     "None of the three decoders fetches an external reference. Measured: outlines-core 0.2.14 " +
     "raises `ValueError: Invalid reference path`, lm-format-enforcer 0.11.3 raises a `KeyError`, " +
-    "so neither can build a guide at all — while xgrammar 0.2.4 compiles it to its " +
+    "so neither can build a guide at all — while xgrammar 0.2.5 compiles it to its " +
     "match-anything fallback and reports nothing, so that field silently stops being " +
     "constrained. (Note the asymmetry: xgrammar DOES raise `Cannot find field` for the same " +
     "missing target written `#/$defs/...`. It is the malformed URI, not the missing target, " +
@@ -7490,7 +7494,7 @@
     //                       the advisory rather than a blocker we cannot
     //                       justify" -- an honestly recorded gap, and therefore
     //                       a work item (#354). Probing it: ALL THREE refuse to
-    //                       build a guide. xgrammar 0.2.4 raises `RuntimeError:
+    //                       build a guide. xgrammar 0.2.5 raises `RuntimeError:
     //                       Cannot find field Missing in #/$defs/Missing`,
     //                       outlines-core 0.2.14 raises `ValueError: Invalid
     //                       reference path`, lm-format-enforcer 0.11.3 raises
@@ -7525,7 +7529,7 @@
             "nothing."
           : danglingBlocks
           ? "This one is not a lost constraint, it is a request that cannot be built: the guide " +
-            "never compiles. Measured — xgrammar 0.2.4 raises `RuntimeError: Cannot find field " +
+            "never compiles. Measured — xgrammar 0.2.5 raises `RuntimeError: Cannot find field " +
             "" + d.ref.split("/").pop() + " in " + d.ref + "`, outlines-core 0.2.14 raises " +
             "`ValueError: Invalid reference path`, and lm-format-enforcer 0.11.3 raises a " +
             "`KeyError`. Worth knowing if this schema is shared: the same document is accepted " +

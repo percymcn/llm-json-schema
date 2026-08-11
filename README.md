@@ -1906,7 +1906,8 @@ later. A repair is a property of a **code path**, and the newest paths carry the
 fewest of them.
 
 What made this one invisible is that the engines do not agree about it.
-Measured on xgrammar 0.2.4 / outlines-core 0.2.14 / lm-format-enforcer 0.11.3,
+Measured on xgrammar 0.2.5 (and identically on 0.2.3 and 0.2.4) / outlines-core
+0.2.14 / lm-format-enforcer 0.11.3,
 with an inline no-`$ref` control enforced on all three so each engine is known
 to discriminate:
 
@@ -1940,6 +1941,14 @@ spelling fix is what lets a repair this tool already ships actually fire.
 Note the asymmetry in the last two rows. xgrammar *does* raise `Cannot find
 field` for a missing target written `#/$defs/...`. It is the malformed URI, not
 the missing target, that buys the silence.
+
+This one is not a disagreement with the vendor: an xgrammar maintainer opened
+[#774](https://github.com/mlc-ai/xgrammar/pull/774) — *"Reject unresolved JSON
+Schema references"* — whose own root-cause note reads *"non-local reference URIs
+fell back to an unconstrained schema after logging a warning; invalid input
+could therefore silently widen accepted output."* It was **closed without
+merging**, and the behaviour is unchanged on 0.2.3, 0.2.4 and 0.2.5. So the
+normalisation here is a workaround for a fix that exists and has not landed.
 
 ### An advisory that justified itself with "nothing will error"
 
