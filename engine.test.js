@@ -8686,12 +8686,21 @@ function fanoutSchema(depth, cyclic) {
   ok("lmfe: an untyped `allOf` member is a blocker",
     has(conv({ allOf: [{ type: "integer" }, { minimum: 10 }] }, T).ledger, "allOf[1]"));
 
-  // OVER-BLOCK GUARDS. These hold both ways and are stated as guards, not
-  // counted as new coverage.
-  ok("lmfe: a bare {} is NOT blocked (it means any JSON, and compiles)",
-    ops(conv({}, T), "!") === 0);
-  ok("lmfe: the same untyped shape NESTED under `properties` is NOT blocked",
-    ops(conv({ type: "object", properties: { a: { minimum: 3 } }, required: ["a"] }, T), "!") === 0);
+  // CORRECTED #390. These two were #386 over-block guards asserting that a bare
+  // `{}` and a nested typeless node are fine on this engine. Both premises are
+  // FALSE and both came from the same contaminated measurement: `JsonSchemaParser`
+  // is LAZY (#389), so a schema that dies at the property position constructs
+  // cleanly. Forced by feeding an instance character by character, BOTH raise
+  // `Unsupported type None`. Re-cut onto the measured behaviour rather than
+  // deleted, with the reason recorded here so a later cycle changes it deliberately.
+  ok("lmfe: a bare {} NESTED is blocked — it raises like any typeless node (#390)",
+    ops(conv({ type: "object", properties: { a: {} }, required: ["a"] }, T), "!") >= 1);
+  ok("lmfe: the same untyped shape NESTED under `properties` IS blocked (#390)",
+    ops(conv({ type: "object", properties: { a: { minimum: 3 } }, required: ["a"] }, T), "!") >= 1);
+  // ...and the discriminator that keeps it about CONTENT rather than presence:
+  // a non-empty `enum` builds and constrains, an EMPTY one raises (#346).
+  ok("lmfe: a non-empty `enum` is NOT blocked",
+    ops(conv({ type: "object", properties: { a: { "enum": [1] } }, required: ["a"] }, T), "!") === 0);
   ok("lmfe: an ordinary typed object draws no blocker",
     ops(conv({ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, T), "!") === 0);
 
@@ -9203,6 +9212,102 @@ function fanoutSchema(depth, cyclic) {
   })();
 })();
 
+
+// --- #390: the two repairs the three decoder targets never inherited ---------
+//
+// Found by running the MECHANICAL check #388 prescribed — for each shared
+// repair, list the converters that call it and diff that against the target
+// list. Two came back short on all three decoders: noteUnsatisfiable (#347) and
+// findBooleanSubschemas (#333).
+//
+// MEASURED 2026-08-11 on xgrammar 0.2.4 / outlines-core 0.2.14 /
+// lm-format-enforcer 0.11.3, with a `{"type":"string"}` control accepting 1 of 6
+// probe instances in every run. The severity forks because the engines do three
+// different things, so this is per-engine rather than a port (#365).
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  function blockers(r) { return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }); }
+  function advisories(r) { return r.ledger.filter(function (l) { return l.op === "!" && l.advisory; }); }
+  function P(v) {
+    return { type: "object", properties: { f: v }, required: ["f"], additionalProperties: false };
+  }
+
+  // xgrammar: three forms are a COMPILE ERROR and three INVERT into
+  // "any value". Both are blockers; the reasons differ and both are in the text.
+  [["enum", { "enum": [] }], ["anyOf", { anyOf: [] }], ["oneOf", { oneOf: [] }],
+   ["type", { type: [] }], ["not{}", { not: {} }], ["not-true", { not: true }]
+  ].forEach(function (pair) {
+    ok("#390 xgrammar: `" + pair[0] + "` unsatisfiable is a blocker",
+      blockers(conv(P(pair[1]), "xgrammar")).length >= 1);
+  });
+  // THE DISCRIMINATOR. `true` is the one row where an engine is CORRECT — a
+  // boolean `true` means any value and xgrammar generates any value — so the
+  // rule must be silent there. Without this the rule could be firing blanket and
+  // every assertion above would still pass.
+  ok("#390 xgrammar: a boolean `true` subschema draws NO blocker (it is correct there)",
+    blockers(conv(P(true), "xgrammar")).length === 0);
+  ok("#390 xgrammar: a boolean `false` subschema IS a blocker (refuses to compile)",
+    blockers(conv(P(false), "xgrammar")).length >= 1);
+
+  // outlines: the four collection forms COMPILE, so they stay advisory — the
+  // engine handles them correctly and the field is simply dead. Being stricter
+  // than the engine is the bug this project has shipped repeatedly.
+  [["enum", { "enum": [] }], ["anyOf", { anyOf: [] }], ["oneOf", { oneOf: [] }],
+   ["type", { type: [] }]].forEach(function (pair) {
+    var r = conv(P(pair[1]), "outlines");
+    ok("#390 outlines: `" + pair[0] + "` is ADVISORY, not a gate failure",
+      advisories(r).length >= 1 && blockers(r).length === 0);
+  });
+  // ...and `not` must NOT be reported twice: #384 already blocks the keyword on
+  // this target, so the unsatisfiable table deliberately omits it.
+  ok("#390 outlines: a match-anything `not` is reported exactly once",
+    blockers(conv(P({ not: {} }), "outlines")).length === 1);
+  ["true", "false"].forEach(function (b) {
+    ok("#390 outlines: a boolean `" + b + "` subschema is a blocker",
+      blockers(conv(P(b === "true"), "outlines")).length >= 1);
+  });
+
+  // lm-format-enforcer: every typeless form is owned by the widened
+  // `Unsupported type None` blocker, so the unsat table carries only `type: []`
+  // — the one form this engine gets right — and it stays advisory.
+  var lt = conv(P({ type: [] }), "lmformatenforcer");
+  ok("#390 lmfe: `type: []` is ADVISORY (the engine rejects it correctly)",
+    advisories(lt).length >= 1 && blockers(lt).length === 0);
+  [["enum", { "enum": [] }], ["anyOf", { anyOf: [] }], ["not{}", { not: {} }]].forEach(function (pair) {
+    ok("#390 lmfe: `" + pair[0] + "` is a blocker, reported ONCE",
+      blockers(conv(P(pair[1]), "lmformatenforcer")).length === 1);
+  });
+  ["true", "false"].forEach(function (b) {
+    ok("#390 lmfe: a boolean `" + b + "` subschema is a blocker (dies mid-generation)",
+      blockers(conv(P(b === "true"), "lmformatenforcer")).length >= 1);
+  });
+
+  // OVER-BLOCK GUARDS. These hold both ways and are stated as guards rather than
+  // counted as coverage — but they are load-bearing: an ordinary schema must be
+  // untouched on all three, and the four JSON-Schema-dialect targets must keep
+  // #347's ADVISORY severity, so a later cycle cannot "unify" the two into one
+  // blanket rule and silently start failing CI on documents providers accept.
+  ["xgrammar", "outlines", "lmformatenforcer"].forEach(function (p) {
+    var r = conv({ type: "object", properties: { f: { type: "string" } },
+                   required: ["f"], additionalProperties: false }, p);
+    ok("#390 " + p + ": an ordinary schema draws no unsatisfiable finding",
+      r.ledger.filter(function (l) { return l.op === "!"; }).length === 0);
+  });
+  [["anthropic", { "enum": [] }], ["gemini-json", { "enum": [] }],
+   ["openai-nonstrict", { "enum": [] }], ["openai", { type: [] }]].forEach(function (pair) {
+    var r = conv(P(pair[1]), pair[0]);
+    ok("#390 " + pair[0] + ": #347's severity is unchanged (advisory, never a gate failure)",
+      advisories(r).length >= 1 && blockers(r).length === 0);
+  });
+  // The two targets genuinely DISAGREE about one file — the proof the fork is
+  // real and not a blanket rule wearing three coats.
+  ok("#390 one `enum: []` file: xgrammar blocks it and outlines does not",
+    blockers(conv(P({ "enum": [] }), "xgrammar")).length >= 1 &&
+    blockers(conv(P({ "enum": [] }), "outlines")).length === 0);
+})();
 
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

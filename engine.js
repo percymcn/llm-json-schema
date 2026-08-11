@@ -6535,6 +6535,132 @@
     "and the merged form is enforced by all three, with every legal value still generatable";
   var DECODER_REF_SIBLING_RECURSIVE = "a constrained decoder drops the sibling silently";
 
+  // ---- unsatisfiable nodes on a constrained decoder -------------------------
+  //
+  // #347 shipped noteUnsatisfiable() for the five shapes that admit no value
+  // (`enum: []`, `anyOf: []`, `oneOf: []`, `type: []`, and `not` of a
+  // match-anything schema). It is wired to openai / anthropic / gemini /
+  // openai-nonstrict — every target that existed when it was written. The three
+  // DECODER targets were added later (#384/#385/#386) and inherited none of it,
+  // which is #388's rule exactly: a repair is a property of a CODE PATH, and the
+  // newest paths carry the fewest.
+  //
+  // It cannot simply be ported, because #347's severity rests on a premise that
+  // is FALSE here. That premise is stated in its own message — "providers accept
+  // the schema as written" — which is why it is advisory there. A constrained
+  // decoder does not merely accept-and-ignore: it either refuses to compile, or
+  // dies mid-generation, or compiles the OPPOSITE constraint. Measured
+  // 2026-08-11, one shape per row, with an ordinary `{"type":"string"}` control
+  // accepting 1 of 6 probe instances in every run so each engine is discriminating:
+  //
+  //   shape        xgrammar 0.2.4        outlines-core 0.2.14   lm-format-enforcer 0.11.3
+  //   enum: []     RuntimeError          guide matches nothing  Exception at decode
+  //   anyOf: []    RuntimeError (EBNF)   guide matches nothing  Exception at decode
+  //   oneOf: []    RuntimeError (EBNF)   guide matches nothing  Exception at decode
+  //   type: []     INVERTS -> any value  guide matches nothing  rejects (correct)
+  //   not:{} /true INVERTS -> any value  ValueError (compile)   Exception at decode
+  //
+  // The xgrammar inversion is read off the EMITTED GRAMMAR rather than inferred
+  // (#385): `{"not":{}}` compiles to
+  // `root_prop_0 ::= ((basic_number) | (basic_string) | ... )` and `{"type":[]}`
+  // to `root_prop_0 ::= ((basic_any))`. A node that permits no value became the
+  // grammar that permits every value.
+  //
+  // So the severity forks. BLOCKER where the engine cannot produce a working
+  // guide (compile error / decode crash) or silently produces the opposite
+  // constraint; ADVISORY where the engine handles it correctly and the field is
+  // simply dead, which is what the schema said. No repair is invented either way
+  // — nothing can make an impossible field possible (#329), so the remedy is named.
+  var DECODER_UNSAT = {
+    xgrammar: {
+      "enum": [true, "xgrammar refuses to compile it: `Grammar.from_json_schema` raises " +
+        "`enum array must not be empty`."],
+      anyOf: [true, "xgrammar refuses to compile it: `Grammar.from_json_schema` raises an " +
+        "`EBNF parser error` — it emits a rule with no alternatives and then fails to parse it."],
+      oneOf: [true, "xgrammar refuses to compile it: `Grammar.from_json_schema` raises an " +
+        "`EBNF parser error` — it emits a rule with no alternatives and then fails to parse it."],
+      type: [true, "xgrammar compiles it into the OPPOSITE constraint. The emitted grammar is " +
+        "`root_prop_0 ::= ((basic_any))`: a node that permits no value becomes one that permits " +
+        "every value, with no error. Measured — all 6 probe instances accepted, where the same " +
+        "field typed `string` accepts 1."],
+      "not": [true, "xgrammar compiles it into the OPPOSITE constraint. The emitted grammar is " +
+        "the full any-value alternation (`basic_number | basic_string | ...`): a node that " +
+        "permits no value becomes one that permits every value, with no error. Measured — all 6 " +
+        "probe instances accepted, where the same field typed `string` accepts 1."]
+    },
+    outlines: {
+      "enum": [false, "outlines-core compiles it, and the resulting regex matches no string at " +
+        "all — so for a required property the decoder can never complete the document."],
+      anyOf: [false, "outlines-core compiles it, and the resulting regex matches no string at " +
+        "all — so for a required property the decoder can never complete the document."],
+      oneOf: [false, "outlines-core compiles it, and the resulting regex matches no string at " +
+        "all — so for a required property the decoder can never complete the document."],
+      type: [false, "outlines-core compiles it, and the resulting regex matches no string at " +
+        "all — so for a required property the decoder can never complete the document."]
+      // `not` is already a blocker on this target (#384: build_regex_from_schema
+      // raises on the keyword itself), so it is deliberately absent here rather
+      // than reported twice for one node.
+    },
+    lmformatenforcer: {
+      type: [false, "lm-format-enforcer rejects every value for it, which is correct — but it " +
+        "means that for a required property the decoder can never complete the document."]
+      // Every other form here is TYPELESS, so it is already covered by the
+      // `Unsupported type None` blocker below — reporting it twice would be two
+      // findings for one node with one cause.
+    }
+  };
+
+  function noteDecoderUnsatisfiable(engine, node, path, ledger, url, skip) {
+    var form = unsatisfiableForm(node);
+    if (!form || skip) return null;
+    var row = DECODER_UNSAT[engine][form];
+    if (!row) return null;
+    ledger.push(entry("!", path,
+      "No value can satisfy this node: " + UNSAT_WHY[form][0] + ". " + row[1] +
+      " There is no repair — nothing can make an impossible field possible — so drop the field, " +
+      "or give it a real type if this was not intended (" + UNSAT_WHY[form][1] + ").",
+      url, !row[0]));
+    return form;
+  }
+
+  // Boolean subschemas on a decoder (#333's rule, the second repair the three
+  // decoder targets did not inherit). Measured the same day: `true` is the only
+  // row where an engine is CORRECT, and it is correct on exactly one engine, so
+  // the rule is per-engine rather than blanket (#365 — a rule that is a no-op
+  // for the member it was written for is a bug with a rationale attached).
+  var DECODER_BOOL = {
+    xgrammar: {
+      // `true` means any value and xgrammar generates any value: nothing to say.
+      "true": null,
+      "false": "xgrammar refuses to compile it: `Grammar.from_json_schema` raises " +
+        "`Schema 'false' cannot accept any value`."
+    },
+    outlines: {
+      "true": "outlines-core refuses to compile it: `build_regex_from_schema` raises " +
+        "`ValueError: Unsupported JSON Schema structure true`.",
+      "false": "outlines-core refuses to compile it: `build_regex_from_schema` raises " +
+        "`ValueError: Unsupported JSON Schema structure false`."
+    },
+    lmformatenforcer: {
+      // Worse than a refusal: the parser CONSTRUCTS, so nothing fails when the
+      // request is built, and it dies while consuming the property's key.
+      "true": "lm-format-enforcer builds the parser without complaint and then dies mid-generation " +
+        "with `AttributeError: 'bool' object has no attribute 'anyOf'` (jsonschemaparser.py:181) " +
+        "the moment the decoder reaches this property.",
+      "false": "lm-format-enforcer builds the parser without complaint and then dies mid-generation " +
+        "with `AttributeError: 'bool' object has no attribute 'anyOf'` (jsonschemaparser.py:181) " +
+        "the moment the decoder reaches this property."
+    }
+  };
+
+  function noteDecoderBooleans(engine, s, ledger, url) {
+    findBooleanSubschemas(s).forEach(function (h) {
+      var why = DECODER_BOOL[engine][h.value === true ? "true" : "false"];
+      if (!why) return;
+      ledger.push(entry("!", h.path, booleanSubschemaMessage(h.value, why), url));
+    });
+  }
+
   function toOutlines(schema) {
     var tooDeepOut = tooDeepEntry(schema, DOCS.outlines);
     if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
@@ -6554,7 +6680,11 @@
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
+    noteDecoderBooleans("outlines", s, ledger, url);
+
     walk(s, "root", function (node, path) {
+      noteDecoderUnsatisfiable("outlines", node, path, ledger, url);
+
       // 1. The fatal case, and the only one that is both silent AND repairable.
       //    Wrapping in a NON-capturing group is lossless — same language, and
       //    `(?:...)` leaves any backreference numbering untouched, which a bare
@@ -6724,7 +6854,11 @@
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
+    noteDecoderBooleans("xgrammar", s, ledger, url);
+
     walk(s, "root", function (node, path) {
+      noteDecoderUnsatisfiable("xgrammar", node, path, ledger, url);
+
       // 1. The alternation bug, confirmed in a SECOND engine. outlines accepts
       //    only malformed JSON; xgrammar accepts NOTHING — the field becomes
       //    impossible to generate. Same one-line repair, and `(?:...)` rather
@@ -6921,11 +7055,32 @@
     });
   }
 
+  // #386 scoped this to the root and to `allOf` members, exempted a bare `{}`,
+  // and treated the mere PRESENCE of `enum`/`anyOf`/`oneOf` as enough. All three
+  // of those came from one contaminated measurement: `JsonSchemaParser(doc)` is
+  // LAZY (#389), so a schema that dies at the property position constructs
+  // cleanly and even answers `get_allowed_characters()` at the top level. Forced
+  // by feeding an instance one character at a time, the truth is wider —
+  // measured 2026-08-11 on 0.11.3, with a `{"type":"string"}` control accepting
+  // its instance in the same run:
+  //
+  //   {} nested under properties            -> Exception: Unsupported type None
+  //   {"description":"x"} nested            -> Exception: Unsupported type None
+  //   {"enum":[]} nested                    -> Exception: Unsupported type None
+  //   {"anyOf":[]} nested                   -> Exception: Unsupported type None
+  //   {"enum":[1]} nested                   -> builds, rejects a string (correct)
+  //
+  // So a bare `{}` is NOT fine, and an EMPTY collection is not a type — the
+  // guard has to test the CONTENT, not the presence (#346). It fires wherever
+  // the walk reaches, because the crash is at whatever property the decoder
+  // happens to arrive at, not at a fixed position.
   function lmfeUnbuildable(node) {
     if (!isPlainObject(node)) return false;
-    if (Object.keys(node).length === 0) return false;      // bare {} is legal: any JSON
-    if (hasOwn(node, "type") || hasOwn(node, "enum") || hasOwn(node, "const")) return false;
-    if (hasOwn(node, "anyOf") || hasOwn(node, "oneOf") || hasOwn(node, "allOf")) return false;
+    if (hasOwn(node, "type") || hasOwn(node, "const")) return false;
+    if (Array.isArray(node["enum"]) && node["enum"].length) return false;
+    if (Array.isArray(node.anyOf) && node.anyOf.length) return false;
+    if (Array.isArray(node.oneOf) && node.oneOf.length) return false;
+    if (Array.isArray(node.allOf) && node.allOf.length) return false;
     if (hasOwn(node, "$ref")) return false;
     return true;
   }
@@ -6944,7 +7099,15 @@
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
+    noteDecoderBooleans("lmformatenforcer", s, ledger, url);
+
     walk(s, "root", function (node, path) {
+      // `type: []` is the one unsatisfiable form this engine gets right, and the
+      // only one not already covered by the `Unsupported type None` blocker
+      // below — every other form is TYPELESS, so reporting both would be two
+      // findings for one node with one cause.
+      noteDecoderUnsatisfiable("lmformatenforcer", node, path, ledger, url);
+
       // 1. THE HEADLINE, and it is an INVERSION rather than a loss of
       //    enforcement: `oneOf` compiles with NO error and the parser then
       //    demands an OBJECT. For a scalar union the accept set becomes
@@ -6997,7 +7160,14 @@
       //    message (`Unsupported type None`) names neither the keyword nor the
       //    path. Scoped to the two positions where it was measured to fire.
       var unbuildable = [];
-      if (path === "root" && lmfeUnbuildable(node)) unbuildable.push("this schema");
+      // A subschema under `not` is a NEGATED schema, never a value position the
+      // parser builds on its own — and the node CARRYING the `not` is typeless
+      // by construction, so it is already reported. Without this, `{"not":{}}`
+      // yields two findings for one cause. Same suppression the Python
+      // Anthropic path uses for the same reason.
+      if (path.indexOf("/not") === -1 && lmfeUnbuildable(node)) {
+        unbuildable.push(path === "root" ? "this schema" : "this node");
+      }
       if (Array.isArray(node.allOf)) {
         node.allOf.forEach(function (m, i) {
           if (lmfeUnbuildable(m)) unbuildable.push("`allOf[" + i + "]`");
@@ -7006,11 +7176,12 @@
       if (unbuildable.length) {
         ledger.push(entry("!", path,
           "lm-format-enforcer cannot build a parser for " + unbuildable.join(" and ") + ": a " +
-          "schema object with keys but no `type`, `enum`, `const`, `$ref` or combinator raises " +
-          "`Unsupported type None`, so the request is never made and the error names neither the " +
-          "keyword nor the path. Give the node an explicit `type`. (A bare `{}` is fine — it " +
-          "means any JSON — and the same shape nested under `properties` compiles, so this is " +
-          "specific to the root and to `allOf` members.)",
+          "schema with no `type`, no `const`, no non-empty `enum`/`$ref`/combinator raises " +
+          "`Unsupported type None`. Give the node an explicit `type`. Note WHEN it raises: " +
+          "`JsonSchemaParser(schema)` is LAZY, so the constructor succeeds and the request is " +
+          "built — it dies while the decoder is consuming this property, and the error names " +
+          "neither the keyword nor the path. A bare `{}` is NOT exempt: measured, it raises here " +
+          "like any other typeless node, and so does an EMPTY `enum`/`anyOf`/`oneOf`.",
           url));
       }
 
