@@ -2154,6 +2154,33 @@
             merged.dropped.forEach(function (k) {
               if (droppedNames.indexOf(k) === -1) droppedNames.push(k);
             });
+            // AT THE ROOT the excluded sibling IS the definition bag, and
+            // `merged.schema` is built from the referent plus `visited` — which
+            // holds only `siblings`, from which the bag was deliberately (and
+            // correctly) removed above. So the merge REPLACED the root and the
+            // bag went with it, while any pointer into it inside the merged
+            // result survived. Measured on
+            // `{$ref:"#/$defs/T", properties:{a:{$ref:"#/$defs/U"}}, required, $defs:{T,U}}`:
+            // the raw input COMPILES on xgrammar 0.2.5, outlines-core 0.2.14 and
+            // lm-format-enforcer 0.11.3, and our output compiled on NONE of them
+            // — we manufactured the dangling pointer and then reported it as the
+            // caller's, telling them to restore a definition that was in their
+            // file all along. Nested merges are unaffected: there the bag is not
+            // a sibling of the `$ref`, so nothing removes it.
+            // The bag is carried WHOLE rather than pruned to the live names. The
+            // orphan pruner is deliberately skipped on this path (it fails open
+            // for the `/$defs/X` spelling these targets never normalise), and a
+            // keep-rule that cannot read a pointer deletes what the pointer
+            // points at (#320) — so fail closed and keep everything. Dead
+            // definitions cost a decoder nothing; there is no property budget
+            // here. `hasOwn` so a referent that declares its own bag wins.
+            if (atRoot) {
+              ["$defs", "definitions"].forEach(function (b) {
+                if (isPlainObject(node[b]) && !hasOwn(merged.schema, b)) {
+                  setOwn(merged.schema, b, visit(node[b], stack, path + "/" + b));
+                }
+              });
+            }
             return merged.schema;
           }
           // Blocked: leave the shape exactly as written so the reader can see

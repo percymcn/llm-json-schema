@@ -1992,5 +1992,40 @@ function fanout(depth) {
 })();
 
 
+// --- #392: the root ref-sibling merge must not manufacture a dangling pointer
+// The exit code is the whole interface a CI gate has. Before the fix the three
+// decoder targets exited 3 on this document -- a BLOCKER naming a dangling
+// reference we had just created ourselves, telling the reader to restore a
+// definition that was in their file all along -- while the RAW input compiles
+// on xgrammar 0.2.5, outlines-core 0.2.14 and lm-format-enforcer 0.11.3 and our
+// output compiled on none of them.
+(function () {
+  var doc = JSON.stringify({
+    "$ref": "#/$defs/T",
+    properties: { a: { "$ref": "#/$defs/U" } },
+    required: ["a"],
+    $defs: {
+      T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] },
+      U: { type: "string", minLength: 3 }
+    }
+  });
+  ["outlines", "xgrammar", "lmformatenforcer"].forEach(function (p) {
+    var r = run(["--to", p, "--check", "-"], doc);
+    ok("#392 cli " + p + ": no longer a blocker (was exit 3)", r.status === 1,
+      "exit=" + r.status);
+    var out = run(["--to", p, "-"], doc);
+    var s;
+    try { s = JSON.parse(out.stdout); } catch (e) { s = null; }
+    ok("#392 cli " + p + ": the emitted document still carries its bag",
+      !!(s && s.$defs && s.$defs.U && s.properties && s.properties.a &&
+         s.properties.a.$ref === "#/$defs/U"));
+    // Idempotent: re-checking our own output must be clean, which is the
+    // contract exit 1 promises ("commit this and it will pass").
+    var again = run(["--to", p, "--check", "-"], out.stdout);
+    ok("#392 cli " + p + ": converted output re-checks clean", again.status === 0,
+      "exit=" + again.status);
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

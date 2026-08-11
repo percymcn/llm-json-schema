@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1595 engine + 341 CLI + 83 ESM/library assertions = **2019** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1623 engine + 350 CLI + 83 ESM/library assertions = **2056** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1017,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2019 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2056 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -2076,3 +2076,61 @@ Why this matters more than an exotic-shape note: **this tool manufactures the br
 
 Known and deliberately not covered: when a **combinator** sits beside a `type`, all three decoders honour only the combinator — the `type` and its siblings stop applying, so `{"type":["string","integer"], "anyOf":[{"type":"boolean"}]}` accepts `true`. A *scalar* `type` behaves identically, so this is a different defect with a different population rather than part of the union story, and flagging only the array-valued half would be incoherent. Those nodes are left exactly as written.
 
+
+## A merge at the root takes the definition bag with it
+
+A `$ref` beside constraining siblings is an **intersection** — draft 2020-12
+applies the referent *and* the siblings — so the two are merged rather than one
+overwriting the other. The merge deliberately excludes the definition bag from
+the sibling set: `$defs`/`definitions` is not a constraint, and folding it into
+the referent would merge the whole definition map into one node.
+
+That exclusion is correct, and at the **root** it was also the bug. The merge
+returns a node built from the referent plus the siblings, so at a nested
+position the bag is untouched (it lives at the root); at the root the excluded
+key *is* the bag, and the merge replaced the root — while any pointer into the
+bag that survived the merge stayed behind, pointing at nothing.
+
+Measured on the shape below, whose root `$ref` carries `properties`/`required`
+and whose sibling points into the bag:
+
+| document | xgrammar 0.2.5 | outlines-core 0.2.14 | lm-format-enforcer 0.11.3 |
+|---|---|---|---|
+| the raw input | compiles | compiles | compiles |
+| our output *before* | `RuntimeError` | `ValueError` | `ValueError` |
+| our output *now* | compiles | compiles | compiles |
+
+The raw document compiled everywhere and our output compiled nowhere: this was
+not a defect being surfaced, it was one being manufactured — and the blocker we
+then printed told the reader to restore a definition that was in their file all
+along. On the three decoder targets it was loud (exit 3). On
+`--to anthropic-json-python` it was **silent**: that target keeps the root
+`$ref`, so an ordinary `zod-to-json-schema` document (whose default root is
+`{$ref, definitions, $schema}`) lost its bag at exit 1 with no blocker at all,
+and `anthropic==0.121.0`'s `transform_schema` accepts the dangling pointer and
+forwards it verbatim — so nothing anywhere reported it and the referenced
+constraint was simply gone.
+
+The bag is now carried across the root merge, **whole and unpruned**. Pruning it
+to the live names would need a keep-rule that reads pointers, and a keep-rule
+that cannot read a pointer deletes what the pointer points at — the orphan
+pruner is already skipped on the decoder path for exactly that reason. Dead
+definitions cost a constrained decoder nothing (there is no property budget),
+and a dead bag was verified to compile on all three engines. A referent that
+declares its own bag keeps it.
+
+The fix also restores the constraint, not just compilability. Accept sets
+measured through the three engines on `{"b": "...", "a": "..."}`:
+
+| instance | raw input | our output |
+|---|---|---|
+| `{"b":"x"}` | accepted | rejected |
+| `{"b":"x","a":"zzzz"}` | rejected | **accepted** |
+| `{"b":"x","a":"z"}` (violates `minLength: 3`) | rejected | rejected |
+
+The engines resolve a root `$ref` and ignore its siblings, so the raw document
+means "just the referent"; draft 2020-12 says "both". Every legal value is
+generatable and the violating one is refused, on all three.
+
+`--to openai`, `--to anthropic-json` and `--to gemini` are unchanged: they inline
+the root `$ref` earlier, so there is no root `$ref` left by the time this runs.

@@ -9463,5 +9463,190 @@ function fanoutSchema(depth, cyclic) {
   })();
 })();
 
+// --- #392: the root ref-sibling merge must carry the definition bag ---------
+// `resolveRefSiblings` excludes the bag from `siblings` (correct -- it is not a
+// constraining sibling), then returns the merged node. At a NESTED position the
+// bag lives at the root and is untouched; AT THE ROOT the excluded key IS the
+// bag, so the merge replaced the root and the bag went with it while pointers
+// into it survived. Measured on xgrammar 0.2.5 / outlines-core 0.2.14 /
+// lm-format-enforcer 0.11.3: the raw input COMPILES on all three, our output
+// compiled on NONE. `inlineRootRef` already carries the bag, and the three
+// decoder converters never called it (#391's inheritance rule, third payout).
+(function () {
+  var DECODERS = ["outlines", "xgrammar", "lmformatenforcer"];
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return (r && r.ok) ? r : { schema: {}, ledger: [] };
+  }
+  // root `$ref` + CONSTRAINING siblings + a pointer into the bag from a sibling
+  function rootMerge(bag) {
+    var d = { "$ref": "#/" + bag + "/T", properties: { a: { "$ref": "#/" + bag + "/U" } }, required: ["a"] };
+    d[bag] = {
+      T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] },
+      U: { type: "string", minLength: 3 }
+    };
+    return d;
+  }
+
+  DECODERS.forEach(function (p) {
+    var s = conv(rootMerge("$defs"), p).schema;
+    ok("#392 " + p + ": the root merge keeps the `$defs` bag",
+      s && isObj(s.$defs) && isObj(s.$defs.U));
+    // The whole point: the pointer that survived the merge must still resolve.
+    ok("#392 " + p + ": the surviving pointer still resolves into the kept bag",
+      s && s.properties && s.properties.a && s.properties.a.$ref === "#/$defs/U" &&
+      s.$defs && s.$defs.U && s.$defs.U.minLength === 3);
+    // ...and the merge itself is still an INTERSECTION (#371): both sides' props.
+    ok("#392 " + p + ": the merge still keeps BOTH sides' declarations",
+      s && s.properties && s.properties.b && s.properties.a &&
+      Array.isArray(s.required) &&
+      s.required.indexOf("b") !== -1 && s.required.indexOf("a") !== -1);
+    // The decoder targets deliberately do NOT rename the bag (#388), so the
+    // draft-07 spelling -- `zod-to-json-schema`'s default -- must survive under
+    // its own name. Naming only `$defs` in the fix would miss half the input.
+    var sd = conv(rootMerge("definitions"), p).schema;
+    ok("#392 " + p + ": the `definitions` spelling of the bag survives too",
+      sd && isObj(sd.definitions) && isObj(sd.definitions.U) &&
+      sd.properties && sd.properties.a && sd.properties.a.$ref === "#/definitions/U");
+  });
+
+  // --- over-block guards and scope pins: these hold BOTH ways ---------------
+  // NESTED merge: the bag was never a sibling there, so it was always kept.
+  // Without this the fix could be "carry the bag on every merge" and every
+  // assertion above would still pass.
+  DECODERS.forEach(function (p) {
+    var nested = conv({
+      type: "object",
+      properties: { x: { "$ref": "#/$defs/T", minLength: 2 }, a: { "$ref": "#/$defs/U" } },
+      required: ["x", "a"],
+      $defs: { T: { type: "string" }, U: { type: "string", minLength: 3 } }
+    }, p).schema;
+    ok("#392 " + p + ": a NESTED ref-sibling merge is unaffected",
+      nested && isObj(nested.$defs) && isObj(nested.$defs.U));
+  });
+
+  // A root `$ref` whose only sibling is an ANNOTATION draws no merge at all --
+  // measured, this is exactly what pydantic 2.13.4 emits for `RootModel[T]`
+  // (`{$defs, $ref, title}`), i.e. the commonest root shape there is, so the
+  // rule must not fire on it.
+  DECODERS.forEach(function (p) {
+    var ann = conv({
+      "$ref": "#/$defs/T", title: "Wrap",
+      $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } }
+    }, p).schema;
+    ok("#392 " + p + ": an annotation-only root sibling is left exactly as written",
+      ann && ann.$ref === "#/$defs/T" && ann.title === "Wrap" && isObj(ann.$defs) &&
+      !ann.properties);
+  });
+
+  // A bare root `$ref` (no siblings at all) is untouched: all three decoders
+  // resolve `#/$defs/T` correctly, so inlining it would be an edit that buys
+  // nothing (#314's error-policy rule).
+  DECODERS.forEach(function (p) {
+    var bare = conv({
+      "$ref": "#/$defs/T",
+      $defs: { T: { type: "object", properties: { a: { "$ref": "#/$defs/U" } }, required: ["a"] },
+               U: { type: "string", minLength: 3 } }
+    }, p).schema;
+    ok("#392 " + p + ": a bare root `$ref` is passed through untouched",
+      bare && bare.$ref === "#/$defs/T" && isObj(bare.$defs) && isObj(bare.$defs.U));
+  });
+
+  // THE DISCRIMINATOR (#365): the JSON-Schema-dialect targets must be UNCHANGED.
+  // `inlineRootRef` owns the root there and runs immediately BEFORE
+  // `resolveRefSiblings`, so by the time this code sees the root there is no
+  // `$ref` left and the new branch cannot fire. Without this pin the fix could
+  // be firing on every target and every assertion above would still pass.
+  ["openai", "anthropic-json"].forEach(function (p) {
+    var s = conv(rootMerge("$defs"), p).schema;
+    ok("#392 " + p + ": still keeps the bag via the root inliner, not the new branch",
+      s && isObj(s.$defs) && isObj(s.$defs.U) &&
+      s.properties && s.properties.a && s.properties.a.$ref === "#/$defs/U" &&
+      has(conv(rootMerge("$defs"), p).ledger, "Inlined the root `$ref`"));
+  });
+  // Gemini inlines refs outright and needs no bag -- pinned so a later cycle
+  // does not "unify" the two and start emitting a bag it has no field for.
+  (function () {
+    var s = conv(rootMerge("$defs"), "gemini").schema;
+    ok("#392 gemini: still inlines and carries NO bag",
+      s && !s.$defs && !s.definitions &&
+      s.properties && s.properties.a && s.properties.a.minLength === 3 && !s.properties.a.$ref);
+  })();
+
+  // `anthropic-json-python` is the SILENT half, and the one with real generator
+  // reachability. That target deliberately KEEPS the root `$ref` (#315/#324), so
+  // unlike openai/anthropic-json it still has one when this code runs -- and
+  // `onlyConstraining` is false there, so `$schema` is NOT filtered out of
+  // `siblings`. `$schema` at the root beside a `$ref` is exactly what
+  // `zod-to-json-schema` emits BY DEFAULT, so an ordinary zod schema with a
+  // reused sub-schema fired the merge and lost the bag, leaving `echo`'s
+  // pointer-into-definition unresolvable at exit 1 with NO blocker. Measured on
+  // `anthropic==0.121.0`: `transform_schema` ACCEPTS the dangling form and
+  // forwards it verbatim, so nothing anywhere reports it and the constraint is
+  // simply gone; with the bag kept, the definition survives (its `minLength`
+  // demoted to `description` prose, which is that path's documented behaviour).
+  (function () {
+    var zod = {
+      "$ref": "#/definitions/S",
+      definitions: {
+        S: {
+          type: "object",
+          properties: {
+            inner: { type: "object", properties: { one: { type: "string", minLength: 3 } },
+                     required: ["one"], additionalProperties: false },
+            echo: { "$ref": "#/definitions/S/properties/inner/properties/one" }
+          },
+          required: ["inner", "echo"], additionalProperties: false
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    };
+    var s = conv(zod, "anthropic-json-python").schema;
+    ok("#392 anthropic-json-python: zod's default root keeps its bag",
+      s && isObj(s.$defs) && isObj(s.$defs.S));
+    // The property that matters is RESOLUTION, not presence of a key: walk the
+    // pointer the way a consumer would.
+    ok("#392 anthropic-json-python: the pointer INTO the definition resolves",
+      s && s.properties && s.properties.echo &&
+      resolvePtr(s, s.properties.echo.$ref) === true);
+  })();
+
+  function resolvePtr(doc, ref) {
+    if (typeof ref !== "string" || ref.charAt(0) !== "#") return "n/a";
+    var toks = ref.slice(1).split("/").slice(1).map(function (t) {
+      try { t = decodeURIComponent(t); } catch (e) { /* #378: %zz throws */ }
+      return t.replace(/~1/g, "/").replace(/~0/g, "~");
+    });
+    var cur = doc;
+    for (var i = 0; i < toks.length; i++) {
+      if (!cur || typeof cur !== "object" || !Object.prototype.hasOwnProperty.call(cur, toks[i])) return false;
+      cur = cur[toks[i]];
+    }
+    return true;
+  }
+
+  // Precedence: a referent that declares its own bag wins, so the carry-over
+  // cannot clobber a definition set the merge legitimately produced.
+  (function () {
+    var d = {
+      "$ref": "#/$defs/T", properties: { a: { type: "string" } }, required: ["a"],
+      $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"],
+                    $defs: { INNER: { type: "integer" } } } }
+    };
+    var s = conv(d, "xgrammar").schema;
+    ok("#392 a referent's own bag is not clobbered by the carry-over",
+      s && isObj(s.$defs) && isObj(s.$defs.INNER));
+  })();
+
+  // No bag on the input -> none invented.
+  (function () {
+    var s = conv({ type: "object", properties: { b: { type: "string" } }, required: ["b"] }, "xgrammar").schema;
+    ok("#392 an ordinary schema gains no definition bag",
+      s && !s.$defs && !s.definitions);
+  })();
+
+  function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
