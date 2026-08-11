@@ -2210,5 +2210,50 @@ function fanout(depth) {
     u.stdout.indexOf('"uniqueItems": true') !== -1);
 })();
 
+// --- #399: the ARRAY sibling, at the CLI boundary --------------------------
+(function () {
+  var BARE_ARR = '{"type":"array","uniqueItems":true}';
+  var CONTAINS = '{"type":"array","contains":{"type":"string"}}';
+  var SHAPED = '{"type":"array","items":{"type":"string"},"uniqueItems":true}';
+  // #363's shape: our own $ref-sibling merge manufactures a bare array.
+  var MANUF = '{"type":"array","uniqueItems":true,"$ref":"#/$defs/T","$defs":{"T":{"maxItems":5}}}';
+
+  var c = run(["--to", "xgrammar", "--check"], BARE_ARR);
+  ok("#399 cli a bare array with `uniqueItems` fails --check on xgrammar",
+    c.status === 1);
+
+  var fixed = run(["--to", "xgrammar"], BARE_ARR);
+  ok("#399 cli the converted document declares `items: {}`",
+    fixed.status === 0 && fixed.stdout.indexOf('"items": {}') !== -1);
+  ok("#399 cli ...and the keyword itself SURVIVES conversion (#314 ignore->keep)",
+    fixed.stdout.indexOf('"uniqueItems": true') !== -1);
+  ok("#399 cli the converted document rechecks clean (idempotent)",
+    run(["--to", "xgrammar", "--check"], fixed.stdout).status === 0);
+
+  // The over-edit guard at the boundary: a shaped array is untouched.
+  ok("#399 cli an array with declared `items` still exits 0",
+    run(["--to", "xgrammar", "--check"], SHAPED).status === 0);
+
+  // THE DISCRIMINATOR: same file, three decoder targets, only xgrammar
+  // disagrees. Measured: on outlines-core and lm-format-enforcer these
+  // keywords behave IDENTICALLY to the bare node, so a rule firing on all
+  // three would be a false CI failure for two of them.
+  var o = run(["--to", "outlines", "--check"], BARE_ARR);
+  var l = run(["--to", "lmformatenforcer", "--check"], BARE_ARR);
+  ok("#399 cli ...so the three decoder targets genuinely disagree about one file",
+    c.status === 1 && o.status === 0 && l.status === 0);
+
+  // The DISJOINT row: `contains` demands an element the raw grammar forbids.
+  var ct = run(["--to", "xgrammar", "--check"], CONTAINS);
+  ok("#399 cli the `contains` row is reported and names the disjoint accept set",
+    ct.status === 1 && ct.stderr.indexOf("DISJOINT") !== -1);
+
+  // Our own manufacture (#330's invariant break, closed).
+  var mf = run(["--to", "xgrammar"], MANUF);
+  ok("#399 cli our own $ref-sibling merge no longer emits a destroyed array",
+    mf.status === 0 && mf.stdout.indexOf('"items": {}') !== -1 &&
+    mf.stdout.indexOf('"maxItems": 5') !== -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

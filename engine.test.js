@@ -10422,5 +10422,109 @@ function fanoutSchema(depth, cyclic) {
   });
 })();
 
+// ---------------------------------------------------------------------------
+// #399. The ARRAY sibling of #398's bare object, found by running #398's own
+// lesson as a script (#390): the trigger is the ABSENCE OF A SHAPE, and an
+// array's shape keys are a DIFFERENT, measured set.
+//
+// Measured against xgrammar 0.2.5, a `type:"array"` node with none of
+// {items, prefixItems, unevaluatedItems, $ref, allOf, anyOf, oneOf, enum,
+// const} compiles to `root ::= "[" "]"` the moment any further keyword is
+// present -- the empty array becomes the only legal document, no error.
+// Round trip through the real engine: uniqueItems 1000 -> 1111, contains
+// 1000 -> 1111, minItems RuntimeError -> 0111 (and then CORRECTLY enforced).
+// ---------------------------------------------------------------------------
+(function () {
+  // Guarded: with engine.js reverted these must REPORT rather than abort the
+  // file (#322's trap, which has bitten several cycles).
+  function xc(doc) {
+    try {
+      var r = E.convert(doc, "xgrammar");
+      return (r && r.ok && r.schema) ? r.schema : {};
+    } catch (e) { return {}; }
+  }
+  function hasItems(s) { return Object.prototype.hasOwnProperty.call(s, "items"); }
+
+  // --- the collapsing shapes are repaired ---
+  ok("#399 xgrammar: a bare array with `uniqueItems` is given a shape",
+    JSON.stringify(xc({ type: "array", uniqueItems: true }).items) === "{}");
+  ok("#399 xgrammar: ...and the keyword itself SURVIVES (#314 ignore->keep)",
+    xc({ type: "array", uniqueItems: true }).uniqueItems === true);
+  ok("#399 xgrammar: `maxItems` on a bare array is repaired",
+    hasItems(xc({ type: "array", maxItems: 3 })));
+  // The sharpest row: `contains` demands at least one matching element, so the
+  // raw accept set {[]} is EXACTLY the one document the schema forbids.
+  ok("#399 xgrammar: `contains` on a bare array is repaired (DISJOINT accept set)",
+    hasItems(xc({ type: "array", contains: { type: "string" } })));
+  // Measured to REFUSE TO COMPILE rather than collapse -- the third direction.
+  ok("#399 xgrammar: `minItems` on a bare array is repaired (raw is a RuntimeError)",
+    hasItems(xc({ type: "array", minItems: 1 })));
+  ok("#399 xgrammar: a `$defs` bag alone collapses a bare array too",
+    hasItems(xc({ type: "array", $defs: { T: { type: "string" } } })));
+  // The control that makes this about the ABSENCE OF A SHAPE rather than about
+  // a keyword list. Without it the rule could be a four-keyword special case.
+  ok("#399 xgrammar: an UNKNOWN keyword collapses a bare array too, so it is repaired",
+    hasItems(xc({ type: "array", frobnicate: 1 })));
+  // The spelling is a measurement: `items: true` repairs xgrammar too and
+  // raises on outlines-core / crashes lm-format-enforcer (#333/#390).
+  ok("#399 xgrammar: the repair uses `items: {}`, never the boolean form",
+    xc({ type: "array", uniqueItems: true }).items !== true);
+
+  // --- OVER-EDIT GUARDS: each is left byte-identical. These hold both ways
+  // and are load-bearing -- `prefixItems` in particular caught a real bug in
+  // the first draft of this rule, where adding `items` WIDENED the accept set
+  // from 010000 to 011000 because `items` applies past the prefix.
+  [["bare array alone", { type: "array" }],
+   ["annotations only", { type: "array", title: "T", description: "d" }],
+   ["declared items", { type: "array", items: { type: "string" }, uniqueItems: true }],
+   ["prefixItems (shape key)", { type: "array", prefixItems: [{ type: "string" }], uniqueItems: true }],
+   ["unevaluatedItems (shape key)", { type: "array", unevaluatedItems: { type: "string" }, uniqueItems: true }],
+   ["enum node", { type: "array", enum: [[1]] }],
+   ["combinator node", { type: "array", allOf: [{ minItems: 1 }] }],
+   ["a non-array type", { type: "string", minLength: 2 }]
+  ].forEach(function (pair) {
+    var before = JSON.stringify(pair[1]);
+    ok("#399 xgrammar: " + pair[0] + " is left byte-identical (over-edit guard)",
+      JSON.stringify(xc(pair[1])) === before);
+  });
+
+  // Nested position, and idempotence.
+  var nest = xc({ type: "object", properties: { xs: { type: "array", uniqueItems: true } },
+                  required: ["xs"], additionalProperties: false });
+  ok("#399 xgrammar: the repair reaches a NESTED bare array",
+    !!(nest.properties && nest.properties.xs && hasItems(nest.properties.xs)));
+  var once = xc({ type: "array", uniqueItems: true });
+  ok("#399 xgrammar: the repair is idempotent",
+    JSON.stringify(xc(once)) === JSON.stringify(once));
+
+  // --- THE ROW THAT MAKES THIS OURS: #363's shape. Our own `$ref`-sibling
+  // merge (#371/#388) turns an ordinary OpenAPI composition into a bare array
+  // carrying three collapsing keywords. Measured: RAW accepts any array
+  // (1111) and our PRE-FIX output accepted only [] (1000) at exit 1, i.e.
+  // "commit my output" -- #330's invariant break, manufactured by us.
+  var manufactured = xc({
+    type: "array", uniqueItems: true, $ref: "#/$defs/T",
+    $defs: { T: { maxItems: 5 } }
+  });
+  ok("#399 xgrammar: our own $ref-sibling merge no longer manufactures a destroyed array",
+    hasItems(manufactured) && manufactured.uniqueItems === true &&
+    manufactured.maxItems === 5);
+
+  // --- SCOPE PINS. xgrammar-only, and that is a MEASUREMENT: on outlines-core
+  // and lm-format-enforcer every one of these shapes behaves IDENTICALLY to
+  // the bare node, and both enforce `minItems` correctly, so there is nothing
+  // to repair and firing there would be over-editing.
+  ["outlines", "lmformatenforcer", "openai", "anthropic", "anthropic-json",
+   "gemini-json", "openai-nonstrict"].forEach(function (p) {
+    var s;
+    try {
+      var r = E.convert({ type: "array", uniqueItems: true }, p);
+      s = (r && r.ok && r.schema) ? r.schema : {};
+    } catch (e) { s = {}; }
+    ok("#399 " + p + " does NOT add `items` to a bare array (scope pin)",
+      !Object.prototype.hasOwnProperty.call(s, "items"));
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

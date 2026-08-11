@@ -7367,9 +7367,20 @@
   };
   // Keys that are inert on a bare object: measured to leave the emitted grammar
   // byte-identical to the bare node's. `type` is the node's own declaration.
+  // RE-MEASURED for the array case in #399: the same ten are inert there too,
+  // so this table is shared because it was verified, not because it was assumed.
   var XGRAMMAR_INERT_ON_BARE = {
     type: 1, title: 1, description: 1, $comment: 1, $schema: 1,
     default: 1, examples: 1, readOnly: 1, writeOnly: 1, deprecated: 1
+  };
+  // #399. The ARRAY sibling of XGRAMMAR_SHAPE_KEYS. MEASURED, not ported from
+  // the object list: `contains` and `additionalItems` do NOT count as a shape
+  // (a node carrying only one of them still collapses), while
+  // `unevaluatedItems` does. Neither asymmetry is guessable from the object
+  // table, which is why rule 0-bis says to re-probe rather than port.
+  var XGRAMMAR_ARRAY_SHAPE_KEYS = {
+    items: 1, prefixItems: 1, unevaluatedItems: 1, $ref: 1,
+    allOf: 1, anyOf: 1, oneOf: 1, enum: 1, const: 1
   };
 
   // #398. `XGRAMMAR_DROPPED` said four keywords are "silently ignored". That is
@@ -7408,6 +7419,42 @@
   function xgrammarBareObject(node) {
     if (!isPlainObject(node) || node.type !== "object") return false;
     for (var k in XGRAMMAR_SHAPE_KEYS) if (hasOwn(node, k)) return false;
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length; i++) {
+      if (!XGRAMMAR_INERT_ON_BARE[keys[i]]) return true;
+    }
+    return false;
+  }
+
+  // #399. The ARRAY sibling of xgrammarBareObject, found by running #398's
+  // lesson as a script (#390): the trigger there was not a keyword but the
+  // ABSENCE OF A SHAPE, and an array's shape keys are a different set from an
+  // object's. Measured against xgrammar 0.2.5, a node declaring
+  // `type:"array"` with none of XGRAMMAR_ARRAY_SHAPE_KEYS compiles to
+  //     root ::= (("[" [ \n\t]* "]"))
+  // the moment almost any further keyword is present — THE EMPTY ARRAY IS THE
+  // ONLY LEGAL DOCUMENT, with no error.
+  //
+  //   {"type":"array"}                       any array        (correct)
+  //   {"type":"array", uniqueItems:true}     ONLY []          DESTROYED
+  //   {"type":"array", maxItems:3}           ONLY []          DESTROYED
+  //   {"type":"array", contains:{...}}       ONLY []          INVERTED
+  //   {"type":"array", $defs:{...}}          ONLY []          DESTROYED
+  //   {"type":"array", minItems:1}           RuntimeError     REFUSED
+  //   {"type":"array", frobnicate:1}         ONLY []          (CONTROL)
+  //   {"type":"array", title:"t"}            any array        (CONTROL)
+  //   {..., items:{...}, uniqueItems:true}   ignored          (CONTROL)
+  //
+  // The `frobnicate` control is what makes this about the absence of a shape
+  // rather than about any keyword list, and the `items` control is what makes
+  // it about the NODE: the same keyword on a shaped array is harmlessly
+  // ignored. `contains` is the sharpest row and is the array's analogue of
+  // #398's `required`: `contains:{"type":"string"}` demands at least one
+  // string, so the raw accept set {[]} is EXACTLY the one document the schema
+  // forbids — DISJOINT, not merely narrowed.
+  function xgrammarBareArray(node) {
+    if (!isPlainObject(node) || node.type !== "array") return false;
+    for (var k in XGRAMMAR_ARRAY_SHAPE_KEYS) if (hasOwn(node, k)) return false;
     var keys = Object.keys(node);
     for (var i = 0; i < keys.length; i++) {
       if (!XGRAMMAR_INERT_ON_BARE[keys[i]]) return true;
@@ -7507,6 +7554,41 @@
           "and a declared `{}` matches anything — verified by measuring that healthy nodes' " +
           "accept sets are unchanged. This is xgrammar-specific: outlines-core ignores these " +
           "harmlessly and lm-format-enforcer enforces `required` here correctly.",
+          url));
+      }
+
+      // #399, the array sibling. Same repair shape as the object case and for
+      // the same reason: RESTORE THE DEFAULT rather than remove the offender.
+      // An absent `items` already means "elements are unconstrained", so
+      // stating `items: {}` cannot change what the document means — and both
+      // dominant generators emit exactly that form for an any-element array
+      // (pydantic 2.13.4 `list`/`List[Any]`, zod 4.4.3 `z.array(z.any())`),
+      // so this is their canonical spelling rather than an invention.
+      //
+      // The spelling is a MEASUREMENT, not a preference: `items: true` is
+      // equally correct JSON Schema and equally repairs xgrammar, and it makes
+      // outlines-core raise ValueError and crashes lm-format-enforcer mid-parse
+      // (#333/#390's boolean-subschema defect). `items: {}` is safe on all
+      // three, so the repair cannot become a landmine if it is ever widened.
+      //
+      // SCOPED TO xgrammar, measured: on outlines-core and lm-format-enforcer
+      // every one of these shapes behaves IDENTICALLY to the bare node (and
+      // both enforce `minItems` correctly), so there is nothing to repair
+      // there and firing would be over-editing.
+      if (xgrammarBareArray(node)) {
+        setOwn(node, "items", {});
+        ledger.push(entry("+", path,
+          "Gave this array a shape xgrammar can build from (set `items: {}`). The node declared " +
+          "`type: \"array\"` and nothing else that describes its elements, and xgrammar compiles " +
+          "such a node to `root ::= \"[\" \"]\"` the moment any further keyword is present — the " +
+          "EMPTY ARRAY becomes the only legal document, with no error. This is not a narrowing of " +
+          "the constraint the keyword expresses: for `contains` the raw accept set is DISJOINT " +
+          "from the schema's, permitting exactly the one document the schema forbids. The edit is " +
+          "a no-op in JSON Schema — an absent `items` already leaves elements unconstrained, and " +
+          "`{}` matches anything — verified by measuring that healthy arrays' accept sets are " +
+          "unchanged. `items: {}` rather than `items: true` deliberately: the boolean form repairs " +
+          "xgrammar too but raises on outlines-core and crashes lm-format-enforcer. This is " +
+          "xgrammar-specific; the other two decoders ignore these keywords harmlessly here.",
           url));
       }
 

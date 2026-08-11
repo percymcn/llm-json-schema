@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1775 engine + 397 CLI + 83 ESM/library assertions = **2255** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1801 engine + 405 CLI + 83 ESM/library assertions = **2289** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1183,7 +1183,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2255 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2289 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -2372,3 +2372,59 @@ Deliberately unchanged, and each is pinned by a test: pydantic v1's
 the wrapper survives byte-identical; a two-member `allOf` is a real composition;
 a node that already carries a `$ref` is never lifted over; and the
 JSON-Schema-dialect targets do not run this rewrite at all.
+
+## A shapeless array is destroyed by any keyword, one container over
+
+[#398] found that on **xgrammar 0.2.5** a node declaring `type: "object"` with no
+`properties`/`additionalProperties` collapses to `root ::= "{" "}"` — the empty
+object as the only legal document — the moment almost any further keyword is
+present. The trigger was never a keyword: a bogus `frobnicate` collapses the node
+identically, so the cause is the **absence of a shape**.
+
+An array has a shape too, and a different set of keys spells it. Measured on
+xgrammar 0.2.5, against instances `[]`, `["a"]`, `["a","b"]`, `[1]`:
+
+| node | raw accept set | emitted root rule |
+|---|---|---|
+| `{"type":"array"}` | `1111` any array | `root ::= ((basic_array))` |
+| `… + "uniqueItems": true` | `1000` **only `[]`** | `root ::= (("[" [ \n\t]* "]"))` |
+| `… + "maxItems": 3` | `1000` **only `[]`** | *(byte-identical)* |
+| `… + "contains": {"type":"string"}` | `1000` **DISJOINT** | *(byte-identical)* |
+| `… + "$defs": {…}` | `1000` **only `[]`** | *(byte-identical)* |
+| `… + "minItems": 1` | `RuntimeError` | *(refuses to compile)* |
+| `… + "frobnicate": 1` | `1000` **(control)** | *(byte-identical)* |
+| `… + "title": "t"` | `1111` **(control)** | unchanged |
+| `{"type":"array","items":{…},"uniqueItems":true}` | ignored **(control)** | shaped, correct |
+
+`contains` is the array's analogue of #398's `required`, and the sharpest row:
+it demands *at least one* matching element, so the raw accept set `{[]}` is
+exactly the one document the schema **forbids** — disjoint, not merely narrowed.
+
+**The shape keys were measured, not ported from the object list**, and two of
+them are not guessable from it: `contains` and `additionalItems` do **not** count
+as a shape, while `unevaluatedItems` does.
+
+**The repair restores the default rather than removing the offender.** An absent
+`items` already leaves elements unconstrained, so stating `items: {}` cannot
+change what the document means — and it is the canonical spelling both dominant
+generators already emit for an any-element array (pydantic 2.13.4 `list` /
+`List[Any]`, zod 4.4.3 `z.array(z.any())`). The spelling is a measurement, not a
+preference: `items: true` repairs xgrammar equally well, and raises
+`ValueError` on outlines-core and crashes lm-format-enforcer mid-parse.
+
+Round trip through the real engine — `uniqueItems` `1000` → `1111`, `contains`
+`1000` → `1111`, `minItems` `RuntimeError` → `0111` **and then correctly
+enforced**; healthy arrays come back byte-identical.
+
+**Scope is a measurement.** On outlines-core and lm-format-enforcer every one of
+these shapes behaves identically to the bare node, and both enforce `minItems`
+correctly — so there is nothing to repair there and firing would be over-editing.
+The same file exits **1** on `--to xgrammar` and **0** on the other two.
+
+**The row that makes this ours.** Our own `$ref`-sibling merge ([#371]/[#388])
+turns the ordinary OpenAPI composition
+`{"type":"array","uniqueItems":true,"$ref":"#/$defs/T","$defs":{"T":{"maxItems":5}}}`
+into a bare array carrying three collapsing keywords. Raw, xgrammar accepts any
+array (`1111`); our pre-fix output accepted **only `[]`** (`1000`) — at exit 1,
+which this CLI documents as *"commit my output"*. A gate whose **fix** destroys
+the document is worse than one that stays silent.
