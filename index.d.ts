@@ -15,7 +15,8 @@ export type Provider =
   | "gemini"
   | "gemini-json"
   | "gemini-client"
-  | "openai-realtime";
+  | "openai-realtime"
+  | "outlines";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */
 export type JSONSchema = Record<string, any>;
@@ -107,6 +108,14 @@ export function toAnthropic(schema: JSONSchema, outputFormatPath?: boolean): Tra
  * `true` targets the permissive `responseJsonSchema` field.
  */
 export function toGemini(schema: JSONSchema, jsonPath?: boolean): TransformResult;
+
+/**
+ * Report what outlines-core will actually ENFORCE, rather than what a vendor
+ * will accept. The schema passes through unchanged apart from one lossless
+ * repair: a `pattern` whose top-level alternation would otherwise compile to a
+ * guide that accepts only malformed JSON.
+ */
+export function toOutlines(schema: JSONSchema): TransformResult;
 
 /** Infer a JSON Schema from a sample JSON value. */
 export function inferSchema(value: unknown): JSONSchema;
@@ -262,6 +271,19 @@ export const ANTHROPIC_TRANSFORM_SURFACES: Array<{
   transforms: boolean;
 }>;
 
+/**
+ * Keywords outlines-core compiles WITHOUT error and then does not enforce —
+ * the emitted regex is byte-identical to the one it emits without them.
+ * Measured against outlines-core 0.2.14.
+ */
+export const OUTLINES_DROPPED_KEYS: string[];
+
+/** Keywords `build_regex_from_schema` raises `ValueError` on. Loud, not silent. */
+export const OUTLINES_REJECTED_KEYS: string[];
+
+/** Positive control: keywords outlines-core genuinely does enforce. */
+export const OUTLINES_ENFORCED_KEYS: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -282,6 +304,10 @@ declare const api: {
   OPENAI_ANNOTATION_KEYWORDS_LIST: typeof OPENAI_ANNOTATION_KEYWORDS_LIST;
   OPENAI_STRICT_SURFACES: typeof OPENAI_STRICT_SURFACES;
   ANTHROPIC_TRANSFORM_SURFACES: typeof ANTHROPIC_TRANSFORM_SURFACES;
+  toOutlines: typeof toOutlines;
+  OUTLINES_DROPPED_KEYS: typeof OUTLINES_DROPPED_KEYS;
+  OUTLINES_REJECTED_KEYS: typeof OUTLINES_REJECTED_KEYS;
+  OUTLINES_ENFORCED_KEYS: typeof OUTLINES_ENFORCED_KEYS;
 };
 
 export default api;

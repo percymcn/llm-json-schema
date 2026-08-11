@@ -1717,5 +1717,53 @@ function fanout(depth) {
      "status=" + good.status);
 })();
 
+// --- #384 outlines target, end to end through the CLI ----------------------
+(function () {
+  var ALT = JSON.stringify({
+    type: "object",
+    properties: {
+      verb: { type: "string", pattern: "^GET|POST$" },
+      n: { type: "integer", minimum: 10, maximum: 100 }
+    },
+    required: ["verb", "n"], additionalProperties: false
+  });
+
+  var r = run(["--to", "outlines", "--check", "-"], ALT);
+  ok("#384 CLI: the alternation repair reaches the installed entry point",
+     r.status === 1 && r.stderr.indexOf("ONLY MALFORMED JSON") !== -1,
+     "status=" + r.status);
+
+  var out = run(["--to", "outlines", "-"], ALT);
+  ok("#384 CLI: the emitted pattern is the non-capturing form",
+     out.status === 0 && out.stdout.indexOf("(?:GET|POST)") !== -1);
+
+  // THE PAIR THAT MATTERS: the same file, two targets, opposite verdicts. Eight
+  // vendors accept this document; on outlines it compiles to a guide that emits
+  // only malformed JSON. If these ever agree, one of the two targets is wrong.
+  var oai = run(["--to", "openai", "--check", "-"], ALT);
+  ok("#384 CLI: openai and outlines genuinely disagree about the same file",
+     oai.status === 0 && r.status === 1,
+     "openai=" + oai.status + " outlines=" + r.status);
+
+  // An advisory must never fail the gate (#317's property), even though the
+  // constraint it names is silently unenforced.
+  var BOUNDS = JSON.stringify({
+    type: "object", properties: { n: { type: "integer", minimum: 10 } },
+    required: ["n"], additionalProperties: false
+  });
+  var b = run(["--to", "outlines", "--check", "-"], BOUNDS);
+  ok("#384 CLI: an unenforced-keyword note does not fail the gate",
+     b.status === 0 && b.stderr.indexOf("does NOT enforce") !== -1,
+     "status=" + b.status);
+
+  // Idempotence: re-checking our own output must be clean.
+  var again = run(["--to", "outlines", "--check", "-"], out.stdout);
+  ok("#384 CLI: converted output rechecks clean", again.status === 0,
+     "status=" + again.status);
+
+  ok("#384 CLI: outlines is listed as a provider in --help",
+     run(["--help"], "").stdout.indexOf("outlines") !== -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

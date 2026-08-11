@@ -113,6 +113,19 @@ const ZOD_OUTPUT = {
   for (const name of Object.keys(api)) {
     ok(".d.ts declares `" + name + "`", new RegExp("export (declare )?(function|const) " + name + "\\b").test(dts));
   }
+
+  // #384: the loop above checks the TYPE surface only, and that is not the same
+  // guard. `toOutlines` was declared in the .d.ts and missing from engine.mjs,
+  // so it typechecked cleanly and then threw
+  // `SyntaxError: does not provide an export named 'toOutlines'` at runtime —
+  // found from a consumer install, not here. A named export that TS promises
+  // and ESM does not deliver is the worse of the two failures, because the
+  // compiler says it is fine.
+  const mjs = readFileSync(join(here, "engine.mjs"), "utf8");
+  for (const name of Object.keys(api)) {
+    ok("engine.mjs re-exports `" + name + "`",
+      new RegExp("export const " + name + "\\b").test(mjs));
+  }
 })();
 
 ok("`gemini-client` is a documented provider over ESM",

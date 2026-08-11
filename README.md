@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1327 engine + 281 CLI + 44 ESM/library assertions = **1652** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1350 engine + 287 CLI + 71 ESM/library assertions = **1708** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -683,6 +683,75 @@ target and no edit is needed — run --help to see what selects each one.
 on every run rather than read from a table, so it cannot go stale when a
 framework changes which field it posts to.
 
+## Accepted is not enforced — `--to outlines`
+
+Every other target answers *"will the destination accept this document?"*.
+`--to outlines` answers the question you actually care about: **will the decoder
+enforce it?**
+
+[outlines-core](https://github.com/dottxt-ai/outlines-core) compiles a JSON
+Schema to a **regex** and drives generation from the resulting state machine, so
+a keyword it cannot express is not rejected — it silently stops constraining
+anything and the request succeeds. This is the default path, not an opt-in:
+`outlines` 1.3.3 sets `JSON_SCHEMA_DEFAULT_BACKEND = "outlines_core"`.
+
+Measured 2026-08-10 against outlines-core 0.2.14, by building the regex and
+asking whether a **violating** instance still matches it:
+
+| | Keywords |
+|---|---|
+| **Silently not enforced** | `minimum` `maximum` `exclusiveMinimum` `exclusiveMaximum` `multipleOf` `uniqueItems` `contains` `maxProperties` `propertyNames` `dependentRequired` |
+| **Refused outright** (loud — no guide is built) | `allOf` `not` `patternProperties` |
+| **Genuinely enforced** | `minLength` `maxLength` `minItems` `maxItems` `minProperties` `const` `enum` `format` `prefixItems` `oneOf` |
+
+The asymmetries are why this table is measured rather than reasoned:
+`minItems`/`maxItems` **are** enforced while `minimum`/`maximum` are not, and
+`minProperties` **is** enforced while `maxProperties` is not. "Length bounds
+work, so value bounds work" is exactly the inference the data refuses. For a
+`minimum`, the emitted regex is byte-identical to the one emitted with the
+keyword absent.
+
+### A `pattern` with a top-level `|` compiles to a guide that emits only malformed JSON
+
+This is the fatal one, and it is silent. The pattern is interpolated between the
+two quote characters **without a wrapping group**, so a top-level alternation
+binds across them:
+
+```
+pattern: "cat|dog"   →   ("cat|dog")   →   parses as  "cat   OR   dog"
+```
+
+Every **valid** JSON document is then rejected, and the four strings the guide
+does accept are all unparseable. It compiles with no error.
+
+The anchored spelling is **not** safer — outlines strips `^`/`$` as a pair
+first, so `^GET|POST$` becomes a bare alternation too. The careful author is hit
+exactly as hard as the careless one.
+
+The repair is lossless and the tool applies it: wrap in a non-capturing group,
+which leaves backreference numbering untouched where a bare `(...)` would not.
+
+```console
+$ llm-schema --to outlines --check schema.json      # pattern: "^GET|POST$"
+Not compliant with outlines (1 change):
+  ~ root.verb — Wrapped this `pattern`'s top-level alternation …
+This schema is already valid as-is for: openai, anthropic, gemini-json, …
+```
+
+Eight targets accept that document. Verified against outlines-core: the raw
+schema accepts **0 of 2** valid JSON documents, ours accepts **2 of 2**.
+
+A pattern anchored at **one end only** (`^S_`, `S_$`) is a blocker rather than a
+repair — the lone anchor survives into the regex, where it asserts a position
+already passed, so `Index` raises outright. Which anchor you meant is not
+derivable from the schema, so it is named instead of guessed.
+
+Two honest limits. This suite is dependency-free and cannot run Rust, so the
+tables pin a **measured snapshot** — re-measuring after a version bump is
+manual. And outlines matches `pattern` against the *whole* string where JSON
+Schema defines it as a search, so it is stricter than the spec there; anything
+it generates still satisfies your schema.
+
 ## Features
 - Accepts a **JSON Schema** or a **JSON example** (auto-detected → schema inferred).
 - Pick a target provider → get the corrected schema.
@@ -789,7 +858,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1652 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1708 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

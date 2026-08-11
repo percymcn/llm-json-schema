@@ -20,7 +20,7 @@ var E = require("./engine.js");
 
 var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json",
   "anthropic-json-python", "anthropic-go", "gemini", "gemini-json",
-  "gemini-client", "openai-realtime"];
+  "gemini-client", "openai-realtime", "outlines"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -42,6 +42,8 @@ var USAGE = [
   "  gemini-json        responseJsonSchema                    (full JSON Schema)",
   "  gemini-client      you hand JSON Schema to a library that converts it for you",
   "                     (google-adk etc.) — proto limits, JSON Schema spellings",
+  "  outlines           outlines / outlines-core constrained decoding, incl. self-hosted",
+  "                     (schema -> regex: asks what is ENFORCED, not what is accepted)",
   "",
   "If you never set `strict`, you are on openai-nonstrict — it is optional and off by",
   "default, and some clients omit it for you (Instructor does, on every OpenAI path).",

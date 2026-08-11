@@ -8298,5 +8298,143 @@ function fanoutSchema(depth, cyclic) {
     emptied(listOfDict).length === 1);
 })();
 
+// --- #384 outlines-core: a CONSUMER target (enforcement, not acceptance) ----
+//
+// Every fixture below is the VERBATIM shape measured against outlines-core
+// 0.2.14 on 2026-08-10 by building the regex and asking whether a violating
+// instance still matches. The suite is dependency-free and cannot run Rust, so
+// these pin a MEASURED SNAPSHOT rather than re-deriving it.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p || "outlines") || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function pat(sch) {
+    var r = conv(sch);
+    return (r.schema && r.schema.properties && r.schema.properties.v &&
+            r.schema.properties.v.pattern);
+  }
+  function strOf(p) {
+    return { type: "object", properties: { v: { type: "string", pattern: p } },
+             required: ["v"], additionalProperties: false };
+  }
+  // A converter that does not exist returns no schema, so every nested read here
+  // goes through a guard. Without it the reverted run ABORTS on the first
+  // assertion and hides how many of the rest actually depend on the change
+  // (#322's trap — the sixth cycle it has bitten).
+  function propOf(r, k) {
+    return (r && r.schema && r.schema.properties && r.schema.properties[k]) || {};
+  }
+  function blockers(r) {
+    return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; });
+  }
+  function advisories(r) {
+    return r.ledger.filter(function (l) { return l.advisory; });
+  }
+
+  // 1. THE FATAL CASE. `cat|dog` compiles to `("cat|dog")`, which parses as
+  //    `"cat` OR `dog"` — so the guide accepts ONLY malformed JSON. Repaired
+  //    losslessly with a non-capturing group; verified against outlines-core
+  //    that the repaired form accepts 2/2 valid documents where raw accepts 0/2.
+  ok("#384 outlines: top-level alternation is wrapped in (?:...)",
+    pat(strOf("cat|dog")) === "(?:cat|dog)");
+
+  // The reachability point, and the one that makes this worth a target: the
+  // ANCHORED spelling is hit exactly as hard, because outlines strips `^`/`$`
+  // as a pair FIRST and that is what creates the bare alternation.
+  ok("#384 outlines: the anchored spelling ^GET|POST$ is hit identically",
+    pat(strOf("^GET|POST$")) === "(?:GET|POST)");
+
+  // THE DISCRIMINATOR. Without this the rule could be firing on any `|` at all
+  // and every other assertion here would still pass.
+  ok("#384 outlines: an ALREADY-grouped alternation is left alone",
+    pat(strOf("(cat|dog)")) === "(cat|dog)");
+  ok("#384 outlines: `|` inside a character class is not top-level",
+    pat(strOf("[a|b]+")) === "[a|b]+");
+  ok("#384 outlines: an escaped \\| is not an alternation",
+    pat(strOf("a\\|b")) === "a\\|b");
+  ok("#384 outlines: a pattern with no alternation is untouched",
+    pat(strOf("^[a-z]+$")) === "^[a-z]+$");
+
+  // 2. HALF-ANCHORED. A real failure but a LOUD one (`Index` raises), and which
+  //    anchor was meant is not derivable — so it is named, not guessed (#329).
+  var half = conv(strOf("^S_"));
+  ok("#384 outlines: a leading-only anchor is a blocker",
+    blockers(half).length === 1 && has(half.ledger, "anchored at one end only"));
+  var halfTrail = conv(strOf("S_$"));
+  ok("#384 outlines: a trailing-only anchor is a blocker too",
+    blockers(halfTrail).length === 1);
+  // Over-block guards: both anchors, or neither, are correct and must be quiet.
+  ok("#384 outlines: ^S_$ (both anchors) is NOT a blocker",
+    blockers(conv(strOf("^S_$"))).length === 0);
+  ok("#384 outlines: an unanchored pattern is NOT a blocker",
+    blockers(conv(strOf("S_"))).length === 0);
+
+  // 3. SILENTLY DROPPED. Kept in the document (outlines ignores rather than
+  //    errors, so stripping would destroy a constraint that still holds
+  //    everywhere else — #314's error-policy rule) and reported as advisory.
+  var bounds = conv({
+    type: "object",
+    properties: { n: { type: "integer", minimum: 10, maximum: 100 } },
+    required: ["n"], additionalProperties: false
+  });
+  ok("#384 outlines: numeric bounds are KEPT, never stripped",
+    propOf(bounds, "n").minimum === 10 && propOf(bounds, "n").maximum === 100);
+  ok("#384 outlines: numeric bounds are reported as unenforced",
+    advisories(bounds).length === 2 && has(bounds.ledger, "does NOT enforce"));
+  ok("#384 outlines: an unenforced keyword never fails the gate",
+    blockers(bounds).length === 0);
+
+  // 4. THE CONTROL THAT STOPS THIS BEING READ AS "decoders ignore bounds".
+  //    `minItems`/`maxItems` and `minProperties` ARE enforced — measured — so a
+  //    schema carrying only those must be completely silent. Without this pair
+  //    the advisory could be firing on every bound and the rule would look right.
+  var enforced = conv({
+    type: "object",
+    properties: { xs: { type: "array", items: { type: "integer" }, minItems: 1, maxItems: 3 } },
+    required: ["xs"], additionalProperties: false
+  });
+  ok("#384 outlines: ENFORCED bounds draw no advisory (the asymmetry control)",
+    advisories(enforced).length === 0 && blockers(enforced).length === 0);
+
+  // 5. REFUSED OUTRIGHT — loud, so safer than the silent set.
+  ["allOf", "not", "patternProperties"].forEach(function (k) {
+    var sch = { type: "object", properties: { v: {} }, required: ["v"], additionalProperties: false };
+    sch.properties.v[k] = k === "allOf" ? [{ type: "string" }] :
+      (k === "not" ? { type: "string" } : { "^S_": { type: "string" } });
+    ok("#384 outlines: `" + k + "` is a blocker (build_regex raises)",
+      blockers(conv(sch)).length >= 1);
+  });
+
+  // 6. SCOPE PIN. The alternation rewrite is an outlines fact — no other target
+  //    may touch the pattern, or a later cycle will "generalise" it and start
+  //    editing schemas for vendors that handle alternation correctly.
+  ["openai", "anthropic", "gemini-json"].forEach(function (t) {
+    var r = conv(strOf("cat|dog"), t);
+    ok("#384 outlines: --to " + t + " leaves the pattern untouched",
+      propOf(r, "v").pattern === "cat|dog");
+  });
+
+  // 7. The exported tables, so the snapshot is re-diffable rather than trusted.
+  var DROPPED = E.OUTLINES_DROPPED_KEYS || [];
+  var REJECTED = E.OUTLINES_REJECTED_KEYS || [];
+  var ENFORCED = E.OUTLINES_ENFORCED_KEYS || [];
+  ok("#384 outlines: dropped table is the 10 measured keywords",
+    DROPPED.length === 10 &&
+    DROPPED.indexOf("minimum") !== -1 &&
+    DROPPED.indexOf("multipleOf") !== -1 &&
+    DROPPED.indexOf("dependentRequired") !== -1);
+  ok("#384 outlines: rejected table is the 3 that raise",
+    REJECTED.length === 3 && REJECTED.indexOf("patternProperties") !== -1);
+  // The three groups must be disjoint — an overlap would mean the same keyword
+  // is claimed both enforced and dropped, and the ledger would contradict itself.
+  ok("#384 outlines: the three measured groups are disjoint",
+    ENFORCED.length > 0 && ENFORCED.every(function (k) {
+      return DROPPED.indexOf(k) === -1 && REJECTED.indexOf(k) === -1;
+    }));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

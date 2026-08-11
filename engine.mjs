@@ -19,6 +19,7 @@ export const looksLikeSchema = api.looksLikeSchema;
 export const toOpenAI = api.toOpenAI;
 export const toAnthropic = api.toAnthropic;
 export const toGemini = api.toGemini;
+export const toOutlines = api.toOutlines;
 export const DOCS = api.DOCS;
 export const GEMINI_ALLOWED_KEYS = api.GEMINI_ALLOWED_KEYS;
 export const AI_SDK_GOOGLE_FORWARDED_KEYS = api.AI_SDK_GOOGLE_FORWARDED_KEYS;
@@ -30,6 +31,9 @@ export const GO_INVOPOP_MODELLED_KEYS = api.GO_INVOPOP_MODELLED_KEYS;
 export const OPENAI_ANNOTATION_KEYWORDS_LIST = api.OPENAI_ANNOTATION_KEYWORDS_LIST;
 export const OPENAI_STRICT_SURFACES = api.OPENAI_STRICT_SURFACES;
 export const ANTHROPIC_TRANSFORM_SURFACES = api.ANTHROPIC_TRANSFORM_SURFACES;
+export const OUTLINES_DROPPED_KEYS = api.OUTLINES_DROPPED_KEYS;
+export const OUTLINES_REJECTED_KEYS = api.OUTLINES_REJECTED_KEYS;
+export const OUTLINES_ENFORCED_KEYS = api.OUTLINES_ENFORCED_KEYS;
 
 export default api;
 export const REF_INLINE_MAX_NODES = api.REF_INLINE_MAX_NODES;

@@ -31,7 +31,8 @@
     "gemini-json": "https://ai.google.dev/gemini-api/docs/structured-output",
     "gemini-client": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
-    "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations"
+    "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations",
+    outlines: "https://github.com/dottxt-ai/outlines-core"
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -6108,6 +6109,160 @@
     return { schema: schema, ledger: ledger };
   }
 
+  // ---- outlines-core: a CONSUMER, not a vendor API -------------------------
+  //
+  // Every other target in this file answers "will the destination ACCEPT this
+  // document?". outlines-core answers the question a caller actually cares
+  // about: "will the decoder ENFORCE it?" It compiles a JSON Schema to a REGEX
+  // (`build_regex_from_schema`) and drives generation from the resulting FSM,
+  // so a keyword it cannot express is not rejected — it silently stops
+  // constraining anything, and the request succeeds.
+  //
+  // Reachability is the DEFAULT path, not an opt-in: `outlines` 1.3.3 sets
+  // JSON_SCHEMA_DEFAULT_BACKEND = "outlines_core" and calls this exact
+  // function (backends/outlines_core.py).
+  //
+  // MEASURED 2026-08-10 against outlines-core 0.2.14 by building the regex and
+  // asking whether a VIOLATING instance still matches it. That is a stronger
+  // oracle than any vendor probe in this file — exact, local, and about
+  // enforcement rather than acceptance — but it is still a SNAPSHOT: this
+  // suite is dependency-free and cannot run Rust, so re-measuring after a
+  // version bump is a manual step.
+  var OUTLINES_DROPPED = {
+    minimum: 1, maximum: 1, exclusiveMinimum: 1, exclusiveMaximum: 1,
+    multipleOf: 1, uniqueItems: 1, contains: 1, maxProperties: 1,
+    propertyNames: 1, dependentRequired: 1
+  };
+
+  // Keywords `build_regex_from_schema` REFUSES outright (ValueError). Loud, and
+  // therefore far less dangerous than the silent set above: the guide is never
+  // built, so nothing ships believing it is constrained.
+  var OUTLINES_REJECTED = { allOf: 1, not: 1, patternProperties: 1 };
+
+  // Kept as a positive control. The asymmetries are why this table is measured
+  // rather than reasoned: `minItems`/`maxItems` ARE enforced while
+  // `minimum`/`maximum` are not, and `minProperties` IS enforced while
+  // `maxProperties` is not. "Length bounds work, so value bounds work" is
+  // exactly the inference the data refuses.
+  var OUTLINES_ENFORCED = [
+    "minLength", "maxLength", "minItems", "maxItems", "minProperties",
+    "const", "enum", "format", "prefixItems", "oneOf"
+  ];
+
+  // A `|` that is NOT inside a group and NOT inside a character class.
+  //
+  // This is the fatal one. The pattern is interpolated between the two quote
+  // characters WITHOUT a wrapping group, so a top-level alternation binds
+  // across them: `cat|dog` becomes `("cat|dog")`, which parses as `"cat` OR
+  // `dog"`. Every VALID JSON document is then rejected and the only strings the
+  // guide accepts are unparseable. It compiles without error.
+  function outlinesTopLevelAlternation(p) {
+    if (typeof p !== "string") return false;
+    var depth = 0, inClass = false;
+    for (var i = 0; i < p.length; i++) {
+      var c = p.charAt(i);
+      if (c === "\\") { i++; continue; }
+      if (inClass) { if (c === "]") inClass = false; continue; }
+      if (c === "[") { inClass = true; continue; }
+      if (c === "(") { depth++; continue; }
+      if (c === ")") { if (depth > 0) depth--; continue; }
+      if (c === "|" && depth === 0) return true;
+    }
+    return false;
+  }
+
+  // outlines strips `^` and `$` as a PAIR. One without the other survives into
+  // the emitted regex, where it asserts a string position that has already been
+  // passed — so the regex matches nothing and `Index` raises outright.
+  function outlinesHalfAnchored(p) {
+    if (typeof p !== "string" || !p) return false;
+    var lead = p.charAt(0) === "^";
+    var trail = false;
+    if (p.charAt(p.length - 1) === "$") {
+      var n = 0, i = p.length - 2;
+      while (i >= 0 && p.charAt(i) === "\\") { n++; i--; }
+      trail = (n % 2 === 0);
+    }
+    return lead !== trail;
+  }
+
+  function toOutlines(schema) {
+    var tooDeepOut = tooDeepEntry(schema, DOCS.outlines);
+    if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
+    var s = clone(schema);
+    var ledger = [];
+    var url = DOCS.outlines;
+
+    walk(s, "root", function (node, path) {
+      // 1. The fatal case, and the only one that is both silent AND repairable.
+      //    Wrapping in a NON-capturing group is lossless — same language, and
+      //    `(?:...)` leaves any backreference numbering untouched, which a bare
+      //    `(...)` would not. Measured: `(?:cat|dog)` accepts `"cat"`/`"dog"`.
+      //
+      //    Note the anchored spelling is NOT safer: outlines strips `^`/`$` as a
+      //    pair first, so `^GET|POST$` becomes a bare alternation too. The
+      //    careful author is hit exactly as hard as the careless one.
+      if (typeof node.pattern === "string" && outlinesTopLevelAlternation(node.pattern)) {
+        var wrapped = "(?:" + node.pattern.replace(/^\^/, "").replace(/([^\\])\$$/, "$1") + ")";
+        setOwn(node, "pattern", wrapped);
+        ledger.push(entry("~", path,
+          "Wrapped this `pattern`'s top-level alternation in a non-capturing group. outlines " +
+          "interpolates the pattern between the two quote characters WITHOUT a group, so a " +
+          "top-level `|` binds across them: `cat|dog` compiles to `(\"cat|dog\")`, i.e. `\"cat` OR " +
+          "`dog\"`. The guide then accepts ONLY MALFORMED JSON — every valid document is rejected " +
+          "— and it compiles with no error, so nothing reports it. `(?:...)` is the same language.",
+          url));
+      }
+
+      // 2. Half-anchored: a real failure, but a LOUD one, and which anchor to
+      //    drop is a meaning decision rather than a mechanical one — so it is
+      //    named instead of guessed (#329's corollary).
+      if (typeof node.pattern === "string" && outlinesHalfAnchored(node.pattern)) {
+        ledger.push(entry("!", path,
+          "This `pattern` is anchored at one end only (`" + node.pattern + "`). outlines strips " +
+          "`^` and `$` as a PAIR; a lone anchor survives into the emitted regex, where it asserts " +
+          "a position already passed, so the regex matches nothing and building the guide raises " +
+          "`ValueError: The vocabulary provided is incompatible with the regex`. Anchor BOTH ends " +
+          "or NEITHER — which one you meant is not derivable from the schema. Note outlines " +
+          "matches `pattern` against the WHOLE string, so dropping the anchors does not widen it " +
+          "here (it is JSON Schema, where `pattern` is a search, that outlines is stricter than).",
+          url));
+      }
+
+      // 3. Refused outright. Loud — the guide is never built.
+      Object.keys(OUTLINES_REJECTED).forEach(function (k) {
+        if (!hasOwn(node, k)) return;
+        ledger.push(entry("!", path,
+          "outlines-core cannot compile `" + k + "` — `build_regex_from_schema` raises " +
+          "`ValueError: Unsupported JSON Schema structure`, so no guide is produced at all. " +
+          "This one is loud, which makes it much safer than the keywords it silently ignores.",
+          url));
+      });
+
+      // 4. The silent set. NEVER stripped: outlines ignores these rather than
+      //    erroring, so removing them would destroy a constraint that still
+      //    holds everywhere else the document is used, and buy nothing here
+      //    (#314's error-policy rule — ignore means keep-and-flag).
+      //
+      //    Advisory, never a gate failure: the pipeline works, the request
+      //    succeeds, and the document is valid. What is lost is enforcement.
+      Object.keys(OUTLINES_DROPPED).forEach(function (k) {
+        if (!hasOwn(node, k)) return;
+        ledger.push(entry("=", path,
+          "`" + k + "` is kept here but outlines-core does NOT enforce it: the compiled regex is " +
+          "byte-identical to the one it emits with the keyword absent, so the model is free to " +
+          "violate it and nothing errors. Validate this constraint yourself after generation. " +
+          "(Measured asymmetry worth knowing: `minItems`/`maxItems` and `minProperties` ARE " +
+          "enforced, so you cannot infer this keyword's fate from its neighbours.)",
+          url, true));
+      });
+    });
+
+    noteEmptiedDocument(schema, s, ledger, url,
+      "outlines-core takes standard JSON Schema, so nothing is stripped on this target.");
+    return { schema: s, ledger: ledger };
+  }
+
   var CONVERTERS = {
     openai: toOpenAI,
     // Anthropic is two request fields, two dialects, two targets — same shape
@@ -6151,7 +6306,11 @@
     // primary name is the CONDITION. `openai-realtime` stays as the surface where
     // that condition is forced rather than chosen (and so nobody's script breaks).
     "openai-nonstrict": function (s) { return toOpenAINonStrict(s, false); },
-    "openai-realtime": function (s) { return toOpenAINonStrict(s, true); }
+    "openai-realtime": function (s) { return toOpenAINonStrict(s, true); },
+    // The first CONSUMER target: not "will this be accepted?" but "will this be
+    // enforced?". A constrained decoder is the one destination where a keyword
+    // can be perfectly legal, perfectly accepted, and still do nothing.
+    outlines: toOutlines
   };
 
   // ---- public API ----------------------------------------------------------
@@ -6380,7 +6539,17 @@
     toOpenAI: toOpenAI,
     toAnthropic: toAnthropic,
     toGemini: toGemini,
+    toOutlines: toOutlines,
     DOCS: DOCS,
+
+    // Exported so the measured enforcement table is re-diffable against
+    // outlines-core rather than trusted (#361). Three groups, because the
+    // difference between them is the whole point: DROPPED is silent, REJECTED
+    // is loud, ENFORCED is the control that stops the table from being read as
+    // "constrained decoders ignore bounds" in general.
+    OUTLINES_DROPPED_KEYS: Object.keys(OUTLINES_DROPPED),
+    OUTLINES_REJECTED_KEYS: Object.keys(OUTLINES_REJECTED),
+    OUTLINES_ENFORCED_KEYS: OUTLINES_ENFORCED.slice(),
     // The narrow `responseSchema` subset, exported so it can be diffed against
     // the vendor artifact it is derived from. It is now confirmed by three
     // independent ones: the JS `Schema` interface (dist/genai.d.ts), the Python
