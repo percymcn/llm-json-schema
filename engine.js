@@ -2098,7 +2098,7 @@
     // `#/definitions/X` correctly and renaming would be an edit that buys
     // nothing (#314's error-policy rule).
     if (!isPlainObject(s.$defs) && !isPlainObject(s.definitions)) return s;
-    var fixed = 0, unresolved = [], blocked = 0, droppedNames = [];
+    var fixed = 0, unresolved = [], blocked = 0, droppedNames = [], pruned = [];
 
     function visit(node, stack, path) {
       if (Array.isArray(node)) {
@@ -2245,10 +2245,26 @@
       var found = localDefRefs(result, "$defs", result.$defs);
       if (!found.bailOut) {
         var kept = {};
+        var prunedNames = [];
         Object.keys(result.$defs).forEach(function (k) {
           if (hasOwn(found.names, k) && found.names[k]) setOwn(kept, k, result.$defs[k]);
+          else prunedNames.push(k);
         });
         if (Object.keys(kept).length) result.$defs = kept; else delete result.$defs;
+        // #394: SAY SO -- but BELOW the inline entries, not here. This deletion was
+        // silent, and #393's rule is that "no changes needed" is a claim about the
+        // BYTES: measured, `--check --to openai` printed "Already valid ... No
+        // changes needed." and exited 0 while `--to` on the SAME FILE emitted a
+        // document with the whole definition gone. The two halves of the CLI
+        // contradicted each other about one file -- #393's defect one rule over.
+        //
+        // The push is deferred because A LEDGER IS A SEQUENCE (#393). An inline is
+        // often WHAT MAKES a definition unreferenced, so reporting the prune first
+        // told the reader "nothing points at `T`" and only then, on the next line,
+        // that something HAD pointed at it and was inlined -- a message false of
+        // the document at the point it is read. Below the inline, it describes
+        // that inline's RESULT and is true as written.
+        pruned = prunedNames;
       }
     }
     if (fixed) {
@@ -2271,6 +2287,31 @@
         "meant " + (droppedNames.length > 1 ? "these" : "this") + " to be usable, declare " +
         (droppedNames.length > 1 ? "them" : "it") + " on the closed side too.",
         docUrl || DOCS.openai));
+    }
+    // ADVISORY, and that is the design rather than caution. The removal is
+    // meaning-preserving -- an orphan is BY DEFINITION unreferenced, and the pruner
+    // is sound (verified: a definition referenced only from INSIDE another
+    // definition is KEPT, and an unresolvable pointer makes it bail out and keep
+    // everything). The document was therefore already compliant, so making this a
+    // required change would fail CI on a schema every destination accepts -- the
+    // over-strictness bug this project has shipped ~10 times (#312/#314/#317/#322/
+    // #329/#337/#343/#344/#348/#365). What was wrong was never the exit code; it
+    // was the sentence "No changes needed" about a file we rewrite.
+    if (pruned.length) {
+      ledger.push(entry("x", "root",
+        "Removed " + pruned.length + " unreferenced definition" +
+        (pruned.length === 1 ? "" : "s") + " (`" + pruned.join("`, `") + "`) from `$defs` — " +
+        "nothing left in this document points at " + (pruned.length === 1 ? "it" : "them") +
+        ". This does NOT change what the schema accepts, which is why it is optional rather " +
+        "than a fix: a definition no `$ref` reaches constrains nothing. It is listed because " +
+        "the output you would commit no longer contains " +
+        (pruned.length === 1 ? "it" : "them") + ", and because an unreachable definition " +
+        "usually means the `$ref` that should have pointed at " +
+        (pruned.length === 1 ? "it" : "them") + " was never written. A MISSPELLED `$ref` is " +
+        "NOT this case: a pointer we cannot resolve makes us keep every definition rather " +
+        "than guess. Dropping " + (pruned.length === 1 ? "it" : "them") + " is a size " +
+        "optimisation only — it keeps the request smaller and costs the destination nothing.",
+        docUrl || DOCS.openai, true));
     }
     unresolved.forEach(function (name) {
       ledger.push(entry("!", "root",

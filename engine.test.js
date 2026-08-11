@@ -9782,5 +9782,145 @@ function fanoutSchema(depth, cyclic) {
   });
 })();
 
+
+// --- #394: the orphan-`$defs` pruner reports what it deletes -----------------
+//
+// Found by the NESTED form of #393's ledger-side sweep: for every key in the
+// input that is absent from the output, is it NAMED anywhere in the ledger --
+// asked at every depth rather than only at the root, and discounting keys whose
+// ANCESTOR's removal is reported (a `pattern` inside a removed `propertyNames`
+// is covered by that removal). 39 rows survived: `--check --to openai` printed
+// "Already valid ... No changes needed." and exited 0 while `--to` on the SAME
+// FILE emitted a document with a whole `$defs` definition deleted.
+//
+// The fix is a REPORT, not a behaviour change: the deletion is meaning-
+// preserving and the schema was already compliant, so the entry is ADVISORY and
+// the exit code stays 0. What was wrong was the sentence.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  // Key on the OP + advisory + a stable clause, never on the whole prose
+  // (#340/#339: keying a check on wording breaks the moment the wording
+  // improves, and the phrase must not collide with a neighbouring rule).
+  function prune(r) {
+    return r.ledger.filter(function (l) {
+      return l.op === "x" && l.advisory === true &&
+        String(l.msg || "").indexOf("unreferenced definition") !== -1;
+    });
+  }
+  function code(r) {
+    if (r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length) return 3;
+    if (r.ledger.filter(function (l) { return l.op !== "=" && !l.advisory; }).length) return 1;
+    return 0;
+  }
+  var PRUNES = ["openai", "anthropic-json", "anthropic-json-python", "anthropic-go"];
+  var DECODERS = ["outlines", "xgrammar", "lmformatenforcer"];
+
+  var ORPHAN = { type: "object", additionalProperties: false, required: ["a"],
+                 properties: { a: { type: "string" } },
+                 $defs: { Unused: { type: "object", properties: { z: { type: "integer" } } } } };
+
+  PRUNES.forEach(function (t) {
+    var r = conv(ORPHAN, t), p = prune(r);
+    ok("#394 " + t + ": an orphaned definition is reported, not deleted in silence",
+      p.length === 1 && String(p[0].msg).indexOf("`Unused`") !== -1);
+    // The whole point of the shape: it must NOT newly fail a gate that
+    // legitimately passed. A required change here would be the over-strictness
+    // bug this project has shipped ~10 times.
+    ok("#394 " + t + ": that report is advisory, so the gate still passes",
+      code(r) === 0);
+    ok("#394 " + t + ": the definition really is gone from the output",
+      !(r.schema && r.schema.$defs));
+  });
+
+  // THE DISCRIMINATOR (#365): the decoder targets skip the pruner entirely
+  // (#388 -- it buys a decoder nothing and fails open on an un-normalised ref
+  // spelling), so they must KEEP the definition and draw NO entry. Without this
+  // pin the rule could be firing on every target and every assertion above
+  // would still pass.
+  DECODERS.forEach(function (t) {
+    var r = conv(ORPHAN, t);
+    ok("#394 " + t + ": does not acquire the prune entry",
+      prune(r).length === 0);
+    ok("#394 " + t + ": and keeps the definition, because it never prunes",
+      !!(r.schema && r.schema.$defs && r.schema.$defs.Unused));
+  });
+
+  // OVER-BLOCK GUARD 1: a definition referenced ONLY from inside another
+  // definition is live. Reporting it would mean the pruner had deleted it,
+  // which is the dangling-ref class of #320/#342.
+  (function () {
+    var doc = { type: "object", additionalProperties: false, required: ["a"],
+                properties: { a: { $ref: "#/$defs/A" } },
+                $defs: { A: { type: "object", additionalProperties: false, required: ["b"],
+                              properties: { b: { $ref: "#/$defs/B" } } },
+                         B: { type: "string", minLength: 3 } } };
+    PRUNES.forEach(function (t) {
+      var r = conv(doc, t);
+      ok("#394 " + t + ": a transitively-referenced definition is neither pruned nor reported",
+        prune(r).length === 0 && !!(r.schema && r.schema.$defs && r.schema.$defs.B));
+    });
+  })();
+
+  // OVER-BLOCK GUARD 2: an unresolvable pointer makes the pruner bail out and
+  // keep EVERYTHING (#320's fail-closed rule). Nothing was deleted, so nothing
+  // may be reported -- otherwise the message would name a deletion that never
+  // happened, which is the "false of the input" class of #391/#393.
+  (function () {
+    var doc = { type: "object", additionalProperties: false, required: ["a"],
+                properties: { a: { $ref: "#/$defs/Bee" } },
+                $defs: { B: { type: "string" } } };
+    var r = conv(doc, "openai");
+    ok("#394 an unresolvable pointer keeps every definition and reports no prune",
+      prune(r).length === 0 && !!(r.schema && r.schema.$defs && r.schema.$defs.B));
+  })();
+
+  // OVER-BLOCK GUARD 3: ordinary documents stay silent.
+  (function () {
+    var plain = { type: "object", additionalProperties: false, required: ["a"],
+                  properties: { a: { type: "string" } } };
+    PRUNES.forEach(function (t) {
+      ok("#394 " + t + ": a schema with no `$defs` draws no prune entry",
+        prune(conv(plain, t)).length === 0);
+    });
+    var used = { type: "object", additionalProperties: false, required: ["a"],
+                 properties: { a: { $ref: "#/$defs/T" } },
+                 $defs: { T: { type: "string" } } };
+    ok("#394 a definition that IS referenced draws no prune entry",
+      prune(conv(used, "openai")).length === 0);
+  })();
+
+  // A LEDGER IS A SEQUENCE (#393). An inline is often WHAT MAKES a definition
+  // unreferenced, so the prune line must come AFTER it -- reported first, it
+  // told the reader "nothing points at `T`" and only then, on the next line,
+  // that something had pointed at it and was inlined. That was a real bug in
+  // this cycle's own first patch, caught by reading the emitted order.
+  (function () {
+    var doc = { $ref: "#/$defs/T", properties: { a: { type: "string" } }, required: ["a"],
+                $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } } };
+    var r = conv(doc, "anthropic-json-python");
+    var iInline = -1, iPrune = -1;
+    r.ledger.forEach(function (l, i) {
+      if (String(l.msg || "").indexOf("that carried sibling keywords") !== -1) iInline = i;
+      if (String(l.msg || "").indexOf("unreferenced definition") !== -1) iPrune = i;
+    });
+    ok("#394 the prune line follows the inline that caused it",
+      iInline !== -1 && iPrune !== -1 && iPrune > iInline);
+  })();
+
+  // #315: a shared helper must not hardcode one provider's wording. The first
+  // draft of this message ended "...still count against OpenAI's 5000-property
+  // budget" and fired on the Anthropic path -- caught by the existing
+  // "anthropic ledger never cites OpenAI" assertion, one cycle after the
+  // codebase recorded that exact lesson.
+  (function () {
+    var p = prune(conv(ORPHAN, "anthropic-go"));
+    ok("#394 the prune message names no other provider",
+      p.length === 1 && String(p[0].msg).indexOf("OpenAI") === -1);
+  })();
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

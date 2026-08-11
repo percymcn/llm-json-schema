@@ -2067,5 +2067,57 @@ function fanout(depth) {
     run(["--to", "xgrammar", "--check", "-"], V1).stderr.indexOf("Rewrote `allOf") === -1);
 })();
 
+
+// --- #394: `--check` no longer claims "No changes needed" about a file we edit
+//
+// The defect end-to-end: `--check --to openai` printed "Already valid for
+// openai. No changes needed." and exited 0, while `--to openai` on the SAME
+// FILE emitted a document with the whole `$defs.Unused` definition deleted.
+// The two halves of the CLI contradicted each other about one file (#393's
+// shape, one rule over). Asserted at the CLI surface because the false sentence
+// IS the CLI's output -- the engine-level entry alone would not have caught it.
+(function () {
+  var ORPHAN = JSON.stringify({
+    type: "object", additionalProperties: false, required: ["a"],
+    properties: { a: { type: "string" } },
+    $defs: { Unused: { type: "object", properties: { z: { type: "integer" } } } }
+  });
+
+  ["openai", "anthropic-json", "anthropic-go"].forEach(function (t) {
+    var c = run(["--to", t, "--check"], ORPHAN);
+    var err = String(c.stderr || "");
+    ok("#394 cli " + t + ": stops claiming \"No changes needed\" about a file it rewrites",
+      err.indexOf("No changes needed") === -1, err.slice(0, 160));
+    ok("#394 cli " + t + ": names the definition it removed",
+      err.indexOf("unreferenced definition") !== -1 && err.indexOf("`Unused`") !== -1,
+      err.slice(0, 160));
+    // The advisory must be labelled "optional", never "needs a human fix" --
+    // #317's rule: a passing build must not send people hunting for nothing.
+    ok("#394 cli " + t + ": the line is labelled optional",
+      err.indexOf("[optional]") !== -1, err.slice(0, 160));
+    // And it must NOT newly fail a gate that legitimately passed.
+    ok("#394 cli " + t + ": --check still exits 0 (the schema was always compliant)",
+      c.status === 0, "status=" + c.status);
+  });
+
+  // THE DISCRIMINATOR (#365): a decoder target skips the pruner, so it keeps
+  // the definition AND still says "No changes needed" -- the same file, two
+  // targets, genuinely different answers. Without this the rule could be
+  // firing everywhere and every assertion above would still pass.
+  var d = run(["--to", "outlines", "--check"], ORPHAN);
+  ok("#394 cli outlines: still reports no changes, because it never prunes",
+    String(d.stderr || "").indexOf("No changes needed") !== -1 && d.status === 0);
+  var kept = run(["--to", "outlines"], ORPHAN);
+  ok("#394 cli outlines: and the definition survives conversion",
+    String(kept.stdout || "").indexOf("Unused") !== -1);
+
+  // An ordinary schema is untouched and silent.
+  var plain = run(["--to", "openai", "--check"],
+    JSON.stringify({ type: "object", additionalProperties: false, required: ["a"],
+                     properties: { a: { type: "string" } } }));
+  ok("#394 cli a schema with no `$defs` still reports no changes",
+    String(plain.stderr || "").indexOf("No changes needed") !== -1 && plain.status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

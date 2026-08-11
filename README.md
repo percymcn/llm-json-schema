@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1657 engine + 366 CLI + 83 ESM/library assertions = **2106** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1687 engine + 381 CLI + 83 ESM/library assertions = **2151** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1017,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2106 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2151 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1963,6 +1963,35 @@ reader told a constraint merely stops applying will ship a request that cannot
 be built. It is a blocker on those three now, and the two Anthropic targets keep
 the advisory, because both helpers really do accept a dangling ref and forward
 it verbatim.
+
+
+## The deletion nobody announced
+
+`--check --to openai` on this file printed **"Already valid for openai. No changes needed."** and exited **0**:
+
+```json
+{"type":"object","additionalProperties":false,"required":["a"],
+ "properties":{"a":{"type":"string"}},
+ "$defs":{"Unused":{"type":"object","properties":{"z":{"type":"integer"}}}}}
+```
+
+`--to openai` on the *same file* emitted a document with the whole `Unused` definition gone. The two halves of the CLI disagreed about one file — the same defect as the one below it, one rule over.
+
+The cause is the orphan-`$defs` pruner: it drops definitions nothing points at, and it had never said so. Found by the **nested** form of a ledger-side sweep — for every key in the input that is absent from the output, is it *named* anywhere in the ledger? — asked at every depth rather than only at the root, and discounting keys whose **ancestor's** removal is reported (a `pattern` inside a removed `propertyNames` is already covered by that removal). Across 774 captured inputs × 13 targets, **39 rows** deleted content at exit 0 with nothing on the record.
+
+What shipped is a **report, not a behaviour change**, and the severity is stated at its true strength:
+
+| | |
+|---|---|
+| Does the accept set change? | **No.** An orphan is by definition unreferenced, so a definition no `$ref` reaches constrains nothing. |
+| Is the pruner sound? | **Yes**, verified: a definition referenced only from *inside* another definition is kept, and an unresolvable pointer makes it bail out and keep everything (fail closed). |
+| Then why report it? | Because "no changes needed" is a claim about the **bytes**, and the bytes changed. The output you commit no longer contains the definition. |
+| Does `--check` now fail? | **No — exit stays 0.** The schema was always compliant; making this a required change would fail CI on a document every destination accepts. The entry is advisory and prints as an *optional suggestion*. |
+
+Two details that are load-bearing rather than cosmetic:
+
+- **The decoder targets are untouched.** `--to outlines`, `--to xgrammar` and `--to lmformatenforcer` skip the pruner entirely — it buys a decoder nothing, and it fails open on a reference spelling those paths never normalise — so they keep the definition *and* still report no changes. Same file, two targets, genuinely different answers.
+- **The line comes after the inline that caused it.** A ledger is a sequence, and an inline is often *what makes* a definition unreferenced. Reported first, the message told the reader "nothing points at `T`" and only then, on the next line, that something had pointed at it and was inlined. That was a real bug in this change's own first draft.
 
 ## License
 MIT.
