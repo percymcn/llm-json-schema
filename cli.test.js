@@ -1908,5 +1908,41 @@ function fanout(depth) {
 })();
 
 
+
+// --- #388: a constraining `$ref` sibling is silently unenforced by every
+//     constrained decoder, so the gate must stop passing it -----------------
+(function () {
+  var REF_SIB = JSON.stringify({
+    $defs: { S: { type: "string" } },
+    type: "object", additionalProperties: false, required: ["s"],
+    properties: { s: { $ref: "#/$defs/S", minLength: 3 } }
+  });
+  // Annotation-only: nothing is lost on a decoder, so the gate must stay quiet.
+  var ANNOT = JSON.stringify({
+    $defs: { S: { type: "string" } },
+    type: "object", additionalProperties: false, required: ["s"],
+    properties: { s: { $ref: "#/$defs/S", description: "d" } }
+  });
+
+  ["outlines", "xgrammar", "lmformatenforcer"].forEach(function (p) {
+    var r = run(["--check", "--to", p], REF_SIB);
+    ok("cli #388: " + p + " no longer passes a constraining `$ref` sibling",
+      r.status === 1);
+    ok("cli #388: " + p + " leaves an annotation-only `$ref` sibling at exit 0",
+      run(["--check", "--to", p], ANNOT).status === 0);
+    // The emitted document must be the form the engine actually enforces.
+    var out = JSON.parse(run(["--to", p], REF_SIB).stdout);
+    ok("cli #388: " + p + " emits the merged form (`type` kept, `$ref` gone)",
+      out.properties.s.type === "string" &&
+      out.properties.s.minLength === 3 &&
+      out.properties.s.$ref === undefined);
+  });
+
+  var msg = run(["--check", "--to", "xgrammar"], REF_SIB).stderr || "";
+  ok("cli #388: the diagnosis names the measured behaviour",
+    msg.indexOf("IGNORES the sibling") !== -1);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -8901,5 +8901,160 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+
+// ===========================================================================
+// #388 — a `$ref` sibling is a constraint the decoder never sees
+//
+// #371 established that a `$ref` beside constraining siblings is an
+// INTERSECTION (draft 2020-12 applies the referent AND the siblings) and wired
+// `intersectRef()` to the three JSON-Schema-dialect targets. The three DECODER
+// targets were added AFTER it (#384/#385/#386) and never got the merge, so the
+// sibling was handed to the decoder as written.
+//
+// MEASURED, all three engines, with a control that discriminates:
+//   xgrammar 0.2.4 / outlines-core 0.2.14 / lm-format-enforcer 0.11.3
+//   {$ref: S, minLength: 3}      -> ALL THREE accept "a"   (constraint GONE)
+//   {type: string, minLength: 3} -> ALL THREE reject "a"   (constraint HELD)
+// The control is what proves the `$ref` is the cause rather than the keyword.
+// Round trip from the installed binary: 15 rows FIXED, 0 REGRESSED across
+// 5 shapes x 3 engines, every legal instance still generatable.
+// ===========================================================================
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  function propOf(r, name) {
+    var s = r && r.schema;
+    if (!s || !s.properties || !s.properties[name]) return {};
+    return s.properties[name];
+  }
+  var DEC = ["outlines", "xgrammar", "lmformatenforcer"];
+
+  function doc(node, bag) {
+    var d = {};
+    d[bag || "$defs"] = { S: { type: "string" } };
+    d.type = "object";
+    d.properties = { s: node };
+    d.required = ["s"];
+    d.additionalProperties = false;
+    return d;
+  }
+
+  // --- THE DISCRIMINATOR ---------------------------------------------------
+  // The merge must happen on the decoder targets AND the result must be the
+  // form the engines actually enforce: `type` present, `$ref` gone, constraint
+  // kept. Without this the rule could be doing anything at all.
+  DEC.forEach(function (p) {
+    var s = propOf(conv(doc({ $ref: "#/$defs/S", minLength: 3 }), p), "s");
+    ok("#388 " + p + ": merges a constraining `$ref` sibling into the node",
+      s.type === "string" && s.minLength === 3 && s.$ref === undefined);
+  });
+
+  // Alternate spelling of the BAG. `definitions` is `zod-to-json-schema`'s
+  // default, and all three decoders resolve `#/definitions/X` correctly — so
+  // the merge must fire AND the bag must NOT be renamed (renaming would be an
+  // edit that buys nothing).
+  DEC.forEach(function (p) {
+    var r = conv(doc({ $ref: "#/definitions/S", minLength: 3 }, "definitions"), p);
+    var s = propOf(r, "s");
+    ok("#388 " + p + ": merges under the `definitions` spelling too",
+      s.type === "string" && s.minLength === 3 && s.$ref === undefined);
+    ok("#388 " + p + ": does NOT rename the `definitions` bag",
+      r.schema.definitions !== undefined && r.schema.$defs === undefined);
+  });
+
+  // Alternate spelling of the WRAPPER: `allOf:[{$ref}]` is the same meaning
+  // (the OpenAPI "extend this base" idiom) and is broken IDENTICALLY in all
+  // three engines. Shipping one spelling and not the other is the failure this
+  // project keeps recording.
+  DEC.forEach(function (p) {
+    var s = propOf(conv(doc({ allOf: [{ $ref: "#/$defs/S" }], minLength: 3 }), p), "s");
+    ok("#388 " + p + ": merges the `allOf:[{$ref}]` spelling of the same shape",
+      s.type === "string" && s.minLength === 3 && s.allOf === undefined);
+  });
+
+  // --- OVER-BLOCK GUARDS: these hold BOTH ways and are load-bearing --------
+  // A pure ANNOTATION beside a `$ref` loses nothing on a decoder (annotations
+  // never constrain anywhere), so merging would expand the document and delete
+  // the bag for no benefit — the over-edit #363 caught and reverted on the
+  // OpenAI path.
+  DEC.forEach(function (p) {
+    var s = propOf(conv(doc({ $ref: "#/$defs/S", description: "d" }), p), "s");
+    ok("#388 " + p + ": leaves an ANNOTATION-only `$ref` sibling alone",
+      s.$ref === "#/$defs/S" && s.description === "d" && s.type === undefined);
+  });
+  DEC.forEach(function (p) {
+    var s = propOf(conv(doc({ title: "T", description: "d", allOf: [{ $ref: "#/$defs/S" }] }), p), "s");
+    ok("#388 " + p + ": leaves pydantic v1's annotation-only `allOf` wrapper alone",
+      Array.isArray(s.allOf) && s.$ref === undefined);
+  });
+
+  // The canonical root `zod-to-json-schema` emits. The sibling filter names
+  // BOTH bags for exactly this reason: counting `definitions` as a constraining
+  // sibling would merge the whole definition map into the referent.
+  DEC.forEach(function (p) {
+    var zodRoot = {
+      $ref: "#/definitions/T",
+      definitions: { T: { type: "object", properties: { t: { type: "string" } }, required: ["t"], additionalProperties: false } },
+      $schema: "http://json-schema.org/draft-07/schema#"
+    };
+    var out = conv(zodRoot, p).schema;
+    ok("#388 " + p + ": leaves zod's canonical `{$ref, definitions, $schema}` root untouched",
+      out.$ref === "#/definitions/T" && out.definitions !== undefined);
+  });
+
+  // THE DANGLING-POINTER GUARD, and it is not hypothetical: wiring the merge in
+  // also brought its orphan `$defs` pruner along, and the decoder path does not
+  // run `normalizeRefSpelling`, so `localDefRefs` read #320's `/$defs/P`
+  // spelling as "not a local reference" and DELETED the definition it points
+  // at. The bag must survive (#320/#342 fail-closed).
+  DEC.forEach(function (p) {
+    var unnormalised = {
+      $ref: "/$defs/P",
+      $defs: { P: { type: "object", properties: { x: { type: "string" } }, required: ["x"] } }
+    };
+    var out = conv(unnormalised, p).schema;
+    ok("#388 " + p + ": keeps a `$defs` bag an unnormalised `/$defs/` ref points at",
+      out.$defs !== undefined && out.$defs.P !== undefined);
+  });
+
+  // --- SCOPE: the decoder targets now AGREE with the target that already
+  //     merged. Without this the three could be merging to some other shape.
+  (function () {
+    var d = doc({ $ref: "#/$defs/S", minLength: 3 });
+    var oa = propOf(conv(d, "openai"), "s");
+    DEC.forEach(function (p) {
+      var s = propOf(conv(d, p), "s");
+      ok("#388 " + p + ": merged shape agrees with `--to openai` (#371's merge)",
+        s.type === oa.type && s.minLength === oa.minLength);
+    });
+  })();
+
+  // A genuinely UNSATISFIABLE intersection stays a blocker. Deliberate: the
+  // decoder does not throw, but no instance can satisfy both sides, so there is
+  // no valid document being rejected — #370's reasoning, which does not depend
+  // on the vendor.
+  DEC.forEach(function (p) {
+    var unsat = {
+      $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"], additionalProperties: false } },
+      type: "object",
+      properties: { p: { $ref: "#/$defs/T", properties: { a: { type: "string" } }, required: ["a"] } },
+      required: ["p"], additionalProperties: false
+    };
+    ok("#388 " + p + ": an unsatisfiable `$ref` intersection is still blocked",
+      blockers(conv(unsat, p)).length > 0);
+  });
+
+  // --- idempotent ----------------------------------------------------------
+  DEC.forEach(function (p) {
+    var once = conv(doc({ $ref: "#/$defs/S", minLength: 3 }), p).schema;
+    var twice = conv(once, p).schema;
+    ok("#388 " + p + ": the merge is idempotent",
+      JSON.stringify(once) === JSON.stringify(twice));
+  });
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

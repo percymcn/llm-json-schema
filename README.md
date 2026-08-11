@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1438 engine + 313 CLI + 83 ESM/library assertions = **1834** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1471 engine + 323 CLI + 83 ESM/library assertions = **1877** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -683,6 +683,50 @@ target and no edit is needed — run --help to see what selects each one.
 on every run rather than read from a table, so it cannot go stale when a
 framework changes which field it posts to.
 
+## A `$ref` sibling is a constraint the decoder never sees
+
+Draft 2020-12 applies a `$ref`'s referent **and** its siblings — a `$ref` beside
+`minLength` is an *intersection*, not a decoration. Every constrained decoder
+resolves the pointer and then ignores the sibling.
+
+Measured on xgrammar 0.2.4, outlines-core 0.2.14 and lm-format-enforcer 0.11.3,
+with the control that isolates the cause:
+
+| node | violating instance | xgrammar | outlines | lm-format-enforcer |
+|---|---|---|---|---|
+| `{"$ref": "#/$defs/S", "minLength": 3}` | `"a"` | accepted | accepted | accepted |
+| `{"$ref": …, "pattern": "^A.*$"}` | `"zzz"` | accepted | accepted | accepted |
+| `{"$ref": …, "maxLength": 2}` | `"abcd"` | accepted | accepted | accepted |
+| **control** `{"type": "string", "minLength": 3}` | `"a"` | **rejected** | **rejected** | **rejected** |
+
+The control is the whole argument: the same constraint written *without* the
+`$ref` is enforced by all three, so the pointer is the cause rather than the
+keyword. Nothing throws — the request succeeds and the field is simply no longer
+constrained, which is the failure mode a constrained decoder exists to prevent.
+
+So on `--to outlines`, `--to xgrammar` and `--to lmformatenforcer` the sibling is
+merged into the node, which is what the schema already meant. This is the same
+merge the JSON-Schema-dialect targets have used since the `$ref`-intersection
+work; these three were added afterwards and never received it.
+
+Three details are deliberate:
+
+- **Both spellings of the wrapper.** `{"allOf": [{"$ref": …}], "minLength": 3}`
+  — the OpenAPI *"extend this base"* idiom — means the same thing and is broken
+  identically in all three engines, so a single bare `$ref` member is lifted onto
+  the node and the one merge handles both.
+- **Both spellings of the bag.** `definitions` is `zod-to-json-schema`'s default.
+  All three decoders resolve `#/definitions/X` correctly, so the bag is **not**
+  renamed — that would be an edit that buys nothing.
+- **Annotations are left alone.** `{"$ref": …, "description": "…"}` loses nothing
+  on a decoder, so merging it would expand the document for no benefit. Only a
+  sibling that actually *constrains* triggers the merge.
+
+Where no lossless merge exists — a closed referent that forbids a name the
+siblings require, or one property declared with two different shapes — the tool
+blocks and names the remodelling rather than picking a side, because either
+choice silently changes which documents are accepted.
+
 ## One decoder's table does not transfer — `--to xgrammar`
 
 `--to outlines` above establishes the enforcement question. `--to xgrammar`
@@ -926,7 +970,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1834 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1877 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

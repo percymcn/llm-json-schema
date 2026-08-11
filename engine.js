@@ -1939,9 +1939,25 @@
     return { schema: out, dropped: dropped };
   }
 
-  function resolveRefSiblings(s, ledger, docUrl, whyFixed, whyRecursive, blockedOut) {
-    if (!isPlainObject(s.$defs)) return s;
-    var defs = s.$defs, fixed = 0, unresolved = [], blocked = 0, droppedNames = [];
+  // `onlyConstraining` exists because the two callers ask genuinely different
+  // questions, and collapsing them would be wrong in one direction or the other.
+  // For the JSON-Schema-dialect targets ANY non-tolerated sibling is a vendor
+  // THROW, so every one of them must be merged. For a constrained decoder
+  // nothing throws — the only thing at stake is whether a CONSTRAINT is silently
+  // dropped — so merging for a pure annotation would expand the document (and
+  // delete the definition bag) to buy exactly nothing, which is the over-edit
+  // #363 caught and reverted on the OpenAI path.
+  function resolveRefSiblings(s, ledger, docUrl, whyFixed, whyRecursive, blockedOut, onlyConstraining) {
+    // Either spelling of the bag. `defBagRef` below already resolves both, so
+    // this guard was the ONLY thing keeping the `definitions` form out — and
+    // that form is `zod-to-json-schema`'s default, i.e. the commonest one there
+    // is. The three JSON-Schema-dialect targets run `normalizeDefs` first so
+    // they always arrive with `$defs` and are unaffected; the decoder targets
+    // deliberately do NOT rename the bag, because all three decoders resolve
+    // `#/definitions/X` correctly and renaming would be an edit that buys
+    // nothing (#314's error-policy rule).
+    if (!isPlainObject(s.$defs) && !isPlainObject(s.definitions)) return s;
+    var fixed = 0, unresolved = [], blocked = 0, droppedNames = [];
 
     function visit(node, stack, path) {
       if (Array.isArray(node)) {
@@ -1955,8 +1971,19 @@
       // here would force an inline even where the vendor resolves the pointer
       // correctly. Every other target inlines a root `$ref` earlier anyway, so
       // this only changes the one path that deliberately does not.
+      // BOTH spellings of the bag, for the same reason: `{$ref, definitions}` is
+      // the canonical root shape `zod-to-json-schema` emits, and counting the bag
+      // as a constraining sibling would merge the whole definition map into the
+      // referent. Naming only `$defs` here was safe only while this function was
+      // unreachable for a `definitions`-bag document.
+      var atRoot = node === s;
       var siblings = Object.keys(node).filter(function (k) {
-        return k !== "$ref" && k !== "$defs";
+        if (k === "$ref" || k === "$defs" || k === "definitions") return false;
+        // Decoder targets: skip pure annotations. `toleratedRefSibling` is the
+        // vendor's own predicate (#363) — reused rather than re-listed, since a
+        // second annotation table is how the two drift.
+        if (onlyConstraining && toleratedRefSibling(k, atRoot, node)) return false;
+        return true;
       });
       // Same replacement as `rootRefResolvesInDefs`: one resolver, so a pointer
       // this function agrees to merge is exactly one `resolvesLocally` agrees
@@ -2031,7 +2058,18 @@
     // prune nothing — the pruner is only a size optimisation (dead `$defs`
     // count against OpenAI's 5000-property budget), so skipping it is free
     // while a wrong deletion is not.
-    if (isPlainObject(result.$defs)) {
+    // NOT on the decoder path, and the reason is measured rather than tidy.
+    // The pruner exists to save OpenAI's 5000-property budget — a decoder has no
+    // such budget, so it buys nothing there. It also FAILS OPEN for a ref
+    // spelling the decoder path never normalises: `normalizeRefSpelling` runs
+    // before this on the three JSON-Schema-dialect targets, so by the time the
+    // pruner sees a pointer it is always `#/...`; the decoder targets do not run
+    // it, and `localDefRefs` reads #320's `/$defs/P` spelling as "not a local
+    // reference" and deletes the definition it points at. Measured: `{$ref:
+    // "/$defs/P", $defs:{P}}` came out as a bare `{$ref:"/$defs/P"}` with the
+    // bag gone — a dangling pointer in output that was intact on input, which is
+    // exactly the class #320 and #342 were about.
+    if (!onlyConstraining && isPlainObject(result.$defs)) {
       // Same helper as the root inliner (#372: one rule, one implementation --
       // these two drifted apart once already and the root copy deleted a live
       // definition). `bailOut` = an unattributable local pointer, so prune
@@ -6310,12 +6348,69 @@
       url));
   }
 
+  // `{allOf:[{$ref}], minLength}` is the SAME MEANING as `{$ref, minLength}` —
+  // the OpenAPI "extend this base" spelling — and it is broken IDENTICALLY in all
+  // three decoders (measured: the sibling is ignored either way). Shipping the
+  // repair for one spelling and not the other is the failure this project keeps
+  // recording, so lift a single BARE `$ref` member up to the node and let the one
+  // existing merge handle both.
+  //
+  // Deliberately narrow, and each condition is load-bearing:
+  //   * exactly one member, and that member is a bare `$ref` (no other keys) —
+  //     anything else is a real composition and lifting it would change meaning;
+  //   * the node must not already carry a `$ref`, or the lift would overwrite it;
+  //   * at least one sibling must actually CONSTRAIN, so pydantic v1's
+  //     `{title, description, allOf:[{$ref}]}` — annotations only — is left
+  //     byte-identical rather than rewritten for no benefit.
+  function liftBareAllOfRef(s) {
+    function visit(node, atRoot) {
+      if (Array.isArray(node)) return node.forEach(function (n) { visit(n, false); });
+      if (!isPlainObject(node)) return;
+      if (Array.isArray(node.allOf) && node.allOf.length === 1 &&
+          isPlainObject(node.allOf[0]) &&
+          typeof node.allOf[0].$ref === "string" &&
+          Object.keys(node.allOf[0]).length === 1 &&
+          typeof node.$ref !== "string") {
+        var constrains = Object.keys(node).some(function (k) {
+          return k !== "allOf" && !toleratedRefSibling(k, atRoot, node);
+        });
+        if (constrains) {
+          setOwn(node, "$ref", node.allOf[0].$ref);
+          delete node.allOf;
+        }
+      }
+      Object.keys(node).forEach(function (k) { visit(node[k], false); });
+    }
+    visit(s, true);
+    return s;
+  }
+
+  // One string, three targets: this is a single measured fact about the whole
+  // class, and writing it out three times is how the three copies drift.
+  var DECODER_REF_SIBLING_WHY =
+    "a constrained decoder resolves the pointer and then IGNORES the sibling. Measured on " +
+    "xgrammar 0.2.4, outlines-core 0.2.14 and lm-format-enforcer 0.11.3: with `minLength`, " +
+    "`maxLength` or `pattern` beside a `$ref`, ALL THREE accept a violating value, while the " +
+    "SAME constraint written without the `$ref` is enforced by all three. Draft 2020-12 applies " +
+    "the referent AND the siblings, so merging them is exactly what the schema already meant — " +
+    "and the merged form is enforced by all three, with every legal value still generatable";
+  var DECODER_REF_SIBLING_RECURSIVE = "a constrained decoder drops the sibling silently";
+
   function toOutlines(schema) {
     var tooDeepOut = tooDeepEntry(schema, DOCS.outlines);
     if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
     var s = clone(schema);
     var ledger = [];
     var url = DOCS.outlines;
+
+    // Before the walk, and the bag is deliberately NOT renamed: all three
+    // decoders resolve `#/definitions/X` correctly, so a rename would be an edit
+    // that buys nothing. This is #371's merge, which has been wired to the three
+    // JSON-Schema-dialect targets since that cycle and never to these three —
+    // which is why the loss was silent here and repaired there.
+    s = liftBareAllOfRef(s);
+    s = resolveRefSiblings(s, ledger, url,
+      DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
     walk(s, "root", function (node, path) {
       // 1. The fatal case, and the only one that is both silent AND repairable.
@@ -6479,6 +6574,10 @@
     var s = clone(schema);
     var ledger = [];
     var url = DOCS.xgrammar;
+
+    s = liftBareAllOfRef(s);
+    s = resolveRefSiblings(s, ledger, url,
+      DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
     walk(s, "root", function (node, path) {
       // 1. The alternation bug, confirmed in a SECOND engine. outlines accepts
@@ -6692,6 +6791,10 @@
     var s = clone(schema);
     var ledger = [];
     var url = DOCS.lmformatenforcer;
+
+    s = liftBareAllOfRef(s);
+    s = resolveRefSiblings(s, ledger, url,
+      DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
     walk(s, "root", function (node, path) {
       // 1. THE HEADLINE, and it is an INVERSION rather than a loss of
