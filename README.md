@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1526 engine + 341 CLI + 83 ESM/library assertions = **1950** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1556 engine + 341 CLI + 83 ESM/library assertions = **1980** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1017,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1950 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1980 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1836,6 +1836,63 @@ Membership is now a question about the object, never about `Object.prototype`:
 one `hasOwn` and one `inTable`, used at all fourteen sites. The `definitions` →
 `$defs` rename was one of them, so a definition named `toString` was never
 copied and its pointers dangled.
+
+## The repairs a new target inherits: none
+
+`noteUnsatisfiable` has been in this codebase since Cycle #347. It flags the
+five shapes that no value can satisfy — `enum: []`, `anyOf: []`, `oneOf: []`,
+`type: []`, and `not` of a match-anything schema — and it is wired to
+`openai`, `anthropic`, `gemini` and `openai-nonstrict`. Every target that
+existed when it was written. The three **decoder** targets were added
+afterwards and inherited none of it, because a new converter starts as a fresh
+function and inherits nothing. The same was true of the boolean-subschema check.
+
+It could not simply be ported, because #347's severity rests on a premise that
+is false here — the premise is stated in its own message, *"providers accept the
+schema as written"*, which is why it is advisory there. A constrained decoder
+does not accept-and-ignore. Measured 2026-08-11, one shape per row, with an
+ordinary `{"type":"string"}` control accepting 1 of 6 probe instances in every
+run so each engine is known to be discriminating:
+
+| shape | xgrammar 0.2.4 | outlines-core 0.2.14 | lm-format-enforcer 0.11.3 |
+|---|---|---|---|
+| `enum: []` | `RuntimeError` at compile | compiles, matches nothing | crash at decode |
+| `anyOf: []` / `oneOf: []` | `EBNF parser error` | compiles, matches nothing | crash at decode |
+| `type: []` | **inverts → any value** | compiles, matches nothing | rejects (correct) |
+| `not: {}` / `not: true` | **inverts → any value** | `ValueError` at compile | crash at decode |
+| boolean `true` | correct (any value) | `ValueError` at compile | crash at decode |
+| boolean `false` | `RuntimeError` at compile | `ValueError` at compile | crash at decode |
+
+The inversion is read off the **emitted grammar** rather than inferred:
+`{"not":{}}` compiles to `root_prop_0 ::= ((basic_number) | (basic_string) | …)`
+and `{"type":[]}` to `root_prop_0 ::= ((basic_any))`. A node that permits no
+value becomes the grammar that permits every value, with no error anywhere.
+
+So the severity forks. **Blocker** where the engine cannot produce a working
+guide or silently produces the opposite constraint; **advisory** where the
+engine handles it correctly and the field is simply dead, which is what the
+schema said. No repair is invented either way — nothing can make an impossible
+field possible — so the remedy is named instead. Boolean `true` on xgrammar
+draws nothing at all: it means any value, and xgrammar generates any value.
+
+One consequence worth stating, because it was the loudest symptom: before this,
+`--to outlines` would block a `not: {}` document and then print *"This schema is
+already valid as-is for: … xgrammar, lmformatenforcer"* — affirmatively steering
+the reader onto the two targets that invert it and crash on it.
+
+### …and a guard measured against a lazy constructor
+
+Correcting `lmfeUnbuildable` (#386) fell out of the same measurement. It was
+scoped to the root and to `allOf` members, exempted a bare `{}`, and treated the
+mere *presence* of `enum`/`anyOf`/`oneOf` as enough. All three are wrong, and
+all three came from one contaminated reading: `JsonSchemaParser(schema)` is
+**lazy**, so a schema that dies at a property position constructs cleanly and
+even answers `get_allowed_characters()` at the top level. Forced by feeding an
+instance one character at a time, a bare `{}` under `properties` raises
+`Unsupported type None` like any other typeless node, and so does an empty
+`enum`. The guard now tests content rather than presence, and fires wherever
+the walk reaches — because the crash is at whatever property the decoder
+arrives at, not at a fixed position.
 
 ## License
 MIT.
