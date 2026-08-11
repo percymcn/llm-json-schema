@@ -8448,5 +8448,165 @@ function fanoutSchema(depth, cyclic) {
     }));
 })();
 
+// ---------------------------------------------------------------------------
+// #385 xgrammar: the SECOND consumer target.
+//
+// Measured 2026-08-10 against xgrammar 0.2.4 with
+// Grammar.from_json_schema + testing._is_grammar_accept_string, asking per
+// keyword whether a VIOLATING instance is still accepted AND whether a VALID
+// one still is. Fixtures below are VERBATIM zod 4.4.3 output (#311).
+// ---------------------------------------------------------------------------
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function msgs(r) { return r.ledger.map(function (l) { return String(l.msg || ""); }).join(" || "); }
+  function opsOf(r) { return r.ledger.map(function (l) { return l.op; }).join(""); }
+
+  // VERBATIM zod 4.4.3 `z.record(z.string(), z.string())`.
+  var zodRecord = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: { type: "string" }
+  };
+  // VERBATIM zod 4.4.3 `z.record(z.string().regex(/^[a-z]+$/), z.string())`.
+  var zodPatRecord = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string", pattern: "^[a-z]+$" },
+    additionalProperties: { type: "string" }
+  };
+
+  // 1. THE HEADLINE. A vacuous `propertyNames` is dropped, and the value schema
+  //    it was silently destroying survives. Measured: before, the compiled
+  //    grammar accepts {"a":123} and {"a":null}; after, both are rejected.
+  var r1 = conv(zodRecord, "xgrammar");
+  ok("#385 xgrammar: vacuous propertyNames is dropped",
+    !Object.prototype.hasOwnProperty.call(r1.schema, "propertyNames"));
+  ok("#385 xgrammar: the value schema it was destroying survives",
+    r1.schema.additionalProperties && r1.schema.additionalProperties.type === "string");
+  ok("#385 xgrammar: the drop is reported as a fix, not silently",
+    opsOf(r1).indexOf("~") !== -1 && has(r1.ledger, "asserted nothing"));
+
+  // 2. A CONSTRAINING propertyNames has a lossless patternProperties form, and
+  //    that spelling enforces BOTH key and value. Measured: before, a map of
+  //    {"n": number} accepts {"ab":"plain"}; after it is rejected.
+  var r2 = conv(zodPatRecord, "xgrammar");
+  ok("#385 xgrammar: patterned propertyNames is rewritten to patternProperties",
+    !Object.prototype.hasOwnProperty.call(r2.schema, "propertyNames") &&
+    !!(r2.schema.patternProperties && r2.schema.patternProperties["^[a-z]+$"]));
+  ok("#385 xgrammar: the rewrite carries the value schema across",
+    !!(r2.schema.patternProperties &&
+       r2.schema.patternProperties["^[a-z]+$"] &&
+       r2.schema.patternProperties["^[a-z]+$"].type === "string"));
+  ok("#385 xgrammar: the rewrite closes the object so the key pattern binds",
+    r2.schema.additionalProperties === false);
+
+  // 3. A key constraint with no patternProperties form is NAMED, not guessed
+  //    at (#329) — there is no lossless rewrite of `minLength` on a key.
+  var r3 = conv({ type: "object", propertyNames: { minLength: 3 },
+                  additionalProperties: { type: "string" } }, "xgrammar");
+  ok("#385 xgrammar: a non-pattern key constraint is a blocker",
+    opsOf(r3).indexOf("!") !== -1 && has(r3.ledger, "no lossless rewrite"));
+
+  // 4. The alternation bug, confirmed in a second engine. Raw accepts NOTHING
+  //    (outlines instead accepts only malformed JSON) — same repair fixes both.
+  var alt = { type: "object", properties: { a: { type: "string", pattern: "cat|dog" } },
+              required: ["a"], additionalProperties: false };
+  var r4 = conv(alt, "xgrammar");
+  ok("#385 xgrammar: a top-level alternation is wrapped in a non-capturing group",
+    ((r4.schema.properties || {}).a || {}).pattern === "(?:cat|dog)");
+  ok("#385 xgrammar: and the reason names the accepts-nothing failure",
+    has(r4.ledger, "accepts NO value at all"));
+
+  // 5. Whole-string matching is an ADVISORY, never a gate failure: the result
+  //    is narrower than the schema, so nothing invalid is generated.
+  var r5 = conv({ type: "object", properties: { a: { type: "string", pattern: "^S_" } },
+                  required: ["a"], additionalProperties: false }, "xgrammar");
+  ok("#385 xgrammar: a non-anchored pattern draws the whole-string advisory",
+    has(r5.ledger, "WHOLE string"));
+  ok("#385 xgrammar: that advisory never fails the gate",
+    r5.ledger.filter(function (l) { return has([l], "WHOLE string"); })
+             .every(function (l) { return l.advisory === true; }));
+
+  // 6. `allOf` is conditional on MEMBER COUNT, which a flat keyword list cannot
+  //    express (#318). One member is enforced; two are not.
+  var r6a = conv({ allOf: [{ type: "string" }, { minLength: 3 }] }, "xgrammar");
+  var r6b = conv({ allOf: [{ type: "string", minLength: 3 }] }, "xgrammar");
+  ok("#385 xgrammar: a 2-member allOf is reported as unenforced",
+    has(r6a.ledger, "still ongoing"));
+  ok("#385 xgrammar: a 1-member allOf is NOT reported (it is enforced)",
+    !has(r6b.ledger, "still ongoing"));
+
+  // 7. The silent set is KEPT, never stripped (#314's error-policy rule).
+  var r7 = conv({ type: "array", items: { type: "integer" }, uniqueItems: true }, "xgrammar");
+  ok("#385 xgrammar: uniqueItems is kept, not stripped",
+    r7.schema.uniqueItems === true);
+  ok("#385 xgrammar: and is reported as unenforced",
+    has(r7.ledger, "does NOT enforce"));
+
+  // ---- guards that must hold BOTH ways (over-blocking protection) ----------
+
+  // 8. Declared `properties` are undamaged by propertyNames (measured), so the
+  //    rule must not fire on an ordinary object.
+  var g1 = conv({ type: "object", properties: { a: { type: "string" } },
+                  required: ["a"], additionalProperties: false }, "xgrammar");
+  ok("#385 xgrammar [guard]: an ordinary closed object draws no propertyNames entry",
+    !has(g1.ledger, "propertyNames"));
+
+  // 9. propertyNames with NO additionalProperties has nothing to destroy —
+  //    measured correct — so it must be left alone.
+  var g2 = conv({ type: "object", propertyNames: { type: "string" } }, "xgrammar");
+  ok("#385 xgrammar [guard]: propertyNames with no value schema is untouched",
+    !!g2.schema.propertyNames);
+
+  // 10. A fully anchored pattern is compiled correctly and must draw nothing.
+  var g3 = conv({ type: "object", properties: { a: { type: "string", pattern: "^[a-z]+$" } },
+                  required: ["a"], additionalProperties: false }, "xgrammar");
+  ok("#385 xgrammar [guard]: a fully anchored pattern draws no advisory",
+    !has(g3.ledger, "WHOLE string"));
+
+  // 11. An already-grouped alternation works in xgrammar (measured) and must
+  //     not be re-wrapped, or the rule is firing on any `|` at all.
+  var g4 = conv({ type: "object", properties: { a: { type: "string", pattern: "(cat|dog)" } },
+                  required: ["a"], additionalProperties: false }, "xgrammar");
+  ok("#385 xgrammar [guard]: an already-grouped alternation is left alone",
+    ((g4.schema.properties || {}).a || {}).pattern === "(cat|dog)");
+
+  // 12. SCOPE PINS. This is a decoder fact. No vendor-API target may rewrite a
+  //     caller's map, or a later cycle will "generalise" it onto destinations
+  //     that handle propertyNames correctly.
+  ["openai", "anthropic", "gemini-json", "outlines"].forEach(function (t) {
+    var r = conv(zodRecord, t);
+    ok("#385 xgrammar [scope]: --to " + t + " does not rewrite propertyNames",
+      !(r.schema.patternProperties));
+  });
+
+  // 13. THE DISCRIMINATOR. Without this the whole target could be an alias of
+  //     `--to outlines` and every assertion above would still pass. The two
+  //     decoders' enforcement sets are measured, and they genuinely disagree:
+  //     xgrammar enforces every numeric bound outlines drops.
+  var XD = E.XGRAMMAR_DROPPED_KEYS || [];
+  var XE = E.XGRAMMAR_ENFORCED_KEYS || [];
+  var OD = E.OUTLINES_DROPPED_KEYS || [];
+  ok("#385 xgrammar: the dropped table is the 4 measured keywords",
+    XD.length === 4 && XD.indexOf("uniqueItems") !== -1 && XD.indexOf("not") !== -1);
+  ok("#385 xgrammar: it ENFORCES bounds that outlines silently drops",
+    XE.indexOf("minimum") !== -1 && XE.indexOf("multipleOf") !== -1 &&
+    XE.indexOf("minProperties") !== -1 &&
+    OD.indexOf("minimum") !== -1 && OD.indexOf("multipleOf") !== -1);
+  ok("#385 xgrammar: its two groups are disjoint",
+    XE.length > 0 && XE.every(function (k) { return XD.indexOf(k) === -1; }));
+  // ...and the two decoders must produce genuinely DIFFERENT diagnoses for one
+  // document, which is the proof that a second target was warranted at all.
+  var bounded = { type: "object", properties: { a: { type: "integer", minimum: 5 } },
+                  required: ["a"], additionalProperties: false };
+  ok("#385 xgrammar: outlines and xgrammar disagree about the same schema",
+    has(conv(bounded, "outlines").ledger, "does NOT enforce") &&
+    !has(conv(bounded, "xgrammar").ledger, "does NOT enforce"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

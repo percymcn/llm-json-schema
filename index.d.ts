@@ -16,7 +16,8 @@ export type Provider =
   | "gemini-json"
   | "gemini-client"
   | "openai-realtime"
-  | "outlines";
+  | "outlines"
+  | "xgrammar";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */
 export type JSONSchema = Record<string, any>;
@@ -116,6 +117,14 @@ export function toGemini(schema: JSONSchema, jsonPath?: boolean): TransformResul
  * guide that accepts only malformed JSON.
  */
 export function toOutlines(schema: JSONSchema): TransformResult;
+
+/**
+ * Report what xgrammar will actually ENFORCE. xgrammar is the default
+ * structured-output backend in vLLM and SGLang, and its enforcement set is
+ * NOT outlines': it enforces every numeric bound outlines drops, and ignores
+ * `allOf`/`not` that outlines refuses outright.
+ */
+export function toXgrammar(schema: JSONSchema): TransformResult;
 
 /** Infer a JSON Schema from a sample JSON value. */
 export function inferSchema(value: unknown): JSONSchema;
@@ -284,6 +293,16 @@ export const OUTLINES_REJECTED_KEYS: string[];
 /** Positive control: keywords outlines-core genuinely does enforce. */
 export const OUTLINES_ENFORCED_KEYS: string[];
 
+/**
+ * Keywords xgrammar compiles WITHOUT error and then does not enforce.
+ * Measured against xgrammar 0.2.4. Deliberately NOT the same set as
+ * OUTLINES_DROPPED_KEYS — one decoder's table does not transfer to another.
+ */
+export const XGRAMMAR_DROPPED_KEYS: string[];
+
+/** Positive control: keywords xgrammar genuinely does enforce. */
+export const XGRAMMAR_ENFORCED_KEYS: string[];
+
 declare const api: {
   convert: typeof convert;
   inferSchema: typeof inferSchema;
@@ -308,6 +327,9 @@ declare const api: {
   OUTLINES_DROPPED_KEYS: typeof OUTLINES_DROPPED_KEYS;
   OUTLINES_REJECTED_KEYS: typeof OUTLINES_REJECTED_KEYS;
   OUTLINES_ENFORCED_KEYS: typeof OUTLINES_ENFORCED_KEYS;
+  toXgrammar: typeof toXgrammar;
+  XGRAMMAR_DROPPED_KEYS: typeof XGRAMMAR_DROPPED_KEYS;
+  XGRAMMAR_ENFORCED_KEYS: typeof XGRAMMAR_ENFORCED_KEYS;
 };
 
 export default api;

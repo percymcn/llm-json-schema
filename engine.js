@@ -32,7 +32,8 @@
     "gemini-client": "https://ai.google.dev/gemini-api/docs/structured-output",
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
     "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations",
-    outlines: "https://github.com/dottxt-ai/outlines-core"
+    outlines: "https://github.com/dottxt-ai/outlines-core",
+    xgrammar: "https://github.com/mlc-ai/xgrammar"
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -6269,6 +6270,217 @@
     return { schema: s, ledger: ledger };
   }
 
+  // ---- xgrammar: the SECOND consumer target --------------------------------
+  //
+  // #384 added `outlines` and established the enforcement oracle. This is the
+  // same question asked of a second, structurally different decoder, and the
+  // answer is different enough that porting the outlines advisories would have
+  // been wrong in both directions: xgrammar ENFORCES every numeric bound and
+  // `min/maxProperties` (all of which outlines silently ignores), while
+  // ignoring `allOf`/`not` (which outlines refuses outright). Two consumers,
+  // two nearly-disjoint enforcement sets — so two targets (#336/#362).
+  //
+  // Reachability is larger than outlines': xgrammar is the DEFAULT structured
+  // output backend in vLLM and SGLang, so this is what `guided_json` /
+  // `response_format: json_schema` compiles through unless you opt out.
+  //
+  // MEASURED 2026-08-10 against xgrammar 0.2.4 via
+  // `Grammar.from_json_schema` + `testing._is_grammar_accept_string`, asking
+  // per keyword whether a VIOLATING instance is still accepted AND whether a
+  // VALID one still is — both halves, because a row can otherwise be green for
+  // an unrelated reason (#384's own `minProperties` error). Snapshot: this
+  // suite is dependency-free and cannot run C++, so a version bump owes a
+  // re-measure.
+  var XGRAMMAR_DROPPED = {
+    uniqueItems: 1, contains: 1, dependentRequired: 1, not: 1
+  };
+
+  // Positive control, and the reason the table is measured rather than reasoned:
+  // these are enforced HERE and silently ignored by outlines. "It is a
+  // constrained decoder, so bounds do not work" is exactly the inference the
+  // data refuses.
+  var XGRAMMAR_ENFORCED = [
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+    "minLength", "maxLength", "minItems", "maxItems", "minProperties",
+    "maxProperties", "enum", "const", "format", "prefixItems", "required",
+    "additionalProperties", "anyOf", "oneOf"
+  ];
+
+  // A `propertyNames` that asserts nothing. A JSON key is a string by
+  // construction, so `{"type":"string"}` and `{}` constrain exactly nothing —
+  // which is what makes deleting them lossless, and is why the deletion is a
+  // repair rather than a trade.
+  function xgrammarVacuousPropertyNames(pn) {
+    if (!isPlainObject(pn)) return false;
+    var keys = Object.keys(pn);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (k === "title" || k === "description" || k === "$comment") continue;
+      if (k === "type" && pn[k] === "string") continue;
+      return false;
+    }
+    return true;
+  }
+
+  // The key constraint, if the only thing `propertyNames` asserts is a pattern.
+  // Anything else it might assert (`minLength`, `enum`, …) has no lossless
+  // `patternProperties` form, so it is reported rather than guessed at (#329).
+  function xgrammarKeyPatternOnly(pn) {
+    if (!isPlainObject(pn)) return null;
+    var pat = null, keys = Object.keys(pn);
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (k === "title" || k === "description" || k === "$comment") continue;
+      if (k === "type" && pn[k] === "string") continue;
+      if (k === "pattern" && typeof pn[k] === "string") { pat = pn[k]; continue; }
+      return null;
+    }
+    return pat;
+  }
+
+  // xgrammar compiles `pattern` as a WHOLE-STRING match. JSON Schema specifies
+  // it as a search, so anything not already anchored at both ends is silently
+  // narrowed — `^S_` ("starts with S_") becomes the literal key `S_`.
+  function xgrammarNotWholeString(p) {
+    if (typeof p !== "string" || !p) return false;
+    if (p.charAt(0) !== "^") return true;
+    if (p.charAt(p.length - 1) !== "$") return true;
+    var n = 0, i = p.length - 2;
+    while (i >= 0 && p.charAt(i) === "\\") { n++; i--; }
+    return n % 2 !== 0;
+  }
+
+  function toXgrammar(schema) {
+    var tooDeepOut = tooDeepEntry(schema, DOCS.xgrammar);
+    if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
+    var s = clone(schema);
+    var ledger = [];
+    var url = DOCS.xgrammar;
+
+    walk(s, "root", function (node, path) {
+      // 1. The alternation bug, confirmed in a SECOND engine. outlines accepts
+      //    only malformed JSON; xgrammar accepts NOTHING — the field becomes
+      //    impossible to generate. Same one-line repair, and `(?:...)` rather
+      //    than `(...)` so any backreference numbering is untouched.
+      //    The anchored spelling `^GET|POST$` is hit identically.
+      if (typeof node.pattern === "string" && outlinesTopLevelAlternation(node.pattern)) {
+        var wrapped = "(?:" + node.pattern.replace(/^\^/, "").replace(/([^\\])\$$/, "$1") + ")";
+        setOwn(node, "pattern", wrapped);
+        ledger.push(entry("~", path,
+          "Wrapped this `pattern`'s top-level alternation in a non-capturing group. xgrammar " +
+          "compiles `cat|dog` into a grammar that accepts NO value at all — not the strings on " +
+          "either side of the `|` — so a field carrying this pattern can never be generated, and " +
+          "it compiles with no error. `(?:...)` is the same language. Measured: raw accepts 0 of " +
+          "2 valid values, wrapped accepts 2 of 2.",
+          url));
+      }
+
+      // 2. THE HEADLINE. The mere PRESENCE of `propertyNames` makes xgrammar
+      //    discard the sibling `additionalProperties` VALUE schema — replacing
+      //    it with `basic_any` in the emitted grammar. Declared `properties`
+      //    are unaffected (measured), so this is scoped to the map half.
+      //
+      //    Reachability is every zod 4 `z.record()`: it always emits
+      //    `propertyNames`, so `z.record(z.string(), z.object({...}))` reaches
+      //    the decoder with its entire value model unenforced.
+      var pn = hasOwn(node, "propertyNames") ? node.propertyNames : undefined;
+      var ap = hasOwn(node, "additionalProperties") ? node.additionalProperties : undefined;
+      if (pn !== undefined && isPlainObject(ap)) {
+        var keyPat = xgrammarKeyPatternOnly(pn);
+        if (xgrammarVacuousPropertyNames(pn)) {
+          delete node.propertyNames;
+          ledger.push(entry("~", path,
+            "Dropped `propertyNames` — it asserted nothing (a JSON key is a string by " +
+            "construction), and its mere PRESENCE makes xgrammar discard the sibling " +
+            "`additionalProperties` value schema, replacing it with `basic_any`. With it " +
+            "removed the value type is enforced again. Measured on this shape: before, a map " +
+            "declared `{\"type\":\"string\"}` accepts `{\"a\":123}` and `{\"a\":null}`; after, both " +
+            "are rejected. Every zod 4 `z.record()` emits this keyword.",
+            url));
+        } else if (keyPat !== null) {
+          var moved = node.additionalProperties;
+          delete node.propertyNames;
+          setOwn(node, "patternProperties", { });
+          setOwn(node.patternProperties, keyPat, moved);
+          setOwn(node, "additionalProperties", false);
+          ledger.push(entry("~", path,
+            "Rewrote `propertyNames` + `additionalProperties` as `patternProperties` — the same " +
+            "map, in the spelling xgrammar actually enforces. With `propertyNames` present the " +
+            "value schema is discarded (it becomes `basic_any`), so both the key pattern AND the " +
+            "value type were unenforced; `patternProperties` enforces both. Measured: before, a " +
+            "map of `{\"n\": number}` accepts `{\"ab\":\"plain\"}`; after, it is rejected.",
+            url));
+        } else {
+          ledger.push(entry("!", path,
+            "`propertyNames` here constrains keys with something other than a `pattern`, and its " +
+            "presence makes xgrammar discard the sibling `additionalProperties` value schema " +
+            "entirely — so the values of this map are generated unconstrained. There is no " +
+            "lossless rewrite: only a key `pattern` has a `patternProperties` equivalent. Express " +
+            "the key constraint as a `pattern`, or drop `propertyNames` and validate keys after " +
+            "generation.",
+            url));
+        }
+      }
+
+      // 3. Whole-string matching. Advisory, not a blocker: the result is
+      //    NARROWER than the schema, so everything generated still validates —
+      //    what is lost is documents the schema permits. On a KEY pattern that
+      //    is severe enough to be worth saying out loud, because `^S_` admits
+      //    only the literal key `S_`.
+      var pats = [];
+      if (typeof node.pattern === "string") pats.push(["pattern", node.pattern]);
+      if (isPlainObject(node.patternProperties)) {
+        Object.keys(node.patternProperties).forEach(function (p) {
+          pats.push(["patternProperties key", p]);
+        });
+      }
+      pats.forEach(function (pair) {
+        if (!xgrammarNotWholeString(pair[1])) return;
+        ledger.push(entry("=", path,
+          "xgrammar matches `" + pair[0] + "` against the WHOLE string, where JSON Schema " +
+          "specifies a search — so `" + pair[1] + "` is silently narrowed to an exact match. " +
+          "`^S_` means \"starts with S_\" and compiles to the literal `S_`. Nothing invalid is " +
+          "generated (the result is narrower, not wider), but values your schema permits become " +
+          "impossible. Anchor both ends to say exactly what you mean.",
+          url, true));
+      });
+
+      // 4. `allOf` is conditional, and the condition is the member count: one
+      //    member is ENFORCED, two or more are IGNORED (xgrammar prints
+      //    "Support for allOf with multiple options is still ongoing" and then
+      //    drops the constraint). A flat keyword list cannot express that
+      //    (#318).
+      if (Array.isArray(node.allOf) && node.allOf.length > 1) {
+        ledger.push(entry("=", path,
+          "`allOf` with " + node.allOf.length + " members is kept but NOT enforced — xgrammar " +
+          "warns \"Support for allOf with multiple options is still ongoing\" and compiles a " +
+          "grammar that ignores it. A SINGLE-member `allOf` is enforced, so this depends on the " +
+          "member count rather than on the keyword. Merge the members yourself if you need these " +
+          "constraints enforced.",
+          url, true));
+      }
+
+      // 5. The silent set. Kept, never stripped: xgrammar ignores these rather
+      //    than erroring, so removing them would destroy a constraint that
+      //    still holds everywhere else the document is used and buy nothing
+      //    here (#314's error-policy rule).
+      Object.keys(XGRAMMAR_DROPPED).forEach(function (k) {
+        if (!hasOwn(node, k)) return;
+        ledger.push(entry("=", path,
+          "`" + k + "` is kept here but xgrammar does NOT enforce it: the compiled grammar " +
+          "accepts values that violate it, and nothing errors. Validate this constraint yourself " +
+          "after generation. (Measured asymmetry worth knowing: every numeric bound IS enforced " +
+          "here, and all of them are silently ignored by outlines — you cannot carry one " +
+          "decoder's table over to another.)",
+          url, true));
+      });
+    });
+
+    noteEmptiedDocument(schema, s, ledger, url,
+      "xgrammar takes standard JSON Schema, so nothing is stripped on this target.");
+    return { schema: s, ledger: ledger };
+  }
+
   var CONVERTERS = {
     openai: toOpenAI,
     // Anthropic is two request fields, two dialects, two targets — same shape
@@ -6316,7 +6528,11 @@
     // The first CONSUMER target: not "will this be accepted?" but "will this be
     // enforced?". A constrained decoder is the one destination where a keyword
     // can be perfectly legal, perfectly accepted, and still do nothing.
-    outlines: toOutlines
+    outlines: toOutlines,
+    // The second consumer, and a different answer: xgrammar enforces every
+    // numeric bound that outlines silently drops, and ignores `allOf`/`not`
+    // that outlines refuses outright. One decoder's table does not transfer.
+    xgrammar: toXgrammar
   };
 
   // ---- public API ----------------------------------------------------------
@@ -6546,6 +6762,7 @@
     toAnthropic: toAnthropic,
     toGemini: toGemini,
     toOutlines: toOutlines,
+    toXgrammar: toXgrammar,
     DOCS: DOCS,
 
     // Exported so the measured enforcement table is re-diffable against
@@ -6556,6 +6773,8 @@
     OUTLINES_DROPPED_KEYS: Object.keys(OUTLINES_DROPPED),
     OUTLINES_REJECTED_KEYS: Object.keys(OUTLINES_REJECTED),
     OUTLINES_ENFORCED_KEYS: OUTLINES_ENFORCED.slice(),
+    XGRAMMAR_DROPPED_KEYS: Object.keys(XGRAMMAR_DROPPED),
+    XGRAMMAR_ENFORCED_KEYS: XGRAMMAR_ENFORCED.slice(),
     // The narrow `responseSchema` subset, exported so it can be diffed against
     // the vendor artifact it is derived from. It is now confirmed by three
     // independent ones: the JS `Schema` interface (dist/genai.d.ts), the Python

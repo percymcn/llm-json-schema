@@ -1765,5 +1765,58 @@ function fanout(depth) {
      run(["--help"], "").stdout.indexOf("outlines") !== -1);
 })();
 
+// ---- #385 xgrammar: the second consumer target, end to end ----------------
+(function () {
+  // VERBATIM zod 4.4.3 `z.record(z.string(), z.object({n: z.number()}))`.
+  var ZOD_RECORD = JSON.stringify({
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    type: "object", propertyNames: { type: "string" },
+    additionalProperties: {
+      type: "object", properties: { n: { type: "number" } },
+      required: ["n"], additionalProperties: false
+    }
+  });
+
+  var r = run(["--to", "xgrammar", "-"], ZOD_RECORD);
+  ok("#385 CLI: the zod record converts", r.status === 0 || r.status === 1,
+     "status=" + r.status);
+  var outSchema = {};
+  try { outSchema = JSON.parse(r.stdout); } catch (e) { outSchema = {}; }
+  ok("#385 CLI: propertyNames is gone from the emitted document",
+     !Object.prototype.hasOwnProperty.call(outSchema, "propertyNames"));
+  ok("#385 CLI: and the nested value model survives",
+     !!(outSchema.additionalProperties &&
+        outSchema.additionalProperties.properties &&
+        outSchema.additionalProperties.properties.n));
+  ok("#385 CLI: the reason reaches the installed surface",
+     r.stderr.indexOf("asserted nothing") !== -1);
+
+  // The two consumer targets must genuinely disagree about one document —
+  // otherwise the second target buys nothing.
+  var BOUNDED = JSON.stringify({
+    type: "object", properties: { n: { type: "integer", minimum: 10 } },
+    required: ["n"], additionalProperties: false
+  });
+  var o = run(["--to", "outlines", "--check", "-"], BOUNDED);
+  var x = run(["--to", "xgrammar", "--check", "-"], BOUNDED);
+  ok("#385 CLI: outlines reports `minimum` unenforced and xgrammar does not",
+     o.stderr.indexOf("does NOT enforce") !== -1 &&
+     x.stderr.indexOf("does NOT enforce") === -1);
+
+  // Advisories must never fail the gate (#317).
+  ok("#385 CLI: the whole-string advisory does not fail the gate",
+     run(["--to", "xgrammar", "--check", "-"],
+         JSON.stringify({ type: "object",
+           properties: { a: { type: "string", pattern: "^S_" } },
+           required: ["a"], additionalProperties: false })).status === 0);
+
+  // Idempotence.
+  ok("#385 CLI: converted output rechecks clean",
+     run(["--to", "xgrammar", "--check", "-"], r.stdout).status === 0);
+
+  ok("#385 CLI: xgrammar is listed as a provider in --help",
+     run(["--help"], "").stdout.indexOf("xgrammar") !== -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

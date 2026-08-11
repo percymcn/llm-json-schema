@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1351 engine + 287 CLI + 71 ESM/library assertions = **1709** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1378 engine + 295 CLI + 77 ESM/library assertions = **1750** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -682,6 +682,68 @@ target and no edit is needed — run --help to see what selects each one.
 `--json` exposes the same list as `alsoValidFor`. It is computed from your schema
 on every run rather than read from a table, so it cannot go stale when a
 framework changes which field it posts to.
+
+## One decoder's table does not transfer — `--to xgrammar`
+
+`--to outlines` above establishes the enforcement question. `--to xgrammar`
+asks it of a second, structurally different decoder — a pushdown grammar
+rather than a regex — and the answer is different enough that carrying either
+table across would be wrong in both directions. **xgrammar is the default
+structured-output backend in vLLM and SGLang**, so this is what `guided_json`
+compiles through unless you opt out.
+
+Measured 2026-08-10 against xgrammar 0.2.4 via `Grammar.from_json_schema` +
+`testing._is_grammar_accept_string`, asking per keyword both whether a
+*violating* instance is still accepted and whether a *valid* one still is:
+
+| | outlines-core | xgrammar |
+|---|---|---|
+| `minimum`/`maximum`/`multipleOf` | silently ignored | **enforced** |
+| `minProperties`/`maxProperties` | silently ignored | **enforced** |
+| `allOf`, `not` | refused (`ValueError`) | silently ignored |
+| `uniqueItems`, `contains`, `dependentRequired` | ignored | ignored |
+| a top-level `\|` in `pattern` | accepts only malformed JSON | **accepts nothing at all** |
+
+Two findings drive the repairs, both silent, both measured on verbatim
+generator output:
+
+**1. `propertyNames` destroys its sibling.** The mere *presence* of
+`propertyNames` — even the vacuous `{"type":"string"}` — makes xgrammar discard
+the `additionalProperties` value schema, replacing it with `basic_any` in the
+emitted grammar. Declared `properties` are unaffected, so the loss is confined
+to the map half. **Every zod 4 `z.record()` emits this keyword**, so
+`z.record(z.string(), z.object({n: z.number()}))` reaches the decoder with its
+entire value model unenforced — `{"a": "plain"}` is generatable.
+
+The repair is lossless: a JSON key is a string by construction, so an
+unconstrained `propertyNames` asserts nothing and is dropped. A *patterned*
+one is rewritten to `patternProperties`, the spelling xgrammar enforces on both
+the key and the value.
+
+**2. A top-level alternation compiles to a grammar that accepts nothing.**
+`pattern: "cat|dog"` makes the field impossible to generate — not "cat", not
+"dog", nothing — and it compiles without error. The anchored spelling
+`^GET|POST$` is hit identically. Wrapping in a non-capturing group is the same
+language and fixes it. This is the same defect [`--to outlines`](#accepted-is-not-enforced----to-outlines)
+carries, in an unrelated engine, at the opposite severity.
+
+Round trip through the real decoder, from a consumer install:
+
+```console
+$ llm-schema --to xgrammar record.json > fixed.json
+```
+
+| instance | raw | ours |
+|---|---|---|
+| `{"a":{"n":1}}` (valid) | accepted | accepted |
+| `{"a":"plain"}` (violates the value model) | **accepted** | rejected |
+| `{"a":"cat"}` under `pattern:"cat\|dog"` | **rejected** | accepted |
+
+Advisory-only elsewhere: xgrammar matches `pattern` against the *whole* string
+where JSON Schema specifies a search, so `^S_` silently narrows to the literal
+key `S_`. That is narrower than your schema rather than wider, so nothing
+invalid is generated — but values your schema permits become impossible.
+
 
 ## Accepted is not enforced — `--to outlines`
 
