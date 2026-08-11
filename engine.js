@@ -6548,11 +6548,65 @@
   // `type` present, so it is the IGNORED row, not the refused one.
   var OUTLINES_CONDITIONAL = { allOf: 1, not: 1, patternProperties: 1 };
 
-  // Does the node give outlines-core an object shape to build a regex from?
-  // This is the discriminator between "raises" and "silently consumes".
-  function outlinesHasObjectShape(node) {
-    return node.type === "object" ||
-      (isPlainObject(node.properties) && Object.keys(node.properties).length > 0);
+  // ONE predicate was answering TWO different questions, and it was wrong for
+  // both — `node.type === "object" || non-empty properties`. The questions are:
+  //
+  //   Q1 "can outlines-core build anything from this node?"  -> outlinesHasShape
+  //   Q2 "will an empty `allOf` be absorbed by this node?"   -> outlinesHasProperties
+  //
+  // They come apart, so sharing a reader made each wrong in its own direction.
+  // Measured on outlines-core 0.2.14, `build_regex_from_schema`, with the
+  // keyword-deleted node as the control:
+  //
+  //   Q1 -- ANY declared shape is enough, it does NOT have to be an object:
+  //     {type:"string",  patternProperties} .... OK  (we called this REFUSED)
+  //     {type:"integer", patternProperties} .... OK  (we called this REFUSED)
+  //     {enum:["a"],     patternProperties} .... OK  (we called this REFUSED)
+  //     {type:["object","null"], not} .......... OK  (we called this REFUSED)
+  //     {properties:{},  patternProperties} .... OK  (we called this REFUSED)
+  //     {patternProperties} alone .............. RAISE  (correctly refused)
+  //   so the old reading failed the gate on five shapes outlines compiles fine.
+  //
+  //   Q2 -- `properties` presence is the discriminator, NOT `type`:
+  //     {type:"object", allOf:[]} .............. accepts NOTHING (we said "enforced")
+  //     {type:"object", properties:{},  allOf:[]} accepts {}      (absorbed)
+  //     {type:"object", properties:{a}, allOf:[]} accepts {"a":…} (absorbed)
+  //   so a node that can never be generated was passing at exit 0.
+  //
+  // The `type` reading is additionally narrow in the way #400/#401 found twice
+  // over: `type` has two legal spellings and this asked only about the first.
+  function outlinesHasShape(node) {
+    if (!isPlainObject(node)) return false;
+    // Any `type` at all — scalar or the spec's array form, and any value: a
+    // `type:"string"` node has a shape, it is simply not an object one.
+    if (hasOwn(node, "type")) return true;
+    // EVEN EMPTY: `{properties:{}}` compiles (len 11). The old `.length > 0`
+    // is the second clause of the `OR`, and requiring it non-empty is what
+    // made an empty-but-declared object read as shapeless.
+    if (isPlainObject(node.properties)) return true;
+    if (hasOwn(node, "enum") || hasOwn(node, "const")) return true;
+    if (hasOwn(node, "$ref")) return true;
+    // `prefixItems` counts and `items` does NOT — an asymmetry nobody would
+    // guess, and the one this predicate got wrong on its first draft (the
+    // corpus differential caught it as an over-block). The whole JSON Schema
+    // vocabulary was then measured against outlines-core 0.2.14 one keyword at
+    // a time rather than spot-checked (#313), and EXACTLY NINE keywords give a
+    // typeless node a shape:
+    //
+    //   $ref  allOf  anyOf  const  enum  oneOf  prefixItems  properties  type
+    //
+    // Every one of the other 42 raises when it is the node's only content —
+    // including `items`, `required`, `format`, every numeric bound, both
+    // definition bags, all seven annotations, and a keyword outlines has never
+    // heard of. That last one is the control that makes this about the missing
+    // shape rather than about any keyword list.
+    if (Array.isArray(node.prefixItems)) return true;
+    return Array.isArray(node.anyOf) || Array.isArray(node.oneOf) ||
+      Array.isArray(node.allOf);
+  }
+
+  function outlinesHasProperties(node) {
+    return isPlainObject(node) && isPlainObject(node.properties);
   }
 
   // "refused" | "ignored" | "enforced" | "owned", or null if absent.
@@ -6590,12 +6644,18 @@
       // is — the same discriminator as above. Caught only because the corpus
       // differential newly un-blocked it: the old blocker was there for a false
       // reason ("cannot compile") and removing it would have left this silent.
+      //
+      // CORRECTION (#402): "is an object" was read as `type === "object"`, and
+      // measured it is `properties` that absorbs the empty `allOf`, not `type`.
+      // `{type:"object", allOf:[]}` with no `properties` accepts NO VALUE AT ALL
+      // and was reported as "enforced", i.e. passing at exit 0.
       if (node.allOf.length === 0) {
-        return outlinesHasObjectShape(node) ? "enforced" : "destroys";
+        return outlinesHasProperties(node) ? "enforced" : "destroys";
       }
       return node.allOf.length === 1 ? "enforced" : "owned";
     }
-    return outlinesHasObjectShape(node) ? "ignored" : "refused";
+    // Refused vs silently-consumed is about having ANY shape, not an object one.
+    return outlinesHasShape(node) ? "ignored" : "refused";
   }
 
   // #395: `outlines` HAS A SECOND SURFACE, AND IT IS THE ONE THAT CONVERTS.
@@ -7188,6 +7248,129 @@
       // cannot see what the rewrite creates (#363).
       mergeAllOf(s, node, path, ledger, url, DECODER_ALLOF_WHY, true);
       noteDecoderUnsatisfiable("outlines", node, path, ledger, url);
+
+      // 0a. `additionalProperties: false` on a node with NO `properties`.
+      //     outlines-core raises on it — measured at the root, under
+      //     `properties`, through `$ref`/`$defs` and inside an `anyOf` branch,
+      //     in all three spellings of `type` (scalar, union, absent). The
+      //     sibling decoders build it, so this is outlines-only.
+      //
+      //     REACHABILITY IS OUR OWN OUTPUT, not a hand-written shape: strict
+      //     mode requires `additionalProperties: false` on every object, so
+      //     `--to openai` turns a bare `{"type":"object"}` into exactly this —
+      //     and it is what OpenAI's own transformer produces for that input.
+      //     The documented workflow "convert for OpenAI, then serve with
+      //     outlines" therefore produced a document that cannot compile, and
+      //     `--check --to outlines` on OUR OWN OUTPUT exited 0 (#330's break).
+      //
+      //     Repaired rather than blocked, and the repair RESTORES A DEFAULT
+      //     rather than removing the offender (#398): an object with no
+      //     declared properties already has an empty property set, so saying
+      //     `properties: {}` out loud cannot change what the document means.
+      //     Verified against the emitted regex rather than argued — the
+      //     repaired node accepts `{}` and `{ }` and rejects `{"a":1}`, `null`
+      //     and `"s"`, which is exactly what the input already meant.
+      if (node.additionalProperties === false && !isPlainObject(node.properties)) {
+        setOwn(node, "properties", {});
+        ledger.push(entry("+", path,
+          "Added `properties: {}` beside `additionalProperties: false`. outlines-core cannot " +
+          "compile a closed object that declares no properties — `build_regex_from_schema` " +
+          "raises `ValueError: Unsupported JSON Schema structure false`, so no guide is built " +
+          "at all. Stating the empty property set is lossless: an object with no declared " +
+          "properties and no additional ones permits exactly `{}` either way, and the repaired " +
+          "node's emitted regex accepts `{}` and rejects `{\"a\":1}`. Worth knowing where this " +
+          "shape comes from: `--to openai` MANUFACTURES it, because strict mode requires " +
+          "`additionalProperties: false` on every object.",
+          url));
+      }
+
+      // 0b. A node that gives outlines-core NOTHING to build from. The trigger
+      //     is the ABSENCE OF A SHAPE rather than any keyword — put a bogus
+      //     `frobnicate` in the same slot and it raises identically, while a
+      //     completely BARE `{}` compiles fine (#398's control, one target
+      //     over). Measured: `{title:"x"}`, `{description:"d"}`, `{minItems:1}`,
+      //     `{required:["a"]}`, `{uniqueItems:true}` and `{frobnicate:true}` all
+      //     raise; `{}`, `{type:<anything>}`, `{properties:{}}`, `{enum:[…]}`,
+      //     `{const:…}`, `{$ref:…}` and any combinator all compile.
+      //
+      //     `allOf`/`not`/`patternProperties` are deliberately excluded: those
+      //     three are owned by `outlinesFate` below, which already reports this
+      //     exact condition for them with a keyword-specific reason. Reporting
+      //     here too would be the double-report of #359/#371.
+      //     SCOPED BY MEASUREMENT, NOT BY SYMMETRY — the corpus differential
+      //     caught two over-blocks in the first draft of this rule, and the
+      //     real engine settled both:
+      //
+      //       unreferenced `$defs` entry, typeless ... OK    (never compiled)
+      //       REFERENCED  `$defs` entry, typeless ... RAISE
+      //       typeless `allOf` member ............... OK    (absorbed)
+      //
+      //     So a node inside a definition bag or an `allOf` member is NOT
+      //     independently compiled and must not be flagged here. Skipping the
+      //     whole bag leaves the referenced-definition case uncovered, which
+      //     is a known and deliberate gap: covering it needs reference
+      //     analysis, and shipping an over-block to reach it would be the
+      //     false-CI-failure this project has now shipped eleven times.
+      var inDefBag = /(^|\.)(\$defs|definitions)\./.test(path);
+      var inAllOf = path.indexOf("allOf") !== -1;
+      //     A document that is nothing but a definition bag genuinely raises,
+      //     but #352's emptied-document rule already owns it and says so more
+      //     usefully; speaking here as well is the double-report of #359/#371.
+      var bagOnly = Object.keys(node).length > 0 && Object.keys(node).every(function (k) {
+        return k === "$defs" || k === "definitions";
+      });
+      //     And a node another rule has ALREADY blocked keeps that rule's
+      //     reason: `mergeAllOf` deletes the `allOf` it refuses to merge, so
+      //     the keyword exclusion below cannot see it (#363 — a rule that runs
+      //     after a rewrite reads the node the rewrite left behind), and
+      //     #355's malformed-keyword blocker reaches the same nodes.
+      var alreadyBlocked = ledger.some(function (e) {
+        return e.op === "!" && !e.advisory && e.path === path;
+      });
+      if (!outlinesHasShape(node) && Object.keys(node).length > 0 &&
+          !inDefBag && !inAllOf && !bagOnly && !alreadyBlocked &&
+          // Any combinator KEY, well-formed or not. A well-formed one gives the
+          // node a shape so this rule would not fire anyway; a MALFORMED one
+          // (`{"anyOf": {...}}`, an object where an array belongs) is #355's,
+          // and its blocker is raised at the `convert()` boundary — a different
+          // ledger from this one, so the same-path check above cannot see it.
+          !hasOwn(node, "allOf") && !hasOwn(node, "anyOf") &&
+          !hasOwn(node, "oneOf") && !hasOwn(node, "not") &&
+          !hasOwn(node, "patternProperties")) {
+        var nodeKeys = Object.keys(node);
+        var annOnly = nodeKeys.every(function (k) {
+          return inTable(OPENAI_ANNOTATION_KEYWORDS, k);
+        });
+        if (annOnly) {
+          // Provably lossless, and verified as byte-identity rather than
+          // argued: an annotation constrains nothing, so the stripped node is
+          // `{}` — and `{}`'s emitted regex is IDENTICAL to the one the
+          // annotation-only node would have had if it compiled at all.
+          nodeKeys.forEach(function (k) { delete node[k]; });
+          ledger.push(entry("~", path,
+            "Removed the annotation-only keywords (`" + nodeKeys.join("`, `") + "`) from this " +
+            "typeless node. outlines-core raises on ANY keyword sitting on a node that declares " +
+            "no `type`, no `properties`, no `enum`/`const`/`$ref` and no combinator — including " +
+            "pure annotations, and including a keyword it has never heard of, which is the tell " +
+            "that the trigger is the missing shape rather than the keyword. A bare `{}` compiles " +
+            "fine and means the same thing an annotation-only node means, so this is lossless: " +
+            "the emitted regex is byte-identical to the one for `{}`.",
+            url));
+        } else {
+          ledger.push(entry("!", path,
+            "outlines-core cannot build a guide for this node: it declares no `type`, no " +
+            "`properties`, no `enum`/`const`/`$ref` and no combinator, so there is nothing to " +
+            "build a regex from and `build_regex_from_schema` raises `ValueError: Unsupported " +
+            "JSON Schema structure`. The trigger is the MISSING SHAPE, not the keyword — a " +
+            "bogus `frobnicate` in the same slot raises identically, while a completely bare " +
+            "`{}` compiles. No repair is offered because there is none that keeps the meaning: " +
+            "these keywords constrain something, so deleting them would widen the schema, and " +
+            "supplying a `type` would narrow it to a guess. Declare the `type` this node is " +
+            "meant to describe (`{\"type\": \"array\", " + JSON.stringify(nodeKeys[0]) +
+            ": …}`) and outlines compiles it.",
+            url));
+        }
+      }
 
       // 1. The fatal case, and the only one that is both silent AND repairable.
       //    Wrapping in a NON-capturing group is lossless — same language, and

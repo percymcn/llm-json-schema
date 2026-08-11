@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1852 engine + 412 CLI + 83 ESM/library assertions = **2347** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1904 engine + 421 CLI + 83 ESM/library assertions = **2408** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -46,6 +46,62 @@ definition called `v1`), shipped the dangling pointer at exit 1, and re-checked
 as clean.
 
 
+
+### A node needs a shape for outlines to build anything (#402)
+
+`outlines-core` compiles a schema to a regex, and it needs the node to say
+*what kind of thing it is* before it can emit one. One predicate in this engine
+answered two different questions about that and was wrong for both.
+
+Measured on `outlines-core` 0.2.14 with `build_regex_from_schema`, at the root,
+under `properties`, through `$ref`/`$defs` and inside an `anyOf` branch —
+identical at every position:
+
+| node | outlines | we said |
+|---|---|---|
+| `{"type":"object","additionalProperties":false}` | **raises** | valid (exit 0) |
+| `{"minItems":1}` (no `type`) | **raises** | valid (exit 0) |
+| `{"title":"x"}` (no `type`) | **raises** | valid (exit 0) |
+| `{"frobnicate":true}` (no `type`) | **raises** | valid (exit 0) |
+| `{"type":"object","allOf":[]}` | compiles, accepts **nothing** | valid (exit 0) |
+| `{"type":"string","patternProperties":{…}}` | compiles fine | **blocked (exit 3)** |
+| `{"type":["object","null"],"not":{…}}` | compiles fine | **blocked (exit 3)** |
+| `{"enum":["a"],"patternProperties":{…}}` | compiles fine | **blocked (exit 3)** |
+
+**The trigger is the absence of a shape, not any keyword.** A bogus
+`frobnicate` raises identically to `minItems`, while a completely bare `{}`
+compiles — so a keyword list could never have expressed it. Measured one
+keyword at a time across the whole JSON Schema vocabulary, exactly **nine**
+give a typeless node a shape: `$ref`, `allOf`, `anyOf`, `const`, `enum`,
+`oneOf`, `prefixItems`, `properties`, `type`. The other 42 raise, including
+`items` — which is the asymmetry with `prefixItems` nobody would guess.
+
+**The first row is one we manufacture.** Strict mode requires
+`additionalProperties: false` on every object, so `--to openai` turns a bare
+`{"type":"object"}` into exactly the shape outlines refuses — and it is what
+OpenAI's own transformer produces for that input. The documented "convert for
+OpenAI, then serve with outlines" workflow therefore produced a document that
+cannot compile, and `--check --to outlines` on *our own output* exited 0.
+
+Repairs where one is lossless, blockers where none is:
+
+- `additionalProperties: false` with no `properties` → **`properties: {}` is
+  added**. An object with no declared properties already has an empty property
+  set, so saying it out loud cannot change the meaning; verified against the
+  emitted regex, which accepts `{}` and rejects `{"a":1}`.
+- an **annotation-only** typeless node → the annotations are **stripped**. The
+  result is `{}`, whose regex is byte-identical to what the node meant.
+- anything else shapeless → **blocked**, because deleting the keywords would
+  widen the schema and supplying a `type` would narrow it to a guess (#329).
+
+Scoped by measurement, not symmetry: an unreferenced `$defs` entry and a
+typeless `allOf` member both compile fine, so neither is flagged — the corpus
+differential caught both as over-blocks in the first draft. `xgrammar` and
+`lm-format-enforcer` build these shapes, so the rule is outlines-only.
+
+*Known gap, stated rather than papered over:* a typeless definition that **is**
+referenced does raise, and is not flagged — covering it needs reference
+analysis, and reaching it via a blanket rule would re-introduce the over-block.
 
 ### `allOf` is an intersection on a constrained decoder too (#396)
 
@@ -1264,7 +1320,7 @@ our output, and 12 of 13 targets untouched.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2347 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2408 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

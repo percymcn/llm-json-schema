@@ -10778,5 +10778,145 @@ function fanoutSchema(depth, cyclic) {
     fnode(conv({ type: ["array", "null"], uniqueItems: true }, "xgrammar")).items !== undefined);
 })();
 
+// --- #402: outlines -- one OR predicate answering two questions -------------
+//
+// `outlinesHasObjectShape` was `node.type === "object" || non-empty properties`
+// and was consulted for BOTH "can outlines build this?" and "will an empty
+// allOf be absorbed?". Measured against outlines-core 0.2.14, it was wrong for
+// both, in opposite directions.
+(function () {
+  // Guarded (#322): a reverted engine must REPORT these, not abort the file.
+  function conv(node, p) {
+    try {
+      var r = E.convert(node, p || "outlines");
+      return (r && r.ok) ? r : { schema: {}, ledger: [] };
+    } catch (e) { return { schema: {}, ledger: [] }; }
+  }
+  function blockers(r) {
+    if (!r || !Array.isArray(r.ledger)) return -1;
+    return r.ledger.filter(function (e) { return e.op === "!" && !e.advisory; }).length;
+  }
+  function at(r, path) {
+    var cur = r && r.schema;
+    (path || []).forEach(function (k) { cur = (cur && typeof cur === "object") ? cur[k] : undefined; });
+    return cur;
+  }
+  function wrap(inner) {
+    return { type: "object", properties: { p: inner }, required: ["p"] };
+  }
+
+  // ---- Q1a: `additionalProperties:false` with no `properties` --------------
+  // outlines-core raises; we exited 0. REPAIRED by restoring the default
+  // (#398), which is lossless: the repaired node's regex accepts `{}` and
+  // rejects `{"a":1}`, exactly what the input already meant.
+  var apRepair = conv({ type: "object", additionalProperties: false });
+  ok("#402 closed-object-with-no-properties gains `properties: {}`",
+    JSON.stringify(at(apRepair, ["properties"])) === "{}");
+  ok("#402 that repair is reported, not silent",
+    has(apRepair.ledger, "properties: {}"));
+  ok("#402 the repair never blocks (it is a repair, not a refusal)",
+    blockers(apRepair) === 0);
+  // THE REACHABILITY PIN: we manufacture this shape ourselves, so the
+  // documented "convert for OpenAI, then serve with outlines" workflow is what
+  // produces it. Our own `--to openai` output must survive `--to outlines`.
+  var mfg = E.convert({ type: "object" }, "openai");
+  ok("#402 `--to openai` still manufactures the closed empty object",
+    mfg.ok && mfg.schema.additionalProperties === false &&
+    !isPlainObjectTest(mfg.schema.properties));
+  ok("#402 and `--to outlines` now repairs OUR OWN openai output",
+    JSON.stringify(at(conv(mfg.schema), ["properties"])) === "{}");
+  // Idempotent: a node that already says `properties: {}` is left alone.
+  ok("#402 an already-repaired node is not repaired twice",
+    !has(conv({ type: "object", properties: {}, additionalProperties: false }).ledger,
+      "Added `properties: {}`"));
+
+  // ---- Q1b: a node with NO shape at all ------------------------------------
+  ok("#402 a typeless node carrying a real constraint is blocked",
+    blockers(conv(wrap({ minItems: 1 }))) === 1);
+  // THE CONTROL that makes this about the missing SHAPE and not a keyword list
+  // (#398): a keyword outlines has never heard of behaves identically.
+  ok("#402 a bogus keyword on a typeless node blocks IDENTICALLY (control)",
+    blockers(conv(wrap({ frobnicate: true }))) === 1);
+  // Annotation-only is the one shapeless case with a lossless repair: the
+  // stripped node is `{}`, whose emitted regex is byte-identical.
+  var annot = conv(wrap({ title: "a label", description: "d" }));
+  ok("#402 an annotation-only typeless node is stripped, not blocked",
+    blockers(annot) === 0 &&
+    JSON.stringify(at(annot, ["properties", "p"])) === "{}");
+  ok("#402 and the strip is reported", has(annot.ledger, "annotation-only"));
+
+  // ---- over-block guards: shapes outlines COMPILES must stay unblocked -----
+  // Nine keywords give a typeless node a shape; these are the ones the first
+  // draft got wrong, each caught by the corpus differential or the oracle.
+  ok("#402 `prefixItems` IS a shape (asymmetry with `items`)",
+    blockers(conv({ prefixItems: [{ type: "integer" }] })) === 0);
+  ok("#402 ...while `items` is NOT, and still blocks",
+    blockers(conv(wrap({ items: { type: "string" } }))) === 1);
+  ok("#402 an UNREFERENCED typeless $defs entry is never compiled, so not blocked",
+    blockers(conv({ type: "object", properties: { a: { type: "string" } },
+      required: ["a"], $defs: { T: { maxItems: 5 } } })) === 0);
+  ok("#402 a typeless `allOf` member is absorbed, so not blocked",
+    blockers(conv({ type: "object", properties: { a: { type: "string" } },
+      required: ["a"], allOf: [{ minItems: 1 }] })) === 0);
+  ok("#402 a bare {} compiles and must not be touched",
+    blockers(conv(wrap({}))) === 0 &&
+    JSON.stringify(at(conv(wrap({})), ["properties", "p"])) === "{}");
+  ok("#402 `properties: {}` alone is a shape",
+    blockers(conv(wrap({ properties: {} }))) === 0);
+  ok("#402 `enum` and `const` are shapes",
+    blockers(conv(wrap({ enum: ["a"] }))) === 0 &&
+    blockers(conv(wrap({ const: "a" }))) === 0);
+
+  // ---- Q1c: "refused" is about ANY shape, not an OBJECT shape --------------
+  // Five shapes outlines compiles that we were failing the gate on.
+  ok("#402 `type:\"string\"` + patternProperties is no longer refused",
+    blockers(conv({ type: "string", patternProperties: { "^a": { type: "string" } } })) === 0);
+  ok("#402 `type:\"integer\"` + patternProperties is no longer refused",
+    blockers(conv({ type: "integer", patternProperties: { "^a": { type: "string" } } })) === 0);
+  ok("#402 an `enum` node + patternProperties is no longer refused",
+    blockers(conv({ enum: ["a"], patternProperties: { "^a": { type: "string" } } })) === 0);
+  ok("#402 the UNION spelling of type is no longer refused (#400/#401 again)",
+    blockers(conv({ type: ["object", "null"], not: { type: "string" } })) === 0);
+  // ...but a genuinely shapeless one still is, and exactly ONCE: `outlinesFate`
+  // owns these three keywords and the node-level rule must stay quiet (#359).
+  ok("#402 patternProperties ALONE is still refused, and reported once",
+    blockers(conv({ patternProperties: { "^a": { type: "string" } } })) === 1);
+  ok("#402 `not` ALONE is still refused, and reported once",
+    blockers(conv({ not: { type: "string" } })) === 1);
+  ok("#402 a MALFORMED combinator is reported once (#355 owns it)",
+    blockers(conv({ anyOf: { type: "string" } })) === 1);
+
+  // ---- Q2: `allOf: []` is absorbed by `properties`, NOT by `type` ---------
+  // The false pass: this node accepts NO VALUE AT ALL and we called it
+  // "enforced", i.e. passed it at exit 0.
+  ok("#402 `{type:object, allOf:[]}` with no properties is blocked",
+    blockers(conv({ type: "object", allOf: [] })) === 1);
+  ok("#402 ...but `properties` absorbs it, so a declared object is not blocked",
+    blockers(conv({ type: "object", properties: { a: { type: "string" } },
+      required: ["a"], allOf: [] })) === 0);
+  ok("#402 ...and an EMPTY `properties` absorbs it too",
+    blockers(conv({ type: "object", properties: {}, allOf: [] })) === 0);
+  ok("#402 a non-object node with `allOf: []` still reports (#397 regression)",
+    blockers(conv({ type: "string", allOf: [] })) === 1);
+
+  // ---- THE DISCRIMINATOR (#365): none of this may leak to other targets ----
+  // Without this pair the rule could be firing on all thirteen targets and
+  // every assertion above would still pass.
+  ["openai", "anthropic", "anthropic-json", "anthropic-json-python",
+    "anthropic-go", "gemini", "gemini-json", "gemini-client",
+    "openai-nonstrict", "openai-realtime", "xgrammar", "lmformatenforcer"
+  ].forEach(function (t) {
+    ok("#402 " + t + " does NOT acquire the outlines shapeless rule",
+      !has(conv(wrap({ minItems: 1 }), t).ledger, "cannot build a guide"));
+    ok("#402 " + t + " does NOT acquire the `properties: {}` repair",
+      !has(conv({ type: "object", additionalProperties: false }, t).ledger,
+        "Added `properties: {}`"));
+  });
+})();
+
+function isPlainObjectTest(v) {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

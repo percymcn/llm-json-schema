@@ -2318,5 +2318,48 @@ function fanout(depth) {
     other.status === 0);
 })();
 
+// --- #402: outlines shape rules, end to end through the CLI -----------------
+(function () {
+  var CLOSED_EMPTY = JSON.stringify({ type: "object", additionalProperties: false });
+  var SHAPELESS = JSON.stringify({
+    type: "object", properties: { a: { minItems: 1 } }, required: ["a"]
+  });
+  var ANNOT = JSON.stringify({
+    type: "object", properties: { a: { title: "a label" } }, required: ["a"]
+  });
+  var COMPILES = JSON.stringify({ type: "string", patternProperties: { "^a": { type: "string" } } });
+
+  // The repair path: exit 1, and committing the output re-checks clean.
+  var c1 = run(["--to", "outlines", "--check"], CLOSED_EMPTY);
+  ok("#402 cli a closed empty object needs a change", c1.status === 1);
+  var f1 = run(["--to", "outlines"], CLOSED_EMPTY);
+  ok("#402 cli ...the fix supplies `properties: {}`",
+    JSON.parse(f1.stdout).properties !== undefined);
+  ok("#402 cli ...and committing it re-checks clean",
+    run(["--to", "outlines", "--check"], f1.stdout).status === 0);
+
+  // The blocker path: no repair exists, so exit 3 rather than a guessed fix.
+  ok("#402 cli a shapeless node is a blocker, not a silent pass",
+    run(["--to", "outlines", "--check"], SHAPELESS).status === 3);
+  ok("#402 cli ...and the reason reaches the user",
+    /cannot build a guide/.test(run(["--to", "outlines", "--check"], SHAPELESS).stdout +
+      run(["--to", "outlines", "--check"], SHAPELESS).stderr));
+
+  // The annotation-only node is repaired, not blocked.
+  ok("#402 cli an annotation-only node is fixable rather than fatal",
+    run(["--to", "outlines", "--check"], ANNOT).status === 1);
+
+  // THE OVER-BLOCK REMOVAL, end to end: we used to fail CI on this.
+  ok("#402 cli a node outlines compiles is no longer failed",
+    run(["--to", "outlines", "--check"], COMPILES).status === 0);
+
+  // The targets genuinely disagree about one file — without this the rule
+  // could be firing everywhere and every assertion above would still pass.
+  ok("#402 cli xgrammar accepts the shapeless file outlines blocks",
+    run(["--to", "xgrammar", "--check"], SHAPELESS).status !== 3);
+  ok("#402 cli openai leaves the closed empty object alone",
+    run(["--to", "openai", "--check"], CLOSED_EMPTY).status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
