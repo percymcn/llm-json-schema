@@ -1944,5 +1944,53 @@ function fanout(depth) {
 })();
 
 
+// --- #389: RFC 6901 through the CLI -----------------------------------------
+(function () {
+  var SLASH = JSON.stringify({
+    type: "object", properties: { b: { $ref: "#/$defs/v1~1U" } }, required: ["b"],
+    additionalProperties: false, $defs: { "v1/U": { type: "string", minLength: 3 } }
+  });
+  var TILDE = JSON.stringify({
+    type: "object", properties: { b: { $ref: "#/$defs/a~0b" } }, required: ["b"],
+    additionalProperties: false, $defs: { "a~b": { type: "string", minLength: 3 } }
+  });
+  var PROP = JSON.stringify({
+    type: "object", properties: { b: { $ref: "#/$defs/T/properties/a~1x" } },
+    required: ["b"], additionalProperties: false,
+    $defs: { T: { type: "object", properties: { "a/x": { type: "string" } },
+                  required: ["a/x"], additionalProperties: false } }
+  });
+
+  ["xgrammar", "outlines", "lmformatenforcer"].forEach(function (p) {
+    // Was exit 0 before #389 -- a false pass on a document all three engines
+    // refuse to compile.
+    ok("cli #389: " + p + " --check FAILS on a `/` definition name",
+      run(["--check", "--to", p], SLASH).status === 1);
+    // A silent edit would exit 0 here while still rewriting the pointer.
+    ok("cli #389: " + p + " --check FAILS on the spec-correct `~0` spelling",
+      run(["--check", "--to", p], TILDE).status === 1);
+    ok("cli #389: " + p + " blocks a `/` in a PROPERTY name",
+      run(["--check", "--to", p], PROP).status === 3);
+
+    var out = JSON.parse(run(["--to", p], SLASH).stdout);
+    ok("cli #389: " + p + " emits a grammar-safe definition name",
+      Object.keys(out.$defs)[0] === "v1_U" &&
+      out.properties.b.$ref === "#/$defs/v1_U");
+    ok("cli #389: " + p + " converted output rechecks clean",
+      run(["--check", "--to", p], JSON.stringify(out)).status === 0);
+  });
+
+  // The two families genuinely disagree about the same file.
+  ok("cli #389: openai accepts the `/` name unchanged (escaping is correct there)",
+    run(["--check", "--to", "openai"], SLASH).status === 0);
+  ok("cli #389: openai does not block the `/` PROPERTY name",
+    run(["--check", "--to", "openai"], PROP).status === 0);
+
+  var m = run(["--check", "--to", "xgrammar"], SLASH).stderr || "";
+  ok("cli #389: the diagnosis names the measured mechanism",
+    m.indexOf("no RFC 6901 unescaping") !== -1);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

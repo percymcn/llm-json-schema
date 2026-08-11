@@ -9056,5 +9056,153 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// --- #389: the three decoders do not implement RFC 6901 ----------------------
+//
+// MEASURED on xgrammar 0.2.4 / outlines-core 0.2.14 / lm-format-enforcer 0.11.3.
+// Each splits a pointer on "/" then looks up every token LITERALLY, proven by
+// their own error text (`Cannot find field v1~1Step`, `Invalid reference path:
+// v1~1Step`, `KeyError: 'v1~1Step'`). Consequences point OPPOSITE ways: a "~"
+// name works RAW (so de-escape), a "/" name works in NO spelling (so rename).
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(sch, p);
+    return r && r.ledger ? r : { schema: {}, ledger: [] };
+  }
+  function refsOf(s) {
+    var out = [];
+    (function v(x) {
+      if (Array.isArray(x)) return x.forEach(v);
+      if (!x || typeof x !== "object") return;
+      if (typeof x.$ref === "string") out.push(x.$ref);
+      Object.keys(x).forEach(function (k) { v(x[k]); });
+    })(s);
+    return out;
+  }
+  function defKeys(s, bag) { return Object.keys((s && s[bag]) || {}); }
+  function blockers(r) { return r.ledger.filter(function (l) { return l.op === "!"; }); }
+
+  var DEC = ["xgrammar", "outlines", "lmformatenforcer"];
+  var JSD = ["openai", "anthropic-json", "gemini-json"];
+
+  function slashDoc(ref) {
+    return { type: "object", properties: { b: { $ref: ref } }, required: ["b"],
+             additionalProperties: false,
+             $defs: { "v1/U": { type: "string", minLength: 3 } } };
+  }
+  function tildeDoc(ref) {
+    return { type: "object", properties: { b: { $ref: ref } }, required: ["b"],
+             additionalProperties: false,
+             $defs: { "a~b": { type: "string", minLength: 3 } } };
+  }
+
+  DEC.forEach(function (p) {
+    // A "/" name: BOTH spellings are unreachable, so both must be renamed.
+    ["#/$defs/v1~1U", "#/$defs/v1/U"].forEach(function (ref) {
+      var r = conv(slashDoc(ref), p);
+      ok("#389 " + p + ": renames a `/` definition (" + ref + ")",
+        defKeys(r.schema, "$defs").indexOf("v1_U") !== -1 &&
+        defKeys(r.schema, "$defs").indexOf("v1/U") === -1);
+      ok("#389 " + p + ": repoints to the renamed definition (" + ref + ")",
+        refsOf(r.schema).indexOf("#/$defs/v1_U") !== -1);
+      ok("#389 " + p + ": the rename is REPORTED, never silent (" + ref + ")",
+        has(r.ledger, "Renamed"));
+    });
+
+    // A "~" name: the RAW spelling already works, so the spec form is
+    // de-escaped and the raw form is left completely alone.
+    var esc = conv(tildeDoc("#/$defs/a~0b"), p);
+    ok("#389 " + p + ": de-escapes `~0` to the raw spelling",
+      refsOf(esc.schema).indexOf("#/$defs/a~b") !== -1);
+    ok("#389 " + p + ": the de-escape is REPORTED (a silent edit exits 0)",
+      has(esc.ledger, "Un-escaped"));
+    ok("#389 " + p + ": a `~` definition is NOT renamed (raw already resolves)",
+      defKeys(esc.schema, "$defs").indexOf("a~b") !== -1);
+
+    var raw = conv(tildeDoc("#/$defs/a~b"), p);
+    ok("#389 " + p + ": an already-raw `~` pointer is left alone",
+      refsOf(raw.schema).indexOf("#/$defs/a~b") !== -1 && raw.ledger.filter(
+        function (l) { return String(l.msg || "").indexOf("Un-escaped") !== -1; }).length === 0);
+
+    // The tail of a pointer-INTO must survive the rename.
+    var into = conv({
+      type: "object", properties: { b: { $ref: "#/$defs/v1~1U/properties/a" } },
+      required: ["b"], additionalProperties: false,
+      $defs: { "v1/U": { type: "object", properties: { a: { type: "string" } },
+                         required: ["a"], additionalProperties: false } }
+    }, p);
+    ok("#389 " + p + ": a pointer-into keeps its tail across the rename",
+      refsOf(into.schema).indexOf("#/$defs/v1_U/properties/a") !== -1);
+
+    // Collision: the obvious rename target is already taken, so it must NOT be
+    // merged into the existing definition.
+    var coll = conv({
+      type: "object", properties: { b: { $ref: "#/$defs/v1~1U" } }, required: ["b"],
+      additionalProperties: false,
+      $defs: { "v1/U": { type: "string", minLength: 3 }, "v1_U": { type: "integer" } }
+    }, p);
+    ok("#389 " + p + ": a rename collision does not merge two definitions",
+      defKeys(coll.schema, "$defs").length === 2 &&
+      defKeys(coll.schema, "$defs").indexOf("v1_U") !== -1 &&
+      coll.schema.$defs.v1_U.type === "integer");
+
+    // A PROPERTY name with "/" is NOT renameable -- it is the data contract.
+    var prop = conv({
+      type: "object", properties: { b: { $ref: "#/$defs/T/properties/a~1x" } },
+      required: ["b"], additionalProperties: false,
+      $defs: { T: { type: "object", properties: { "a/x": { type: "string" } },
+                    required: ["a/x"], additionalProperties: false } }
+    }, p);
+    ok("#389 " + p + ": a `/` in a PROPERTY name is a blocker, not a rename",
+      blockers(prop).length > 0 && has(prop.ledger, "data contract"));
+
+    // `definitions` is handled too and is deliberately NOT renamed to `$defs`.
+    var defsBag = conv({
+      type: "object", properties: { b: { $ref: "#/definitions/v1~1U" } }, required: ["b"],
+      additionalProperties: false, definitions: { "v1/U": { type: "string" } }
+    }, p);
+    ok("#389 " + p + ": the `definitions` bag is repaired and not renamed",
+      defKeys(defsBag.schema, "definitions").indexOf("v1_U") !== -1 &&
+      refsOf(defsBag.schema).indexOf("#/definitions/v1_U") !== -1);
+
+    // OVER-BLOCK GUARDS -- an ordinary document must be untouched.
+    var plain = conv({
+      type: "object", properties: { b: { $ref: "#/$defs/S" } }, required: ["b"],
+      additionalProperties: false, $defs: { S: { type: "string" } }
+    }, p);
+    ok("#389 " + p + ": an ordinary definition name is untouched",
+      defKeys(plain.schema, "$defs").indexOf("S") !== -1 &&
+      !has(plain.ledger, "Renamed") && !has(plain.ledger, "Un-escaped"));
+
+    var idem = conv(conv(slashDoc("#/$defs/v1~1U"), p).schema, p);
+    ok("#389 " + p + ": the repair is idempotent",
+      !has(idem.ledger, "Renamed"));
+  });
+
+  // THE DISCRIMINATOR: the two target families disagree about the SAME file, in
+  // opposite directions. Without this the rule could be firing blanket and every
+  // assertion above would still pass (#365).
+  JSD.forEach(function (p) {
+    var r = conv(slashDoc("#/$defs/v1~1U"), p);
+    ok("#389 " + p + ": a JSON-Schema target does NOT rename the definition",
+      !has(r.ledger, "Renamed"));
+    var t = conv(tildeDoc("#/$defs/a~0b"), p);
+    ok("#389 " + p + ": a JSON-Schema target does NOT de-escape",
+      !has(t.ledger, "Un-escaped"));
+  });
+  // ...and the property-name case is a blocker ONLY on the decoders: OpenAI
+  // reads `~1` correctly, so blocking there would be blanket strictness.
+  (function () {
+    var prop = {
+      type: "object", properties: { b: { $ref: "#/$defs/T/properties/a~1x" } },
+      required: ["b"], additionalProperties: false,
+      $defs: { T: { type: "object", properties: { "a/x": { type: "string" } },
+                    required: ["a/x"], additionalProperties: false } }
+    };
+    ok("#389 openai: a `/` PROPERTY name is NOT blocked (it reads `~1`)",
+      conv(prop, "openai").ledger.filter(function (l) { return l.op === "!"; }).length === 0);
+  })();
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

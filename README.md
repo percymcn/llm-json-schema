@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1471 engine + 323 CLI + 83 ESM/library assertions = **1877** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1526 engine + 341 CLI + 83 ESM/library assertions = **1950** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -734,6 +734,46 @@ siblings require, or one property declared with two different shapes — the too
 blocks and names the remodelling rather than picking a side, because either
 choice silently changes which documents are accepted.
 
+## The three decoders do not implement RFC 6901
+
+A JSON Pointer splits on `/`, so a definition *named* `v1/User` has to be
+referenced as `#/$defs/v1~1User` — `~1` is an escaped `/`, `~0` an escaped `~`.
+All three constrained decoders **split on `/` and then look every token up
+literally, with no unescaping.** That is not inferred; it is what their own
+errors say:
+
+| document | xgrammar | outlines-core | lm-format-enforcer |
+|---|---|---|---|
+| `#/$defs/Step` → `Step` *(control)* | compiles | compiles | compiles |
+| `#/$defs/v1~1U` → `v1/U` *(spec-correct)* | `Cannot find field v1~1U` | `Invalid reference path: v1~1U` | `KeyError: 'v1~1U'` |
+| `#/$defs/v1/U` → `v1/U` *(what zod emits)* | fails | `Invalid reference path: v1` | `KeyError: 'U'` |
+| `#/$defs/a~0b` → `a~b` *(spec-correct)* | fails | fails | `KeyError: 'a~0b'` |
+| `#/$defs/a~b` → `a~b` *(raw)* | **compiles** | **compiles** | **compiles** |
+
+The last two rows are the point, and they pull in opposite directions:
+
+- **A `~` in a name has a working spelling — the raw one.** So the repair is to
+  **un-escape**, which is the exact inverse of what `--to openai` does. The same
+  document has two opposite canonical spellings depending on who reads it.
+- **A `/` in a name has no working spelling at all**, because `/` is the token
+  separator. Escaping cannot help. The only repair is to **rename the definition
+  key** and repoint every reference — lossless, because a definition key is an
+  internal label while the pointer is a grammar. Collisions get a suffix rather
+  than being merged.
+
+The same character in a *property* name gets the opposite verdict:
+`#/$defs/T/properties/a~1x` is equally unreachable, and renaming a property
+would change which JSON the model must emit — so that is a **blocker** naming
+the remodelling, not a repair. It is a blocker on the three decoders only;
+`--to openai` reads `~1` correctly and is left alone.
+
+This is reachable from the dominant generator *and from this tool*:
+`zodToJsonSchema(schema, "v1/User")` reproduces the name verbatim in both the key
+and the pointer, and `--to openai` escapes it to `~1` — so the documented
+workflow *"convert for OpenAI, then serve with vLLM"* hands these engines a
+pointer they cannot read. Measured end to end, our repaired output goes from
+**0 to 11 of 11 compiling** across the three engines.
+
 ## One decoder's table does not transfer — `--to xgrammar`
 
 `--to outlines` above establishes the enforcement question. `--to xgrammar`
@@ -977,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1877 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1950 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

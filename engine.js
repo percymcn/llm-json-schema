@@ -1393,6 +1393,145 @@
     return s;
   }
 
+  // #389: THE THREE CONSTRAINED DECODERS DO NOT IMPLEMENT RFC 6901 AT ALL.
+  //
+  // Measured on xgrammar 0.2.4 / outlines-core 0.2.14 / lm-format-enforcer
+  // 0.11.3, and the mechanism is proven by their own error text rather than
+  // inferred: each SPLITS the pointer on `/` and then looks up every token
+  // LITERALLY, with no unescaping. xgrammar says `Cannot find field v1~1Step`,
+  // outlines says `Invalid reference path: v1~1Step`, lm-format-enforcer raises
+  // `KeyError: 'v1~1Step'` — three engines naming the ESCAPED token as the thing
+  // they could not find. Feed the raw-slash form instead and outlines says
+  // `Invalid reference path: v1`, i.e. it split first.
+  //
+  // Two consequences, and they point in OPPOSITE directions — which is the whole
+  // reason this is not one repair:
+  //
+  //   * A name containing `~` HAS a working spelling: the RAW one. `{"a~b": …}`
+  //     referenced as `#/$defs/a~b` COMPILES in all three (measured), while the
+  //     spec-correct `#/$defs/a~0b` fails in all three. So the repair is to
+  //     DE-ESCAPE — the exact inverse of #379's `normalizeRefEscaping`, which is
+  //     correct for OpenAI and wrong here. Same document, two destinations,
+  //     opposite canonical spellings.
+  //
+  //   * A name containing `/` has NO working spelling anywhere, because `/` is
+  //     the token separator itself. No escaping and no de-escaping can reach it.
+  //     The only repair is to RENAME the definition key and repoint every
+  //     reference — lossless, because a definition key is an INTERNAL LABEL
+  //     while the pointer is a grammar (#379's observation, now load-bearing).
+  //
+  // The same character in a REST token is a different question and gets the
+  // opposite answer: `#/$defs/T/properties/a~1x` names a PROPERTY `a/x`, and a
+  // property name is part of the DATA CONTRACT — renaming it changes which JSON
+  // the model must emit. Not repairable, so it is named rather than guessed
+  // (#329). Measured broken with a discriminating control.
+  //
+  // Reachability is the dominant generator plus our own output: zod-to-json-schema
+  // reproduces the name verbatim in BOTH the key and the pointer (so it emits the
+  // raw form), and `--to openai` ESCAPES it (#379), so the documented workflow
+  // "convert for OpenAI, then serve with vLLM" hands these engines a `~1` they
+  // cannot read.
+  function decoderRefTokens(s, ledger, docUrl) {
+    var bags = ["$defs", "definitions"], renamed = [], blocked = [], deescaped = [];
+
+    bags.forEach(function (bag) {
+      var defs = s[bag];
+      if (!isPlainObject(defs)) return;
+
+      // Pass A -- resolve every pointer while the ORIGINAL names are still in
+      // place. Resolution is document-driven (#379), so a pointer written in
+      // either spelling still finds its target; doing this first is what makes
+      // the rename safe without cloning the document.
+      var sites = [];
+      (function visit(v) {
+        if (Array.isArray(v)) { v.forEach(visit); return; }
+        if (!isPlainObject(v)) return;
+        if (typeof v.$ref === "string" && v.$ref.charAt(0) === "#") {
+          var r = defBagRef(s, v.$ref);
+          if (r && r.bag === bag) sites.push({ node: v, r: r });
+        }
+        Object.keys(v).forEach(function (k) { visit(v[k]); });
+      })(s);
+
+      var rename = {}, used = {};
+      Object.keys(defs).forEach(function (k) {
+        if (k.indexOf("/") === -1) return;
+        var base = k.replace(/\//g, "_"), next = base, i = 2;
+        // Fail closed on collision: never silently merge two definitions.
+        while (hasOwn(defs, next) || hasOwn(used, next)) { next = base + "_" + i; i++; }
+        setOwn(used, next, true);
+        rename[k] = next;
+      });
+      Object.keys(rename).forEach(function (old) {
+        setOwn(defs, rename[old], defs[old]);
+        delete defs[old];
+        renamed.push({ from: old, to: rename[old] });
+      });
+
+      // Pass B -- re-emit every pointer RAW, which is the only spelling these
+      // engines can read, carrying the rename where one happened.
+      sites.forEach(function (site) {
+        var r = site.r;
+        var bad = r.rest.filter(function (t) { return t.indexOf("/") !== -1; });
+        if (bad.length) {
+          if (blocked.indexOf(site.node.$ref) === -1) blocked.push(site.node.$ref);
+          return;
+        }
+        var isRenamed = hasOwn(rename, r.name);
+        var name = isRenamed ? rename[r.name] : r.name;
+        var canon = "#/" + bag + "/" + name +
+          (r.rest.length ? "/" + r.rest.join("/") : "");
+        if (canon === site.node.$ref) return;
+        // A de-escape is a DIFFERENT edit from a rename and needs its own line,
+        // or `--check` exits 0 on a document we changed -- which is the silent
+        // edit this project treats as worse than no gate. (Caught by running the
+        // CLI, not by reading the patch.)
+        if (!isRenamed && deescaped.indexOf(site.node.$ref) === -1) {
+          deescaped.push(site.node.$ref);
+        }
+        setOwn(site.node, "$ref", canon);
+      });
+    });
+
+    if (renamed.length) {
+      ledger.push(entry("~", "root",
+        "Renamed " + renamed.length + " definition" + (renamed.length > 1 ? "s" : "") +
+        " whose name contains a `/` (`" + renamed[0].from + "` -> `" + renamed[0].to +
+        "`) and repointed every `$ref`. A JSON Pointer splits on `/`, and these three " +
+        "decoders then look each token up LITERALLY with no RFC 6901 unescaping — measured, " +
+        "`#/" + bags[0] + "/v1~1U` fails with `Cannot find field v1~1U` and the raw " +
+        "`#/" + bags[0] + "/v1/U` fails as `Invalid reference path: v1`. So a name carrying a " +
+        "`/` has NO spelling that resolves here and escaping cannot help; renaming the KEY " +
+        "can, because a definition key is an internal label while the pointer is a grammar, " +
+        "so nothing the model emits changes. `zodToJsonSchema(schema, \"v1/User\")` produces " +
+        "exactly this, and `--to openai` escapes it to `~1`, which these engines also reject.",
+        docUrl));
+    }
+    if (deescaped.length) {
+      ledger.push(entry("~", "root",
+        "Un-escaped " + deescaped.length + " `$ref` (`" + deescaped[0] + "`). These three " +
+        "decoders look a pointer token up LITERALLY with no RFC 6901 unescaping, so the " +
+        "SPEC-CORRECT `~0` spelling of a `~` in a name is exactly what they cannot find — " +
+        "measured, `#/$defs/a~0b` fails in all three (`KeyError: 'a~0b'`) while the raw " +
+        "`#/$defs/a~b` compiles in all three. This is the inverse of the escaping `--to " +
+        "openai` performs, which is correct for that destination: the same document has two " +
+        "opposite canonical spellings depending on who reads it. Nothing is lost — the " +
+        "definition and everything it constrains are untouched.",
+        docUrl));
+    }
+    if (blocked.length) {
+      ledger.push(entry("!", "root",
+        "This `$ref` points at a PROPERTY whose name contains a `/` (`" + blocked[0] +
+        "`). These decoders split a pointer on `/` and never unescape, so no spelling of " +
+        "that pointer reaches it. Unlike a definition name this is not renameable here — a " +
+        "property name is part of the data contract, so changing it changes which JSON the " +
+        "model must emit. Rename the property in the schema you generate from, or reference " +
+        "the whole definition instead of pointing into it.",
+        docUrl));
+    }
+    return s;
+  }
+
   function normalizeRefSpelling(s, ledger, docUrl, why) {
     var bags = ["$defs", "definitions"];
     var rewritten = 0, external = [];
@@ -6409,6 +6548,9 @@
     // JSON-Schema-dialect targets since that cycle and never to these three —
     // which is why the loss was silent here and repaired there.
     s = liftBareAllOfRef(s);
+    // Before the merge, so every pointer it reads is already in the one spelling
+    // these engines can resolve (#389).
+    s = decoderRefTokens(s, ledger, url);
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
@@ -6576,6 +6718,9 @@
     var url = DOCS.xgrammar;
 
     s = liftBareAllOfRef(s);
+    // Before the merge, so every pointer it reads is already in the one spelling
+    // these engines can resolve (#389).
+    s = decoderRefTokens(s, ledger, url);
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
@@ -6793,6 +6938,9 @@
     var url = DOCS.lmformatenforcer;
 
     s = liftBareAllOfRef(s);
+    // Before the merge, so every pointer it reads is already in the one spelling
+    // these engines can resolve (#389).
+    s = decoderRefTokens(s, ledger, url);
     s = resolveRefSiblings(s, ledger, url,
       DECODER_REF_SIBLING_WHY, DECODER_REF_SIBLING_RECURSIVE, undefined, true);
 
