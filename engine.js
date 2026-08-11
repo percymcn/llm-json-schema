@@ -6530,9 +6530,29 @@
   //   * at least one sibling must actually CONSTRAIN, so pydantic v1's
   //     `{title, description, allOf:[{$ref}]}` — annotations only — is left
   //     byte-identical rather than rewritten for no benefit.
-  function liftBareAllOfRef(s) {
-    function visit(node, atRoot) {
-      if (Array.isArray(node)) return node.forEach(function (n) { visit(n, false); });
+  // THE LIFT IS AN EDIT, AND IT HAS TO SAY SO. It deletes `allOf` and writes a
+  // `$ref` the caller never typed, and it used to do that with no ledger line at
+  // all. Where the merge below then fires, the merge's own entry covers it; where
+  // the merge does NOT fire the rewrite shipped unannounced, and for a recursive
+  // member (`allOf: [{ $ref: "#" }]`) nothing downstream fires at all — measured
+  // 2026-08-11, `--check --to outlines` printed "Already valid ... No changes
+  // needed." and exited 0 while `--to outlines` on the same file emitted a
+  // structurally different document. The two halves of the CLI contradicted each
+  // other about one file.
+  //
+  // Reported as a `~` rather than suppressed, because the honest fact is that the
+  // document changed: the meaning is identical (draft 2020-12 applies the
+  // referent AND the siblings either way, so `{X, allOf:[{$ref:R}]}` ≡
+  // `{X, $ref:R}`), but the bytes are not, and "no changes needed" is a claim
+  // about the bytes. It also makes the messages BELOW true of the document they
+  // describe: once the lift is on the record, "Inlined 1 `$ref` that carried
+  // sibling keywords" reads as the next edit in a sequence rather than as a
+  // statement about a `$ref` the reader cannot find in their own file.
+  function liftBareAllOfRef(s, ledger, docUrl) {
+    function visit(node, atRoot, path) {
+      if (Array.isArray(node)) {
+        return node.forEach(function (n, i) { visit(n, false, path + "[" + i + "]"); });
+      }
       if (!isPlainObject(node)) return;
       if (Array.isArray(node.allOf) && node.allOf.length === 1 &&
           isPlainObject(node.allOf[0]) &&
@@ -6545,11 +6565,22 @@
         if (constrains) {
           setOwn(node, "$ref", node.allOf[0].$ref);
           delete node.allOf;
+          if (Array.isArray(ledger)) {
+            ledger.push(entry("~", path,
+              "Rewrote `allOf: [{ $ref }]` here into a `$ref` beside this node's own keywords. " +
+              "Draft 2020-12 applies the referenced schema AND its siblings, so " +
+              "`{…, allOf: [{ $ref: R }]}` and `{…, $ref: R}` are the same intersection — this is a " +
+              "SPELLING change, not a meaning change, and it is what lets the `$ref`-sibling repair " +
+              "below see the composition at all. It is on the record because your file says `allOf` " +
+              "and the output says `$ref`: without this line the two halves of the CLI disagree, " +
+              "`--check` reporting \"no changes needed\" for a document `--to` rewrites.",
+              docUrl));
+          }
         }
       }
-      Object.keys(node).forEach(function (k) { visit(node[k], false); });
+      Object.keys(node).forEach(function (k) { visit(node[k], false, path + "/" + k); });
     }
-    visit(s, true);
+    visit(s, true, "root");
     return s;
   }
 
@@ -6738,7 +6769,7 @@
     // that buys nothing. This is #371's merge, which has been wired to the three
     // JSON-Schema-dialect targets since that cycle and never to these three —
     // which is why the loss was silent here and repaired there.
-    s = liftBareAllOfRef(s);
+    s = liftBareAllOfRef(s, ledger, url);
     // FIRST, for the reason in the xgrammar converter: an unnormalised
     // `/$defs/P` is invisible to every reader below it (#391).
     s = normalizeRefSpelling(s, ledger, url,
@@ -6916,7 +6947,7 @@
     var ledger = [];
     var url = DOCS.xgrammar;
 
-    s = liftBareAllOfRef(s);
+    s = liftBareAllOfRef(s, ledger, url);
     // FIRST, so every reader below sees a pointer it can resolve at all: the
     // document-driven reader all of them share requires the `#` fragment, so an
     // unnormalised `/$defs/P` is invisible to decoderRefTokens AND to the
@@ -7167,7 +7198,7 @@
     var ledger = [];
     var url = DOCS.lmformatenforcer;
 
-    s = liftBareAllOfRef(s);
+    s = liftBareAllOfRef(s, ledger, url);
     // FIRST, for the reason in the xgrammar converter: an unnormalised
     // `/$defs/P` is invisible to every reader below it (#391).
     s = normalizeRefSpelling(s, ledger, url,

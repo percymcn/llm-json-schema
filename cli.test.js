@@ -2027,5 +2027,45 @@ function fanout(depth) {
   });
 })();
 
+// #393 -- the two halves of the CLI must agree about one file. Before the fix,
+// `--check` printed "Already valid ... No changes needed." and exited 0 while
+// `--to` on the SAME file emitted a structurally different document, because the
+// `allOf: [{ $ref }]` lift reported nothing and (for a recursive member) nothing
+// downstream fired either.
+(function () {
+  var DOC = JSON.stringify({
+    type: "object", properties: { a: { type: "string" } },
+    required: ["a"], allOf: [{ $ref: "#" }]
+  });
+  ["outlines", "xgrammar", "lmformatenforcer"].forEach(function (p) {
+    var chk = run(["--to", p, "--check", "-"], DOC);
+    var out = run(["--to", p, "-"], DOC);
+    var changed = JSON.stringify(JSON.parse(out.stdout)) !== JSON.stringify(JSON.parse(DOC));
+
+    ok("#393 cli " + p + ": --to really does rewrite this document", changed);
+    // The defect: these two must not contradict each other.
+    ok("#393 cli " + p + ": --check reports the rewrite instead of exiting 0",
+      chk.status === 1, "exit=" + chk.status);
+    ok("#393 cli " + p + ": --check does not claim \"No changes needed\"",
+      chk.stderr.indexOf("No changes needed") === -1);
+    ok("#393 cli " + p + ": the rewrite is named in the reader's own vocabulary",
+      chk.stderr.indexOf("allOf") !== -1 && chk.stderr.indexOf("$ref") !== -1);
+    // Idempotent: converting our own output introduces nothing further.
+    var again = run(["--to", p, "--check", "-"], out.stdout);
+    ok("#393 cli " + p + ": converted output re-checks clean", again.status === 0,
+      "exit=" + again.status);
+  });
+
+  // Over-block guard: pydantic v1's annotations-only wrapper is left alone, so
+  // the gate must stay quiet about it rather than reporting a rewrite.
+  var V1 = JSON.stringify({
+    type: "object", required: ["inner"],
+    properties: { inner: { title: "Inner", description: "d", allOf: [{ $ref: "#/definitions/Inner" }] } },
+    definitions: { Inner: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } }
+  });
+  ok("#393 cli xgrammar: annotations-only `allOf` draws no lift line",
+    run(["--to", "xgrammar", "--check", "-"], V1).stderr.indexOf("Rewrote `allOf") === -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

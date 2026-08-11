@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1623 engine + 350 CLI + 83 ESM/library assertions = **2056** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1657 engine + 366 CLI + 83 ESM/library assertions = **2106** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1017,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2056 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2106 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -2134,3 +2134,46 @@ generatable and the violating one is refused, on all three.
 
 `--to openai`, `--to anthropic-json` and `--to gemini` are unchanged: they inline
 the root `$ref` earlier, so there is no root `$ref` left by the time this runs.
+
+## The edit that reported nothing, and the two halves of the CLI that disagreed
+
+`{…, allOf: [{ $ref: R }]}` — the OpenAPI "extend this base schema" spelling —
+means exactly what `{…, $ref: R}` means: draft 2020-12 applies the referent *and*
+the siblings, so both are the same intersection. The three constrained-decoder
+targets lift the one into the other so a single repair can handle both spellings.
+
+That lift **deletes `allOf` and writes a `$ref` the caller never typed**, and it
+used to do so with no ledger line. Where the merge below then fired, the merge's
+own entry covered it. Where it did not, the rewrite shipped unannounced — and for
+a *recursive* member nothing downstream fired at all:
+
+```json
+{ "type": "object", "properties": { "a": { "type": "string" } },
+  "required": ["a"], "allOf": [{ "$ref": "#" }] }
+```
+
+Measured 2026-08-11, on all three decoder targets:
+
+| command | before | after |
+|---|---|---|
+| `--check` | `Already valid … No changes needed.` — **exit 0** | reports the rewrite — exit 1 |
+| `--to` (same file) | emits a **structurally different** document | unchanged behaviour |
+
+The two halves of the CLI contradicted each other about one file. The output was
+not wrong — the emitted grammars for the two spellings are byte-identical on
+xgrammar and outlines, and on lm-format-enforcer the raw form does not build at
+all (`ValueError: No definitions found in schema`) while the lifted form does, so
+the rewrite is a genuine repair. It simply never said it had happened, and
+"no changes needed" is a claim about the bytes, not about the meaning.
+
+Reporting it also makes the messages *below* true of the document they describe.
+Before, a reader whose file contained no `$ref` was told either "Inlined 1 `$ref`
+that carried sibling keywords" or "This `$ref` and its siblings cannot both be
+satisfied". With the lift on the record those read as the next edit in a
+sequence rather than as claims about something they cannot find in their file.
+
+Deliberately unchanged, and each is pinned by a test: pydantic v1's
+`{title, description, allOf: [{$ref}]}` is annotations-only, so no lift fires and
+the wrapper survives byte-identical; a two-member `allOf` is a real composition;
+a node that already carries a `$ref` is never lifted over; and the
+JSON-Schema-dialect targets do not run this rewrite at all.

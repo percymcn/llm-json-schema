@@ -9648,5 +9648,139 @@ function fanoutSchema(depth, cyclic) {
   function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
 })();
 
+// ---------------------------------------------------------------------------
+// #393 -- liftBareAllOfRef is an EDIT and has to say so.
+//
+// It deletes `allOf` and writes a `$ref` the caller never typed. Where the merge
+// below fires, the merge's entry covered it; where it does NOT fire the rewrite
+// shipped unannounced, and for a recursive member NOTHING downstream fired at
+// all -- `--check` said "Already valid ... No changes needed." (exit 0) while
+// `--to` on the same file emitted a structurally different document.
+// ---------------------------------------------------------------------------
+(function () {
+  var DEC = ["outlines", "xgrammar", "lmformatenforcer"];
+  var LIFT = "Rewrote `allOf: [{ $ref }]`";
+
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function entryAt(r, substr) {
+    for (var i = 0; i < r.ledger.length; i++) {
+      if (String(r.ledger[i].msg).indexOf(substr) !== -1) return r.ledger[i];
+    }
+    return null;
+  }
+  function changes(r) {
+    return r.ledger.filter(function (l) { return l.op !== "=" && !l.advisory; });
+  }
+
+  // The bug in its purest form: a recursive member means the merge never runs,
+  // so before this fix the whole rewrite was invisible.
+  var RECURSIVE = { type: "object", properties: { a: { type: "string" } },
+                    required: ["a"], allOf: [{ $ref: "#" }] };
+
+  DEC.forEach(function (t) {
+    var r = conv(RECURSIVE, t);
+    ok("#393 " + t + ": a recursive `allOf: [{$ref}]` lift is REPORTED", !!entryAt(r, LIFT));
+    // The whole defect: `--check` computes its verdict from this list.
+    ok("#393 " + t + ": that rewrite counts as a change (was 0 -> \"no changes needed\")",
+      changes(r).length > 0);
+    // ...and the document really did change, so reporting it is the honest answer.
+    ok("#393 " + t + ": and the document really was rewritten",
+      typeof r.schema.$ref === "string" && !Array.isArray(r.schema.allOf));
+  });
+
+  // Merge SUCCEEDS: two entries, not one. A lift and an intersection are
+  // different edits with different reasons (#389); collapsing them under-reports.
+  (function () {
+    var doc = { type: "object", properties: { a: { type: "string" } }, required: ["a"],
+                allOf: [{ $ref: "#/$defs/T" }],
+                $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } } };
+    DEC.forEach(function (t) {
+      var r = conv(doc, t);
+      ok("#393 " + t + ": lift reported alongside the merge it enables",
+        !!entryAt(r, LIFT) && has(r.ledger, "Inlined 1 `$ref`"));
+      // The merge must still do its job -- the repair is the point of the lift.
+      var p = r.schema.properties || {};
+      ok("#393 " + t + ": the merge still keeps BOTH sides' properties",
+        !!p.a && !!p.b);
+    });
+  })();
+
+  // Merge BLOCKED: the lift already happened, so without its entry the blocker
+  // opens by describing a `$ref` the reader cannot find in their own file.
+  (function () {
+    var doc = { type: "object", properties: { a: { type: "string" } }, required: ["a"],
+                allOf: [{ $ref: "#/$defs/T" }],
+                $defs: { T: { type: "object", properties: { b: { type: "string" } },
+                              required: ["b"], additionalProperties: false } } };
+    DEC.forEach(function (t) {
+      var r = conv(doc, t);
+      ok("#393 " + t + ": lift reported even when the merge is blocked",
+        !!entryAt(r, LIFT));
+      ok("#393 " + t + ": the blocker itself still fires",
+        r.ledger.some(function (l) { return l.op === "!" && !l.advisory; }));
+    });
+  })();
+
+  // The entry names WHERE, and a nested lift must not claim to be at the root.
+  (function () {
+    var doc = { type: "object", required: ["inner"],
+                properties: { inner: { type: "object", properties: { a: { type: "string" } },
+                                       required: ["a"], allOf: [{ $ref: "#/$defs/T" }] } },
+                $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } } };
+    var e = entryAt(conv(doc, "xgrammar"), LIFT);
+    ok("#393 a nested lift reports its own path, not `root`",
+      !!e && e.path !== "root" && String(e.path).indexOf("inner") !== -1);
+  })();
+
+  // ---- over-block guards: these hold BOTH ways, and each is load-bearing ----
+
+  // pydantic v1's `{title, description, allOf:[{$ref}]}` is annotations-only, so
+  // the lift must not fire -- rewriting it would be an edit that buys nothing.
+  (function () {
+    var v1 = { title: "Inner", description: "an inner", allOf: [{ $ref: "#/definitions/Inner" }] };
+    var doc = { type: "object", required: ["inner"], properties: { inner: v1 },
+                definitions: { Inner: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } } };
+    DEC.forEach(function (t) {
+      var r = conv(doc, t);
+      ok("#393 " + t + ": pydantic v1 annotations-only draws NO lift entry",
+        !entryAt(r, LIFT) && Array.isArray((r.schema.properties || {}).inner &&
+          r.schema.properties.inner.allOf));
+    });
+  })();
+
+  // A two-member `allOf` is a real composition; lifting it would change meaning.
+  (function () {
+    var doc = { type: "object", properties: { a: { type: "string" } }, required: ["a"],
+                allOf: [{ $ref: "#/$defs/T" }, { type: "object" }],
+                $defs: { T: { type: "object", properties: { b: { type: "string" } }, required: ["b"] } } };
+    DEC.forEach(function (t) {
+      ok("#393 " + t + ": a two-member `allOf` draws no lift entry",
+        !entryAt(conv(doc, t), LIFT));
+    });
+  })();
+
+  // A node already carrying a `$ref` must not have it overwritten.
+  (function () {
+    var doc = { $ref: "#/$defs/U", minLength: 3, allOf: [{ $ref: "#/$defs/T" }],
+                $defs: { T: { type: "string" }, U: { type: "string" } } };
+    var r = conv(doc, "xgrammar");
+    ok("#393 a node that already has a `$ref` is not lifted over",
+      !entryAt(r, LIFT));
+  })();
+
+  // THE DISCRIMINATOR (#365): the JSON-Schema-dialect targets do not run this
+  // rewrite at all. Without this pin the rule could be firing on every target
+  // and every assertion above would still pass.
+  ["openai", "anthropic", "anthropic-json", "gemini", "gemini-json"].forEach(function (t) {
+    ok("#393 " + t + " does not acquire the decoder lift entry",
+      !entryAt(conv(RECURSIVE, t), LIFT));
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
