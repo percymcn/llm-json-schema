@@ -1532,7 +1532,7 @@
     return s;
   }
 
-  function normalizeRefSpelling(s, ledger, docUrl, why) {
+  function normalizeRefSpelling(s, ledger, docUrl, why, externalWhy) {
     var bags = ["$defs", "definitions"];
     var rewritten = 0, external = [];
     (function visit(v) {
@@ -1567,8 +1567,10 @@
     external.forEach(function (ref) {
       ledger.push(entry("!", "root",
         "`$ref: \"" + ref + "\"` points outside this document and there is no matching local " +
-        "definition to resolve it against. No provider fetches external schema references — the " +
-        "reference arrives dangling. Inline the definition or add it to `$defs`.",
+        "definition to resolve it against. " +
+        (externalWhy ||
+          "No provider fetches external schema references — the reference arrives dangling.") +
+        " Inline the definition or add it to `$defs`.",
         docUrl || DOCS.openai));
     });
     return s;
@@ -6535,6 +6537,38 @@
     "and the merged form is enforced by all three, with every legal value still generatable";
   var DECODER_REF_SIBLING_RECURSIVE = "a constrained decoder drops the sibling silently";
 
+  // #320's repair, wired to the three JSON-Schema-dialect targets when it was
+  // written and never inherited by the three decoders added in #384/#385/#386 --
+  // a repair is a property of a CODE PATH, and the newest paths carry the fewest
+  // (#388/#390). The engines do NOT agree about this spelling, which is why the
+  // gap was invisible: measured on xgrammar 0.2.4, outlines-core 0.2.14 and
+  // lm-format-enforcer 0.11.3, outlines and lmfe RESOLVE `/$defs/P` correctly
+  // while xgrammar compiles it to its match-anything fallback.
+  var DECODER_REF_SPELLING_WHY =
+    "the three decoders disagree about this spelling, so it is worse than a style nit. " +
+    "Measured on xgrammar 0.2.4: `{\"$ref\": \"/$defs/P\"}` compiles WITHOUT error to " +
+    "`root_prop_0 ::= ((ref))`, where `ref ::= basic_number | basic_string | basic_boolean | " +
+    "basic_null | basic_array | basic_object` — the referenced constraint is gone and the field " +
+    "accepts ANY JSON, with only a `Warning: URI should either be '#' or start with '#/'` on " +
+    "stderr. outlines-core 0.2.14 and lm-format-enforcer 0.11.3 resolve the same pointer " +
+    "correctly, so the constraint survives there and vanishes on xgrammar. AND ON ALL THREE it " +
+    "defeats a repair this tool already ships: `$ref`-sibling merging (#388) reads pointers with " +
+    "the same document-driven reader, which cannot see this spelling, so a `minLength` beside " +
+    "such a `$ref` is left unmerged and then ignored by every one of the three engines — " +
+    "measured, a 2-character string passes a `minLength: 5` on all three";
+  // The two dangling forms fail in OPPOSITE directions on xgrammar, and that
+  // asymmetry is the whole reason the external one is worth its own sentence: a
+  // WELL-FORMED pointer at a missing target is a loud compile error, while a
+  // MALFORMED one at a missing target is silently unconstrained.
+  var DECODER_REF_EXTERNAL_WHY =
+    "None of the three decoders fetches an external reference. Measured: outlines-core 0.2.14 " +
+    "raises `ValueError: Invalid reference path`, lm-format-enforcer 0.11.3 raises a `KeyError`, " +
+    "so neither can build a guide at all — while xgrammar 0.2.4 compiles it to its " +
+    "match-anything fallback and reports nothing, so that field silently stops being " +
+    "constrained. (Note the asymmetry: xgrammar DOES raise `Cannot find field` for the same " +
+    "missing target written `#/$defs/...`. It is the malformed URI, not the missing target, " +
+    "that buys the silence.)";
+
   // ---- unsatisfiable nodes on a constrained decoder -------------------------
   //
   // #347 shipped noteUnsatisfiable() for the five shapes that admit no value
@@ -6674,6 +6708,10 @@
     // JSON-Schema-dialect targets since that cycle and never to these three —
     // which is why the loss was silent here and repaired there.
     s = liftBareAllOfRef(s);
+    // FIRST, for the reason in the xgrammar converter: an unnormalised
+    // `/$defs/P` is invisible to every reader below it (#391).
+    s = normalizeRefSpelling(s, ledger, url,
+      DECODER_REF_SPELLING_WHY, DECODER_REF_EXTERNAL_WHY);
     // Before the merge, so every pointer it reads is already in the one spelling
     // these engines can resolve (#389).
     s = decoderRefTokens(s, ledger, url);
@@ -6848,6 +6886,12 @@
     var url = DOCS.xgrammar;
 
     s = liftBareAllOfRef(s);
+    // FIRST, so every reader below sees a pointer it can resolve at all: the
+    // document-driven reader all of them share requires the `#` fragment, so an
+    // unnormalised `/$defs/P` is invisible to decoderRefTokens AND to the
+    // sibling merge (#391).
+    s = normalizeRefSpelling(s, ledger, url,
+      DECODER_REF_SPELLING_WHY, DECODER_REF_EXTERNAL_WHY);
     // Before the merge, so every pointer it reads is already in the one spelling
     // these engines can resolve (#389).
     s = decoderRefTokens(s, ledger, url);
@@ -7093,6 +7137,10 @@
     var url = DOCS.lmformatenforcer;
 
     s = liftBareAllOfRef(s);
+    // FIRST, for the reason in the xgrammar converter: an unnormalised
+    // `/$defs/P` is invisible to every reader below it (#391).
+    s = normalizeRefSpelling(s, ledger, url,
+      DECODER_REF_SPELLING_WHY, DECODER_REF_EXTERNAL_WHY);
     // Before the merge, so every pointer it reads is already in the one spelling
     // these engines can resolve (#389).
     s = decoderRefTokens(s, ledger, url);
@@ -7437,29 +7485,52 @@
     //                       cannot be inlined and `types.Schema`
     //                       (google-genai 2.17.0, extra="forbid") REJECTS what
     //                       is left.
+    //   decoders BLOCKER -- #391. The line above used to read "the remaining
+    //                       targets were not probed for this shape, so they get
+    //                       the advisory rather than a blocker we cannot
+    //                       justify" -- an honestly recorded gap, and therefore
+    //                       a work item (#354). Probing it: ALL THREE refuse to
+    //                       build a guide. xgrammar 0.2.4 raises `RuntimeError:
+    //                       Cannot find field Missing in #/$defs/Missing`,
+    //                       outlines-core 0.2.14 raises `ValueError: Invalid
+    //                       reference path`, lm-format-enforcer 0.11.3 raises
+    //                       `KeyError`. So the advisory's own justification --
+    //                       "nothing will error" -- was FALSE here, which is the
+    //                       half that matters: a reader told a constraint merely
+    //                       stops applying will ship a request that cannot be
+    //                       built at all.
     //   others  ADVISORY -- measured on @anthropic-ai/sdk 0.116.0: BOTH
     //                       `betaTool()` and `betaJSONSchemaOutputFormat()`
     //                       accept a dangling ref and pass it through verbatim.
-    //                       The remaining targets were not probed for this shape
-    //                       this cycle, so they get the advisory too rather than
-    //                       a blocker we cannot justify.
     // No repair is offered on purpose: the definition is gone from this file and
     // inventing one would silently narrow the schema to a guess (#329's rule --
     // when a repair is impossible, name the remodelling instead).
-    var danglingBlocks = provider === "openai" || provider === "gemini";
+    var danglingIsFatal = {
+      openai: true, gemini: true,
+      outlines: true, xgrammar: true, lmformatenforcer: true
+    };
+    var danglingBlocks = hasOwn(danglingIsFatal, provider);
     findDanglingLocalRefs(result.schema).forEach(function (d) {
       result.ledger.push(entry(danglingBlocks ? "!" : "=", d.path,
         "`$ref: \"" + d.ref + "\"` points into this document but there is nothing at that " +
         "location — the reference is dangling, so whatever that subschema constrained is " +
         "simply absent. " +
-        (danglingBlocks
-          ? (provider === "openai"
-              ? "OpenAI strict mode rejects it: `toStrictJsonSchema()` throws \"Local $ref ... " +
-                "does not resolve to an object or boolean schema\"."
-              : "Gemini's narrow `responseSchema` proto has no `$ref` field, so a ref has to be " +
-                "inlined — and this one has no target to inline, so `types.Schema` rejects what " +
-                "is left. `--to gemini-json` accepts `$ref`, but a dangling one still points at " +
-                "nothing.")
+        (provider === "openai"
+          ? "OpenAI strict mode rejects it: `toStrictJsonSchema()` throws \"Local $ref ... " +
+            "does not resolve to an object or boolean schema\"."
+          : provider === "gemini"
+          ? "Gemini's narrow `responseSchema` proto has no `$ref` field, so a ref has to be " +
+            "inlined — and this one has no target to inline, so `types.Schema` rejects what " +
+            "is left. `--to gemini-json` accepts `$ref`, but a dangling one still points at " +
+            "nothing."
+          : danglingBlocks
+          ? "This one is not a lost constraint, it is a request that cannot be built: the guide " +
+            "never compiles. Measured — xgrammar 0.2.4 raises `RuntimeError: Cannot find field " +
+            "" + d.ref.split("/").pop() + " in " + d.ref + "`, outlines-core 0.2.14 raises " +
+            "`ValueError: Invalid reference path`, and lm-format-enforcer 0.11.3 raises a " +
+            "`KeyError`. Worth knowing if this schema is shared: the same document is accepted " +
+            "and forwarded unresolved by both Anthropic helpers, so it fails loudly here and " +
+            "silently there."
           : "Measured on `@anthropic-ai/sdk` 0.116.0, both `betaTool()` and " +
             "`betaJSONSchemaOutputFormat()` ACCEPT this and forward the pointer unresolved, so " +
             "nothing will error — the model is simply handed a field with no schema behind it.") +

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1556 engine + 341 CLI + 83 ESM/library assertions = **1980** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1595 engine + 341 CLI + 83 ESM/library assertions = **2019** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1017,7 +1017,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1980 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2019 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1893,6 +1893,67 @@ instance one character at a time, a bare `{}` under `properties` raises
 `enum`. The guard now tests content rather than presence, and fires wherever
 the walk reaches — because the crash is at whatever property the decoder
 arrives at, not at a fixed position.
+
+## A pointer spelling three engines disagree about
+
+`normalizeRefSpelling` has existed since the LiteLLM probe: `litellm` passes
+`ref_template="/$defs/{model}"` to Pydantic (re-verified on 1.96.0), so every
+Python caller doing `response_format=<Model>` against its Anthropic path emits
+`{"$ref": "/$defs/Priority"}` — a path-absolute URI-reference with no fragment,
+which addresses a *different document*. The repair was wired to the three
+JSON-Schema-dialect targets and never inherited by the three decoders added
+later. A repair is a property of a **code path**, and the newest paths carry the
+fewest of them.
+
+What made this one invisible is that the engines do not agree about it.
+Measured on xgrammar 0.2.4 / outlines-core 0.2.14 / lm-format-enforcer 0.11.3,
+with an inline no-`$ref` control enforced on all three so each engine is known
+to discriminate:
+
+| document | xgrammar | outlines-core | lm-format-enforcer |
+|---|---|---|---|
+| `#/$defs/P` — resolvable (control) | enforced | enforced | enforced |
+| `/$defs/P` — resolvable (LiteLLM) | **unconstrained** | enforced | enforced |
+| `/$defs/P` + `minLength` sibling | sibling lost | sibling lost | sibling lost |
+| `#/$defs/Missing` — dangling | `RuntimeError` | `ValueError` | `KeyError` |
+| `/$defs/Missing` — dangling | **unconstrained** | `ValueError` | `KeyError` |
+
+Two of the three resolve the sloppy spelling, so it looks harmless. xgrammar
+compiles it — with no error, only a `Warning: URI should either be '#' or start
+with '#/'` on stderr — into
+
+```
+root_prop_0 ::= ((ref))
+ref         ::= basic_number | basic_string | basic_boolean | basic_null
+              | basic_array | basic_object
+```
+
+read off the emitted grammar rather than inferred. The referenced constraint is
+gone and the field accepts any JSON at all.
+
+The third row is the one that reaches every engine: the unnormalised spelling is
+invisible to the document-driven pointer reader that the `$ref`-sibling merge
+also uses, so a `minLength: 5` written beside such a ref is never merged and is
+then ignored by all three — measured, a two-character string passes. The
+spelling fix is what lets a repair this tool already ships actually fire.
+
+Note the asymmetry in the last two rows. xgrammar *does* raise `Cannot find
+field` for a missing target written `#/$defs/...`. It is the malformed URI, not
+the missing target, that buys the silence.
+
+### An advisory that justified itself with "nothing will error"
+
+The dangling-`$ref` finding shipped as a blocker for OpenAI and Gemini and an
+advisory everywhere else, with its own comment recording why: *"the remaining
+targets were not probed for this shape, so they get the advisory rather than a
+blocker we cannot justify."* An honestly recorded gap is a work item, not a
+closed question. Probed: all three decoders refuse to build a guide at all, so
+the advisory's justification — "nothing will error — the model is simply handed
+a field with no schema behind it" — was false exactly where it mattered. A
+reader told a constraint merely stops applying will ship a request that cannot
+be built. It is a blocker on those three now, and the two Anthropic targets keep
+the advisory, because both helpers really do accept a dangling ref and forward
+it verbatim.
 
 ## License
 MIT.

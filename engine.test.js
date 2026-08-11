@@ -9309,5 +9309,159 @@ function fanoutSchema(depth, cyclic) {
     blockers(conv(P({ "enum": [] }), "outlines")).length === 0);
 })();
 
+// ---------------------------------------------------------------------------
+// #391  A REF SPELLING THE DECODERS NEVER NORMALISED
+//
+// #320 shipped normalizeRefSpelling() for LiteLLM's `/$defs/X` (it passes
+// `ref_template="/$defs/{model}"` to Pydantic -- re-verified on litellm 1.96.0).
+// It was wired to the three JSON-Schema-dialect targets and never inherited by
+// the three decoders added in #384/#385/#386: a repair is a property of a CODE
+// PATH, and the newest paths carry the fewest (#388/#390).
+//
+// Measured 2026-08-11 on xgrammar 0.2.4 / outlines-core 0.2.14 /
+// lm-format-enforcer 0.11.3, one shape per row, with an inline no-`$ref` control
+// ENFORCED on all three so each engine is known to discriminate:
+//
+//   #/$defs/P  resolvable (CONTROL) : ENFORCED     ENFORCED     ENFORCED
+//   /$defs/P   resolvable (LiteLLM) : UNCONSTRAINED ENFORCED    ENFORCED
+//   /$defs/P + minLength sibling    : sibling lost on ALL THREE
+//   #/$defs/Missing dangling        : RuntimeError ValueError   KeyError
+//   /$defs/Missing dangling         : UNCONSTRAINED ValueError  KeyError
+//
+// Two defects, one family. (a) xgrammar compiles `/$defs/P` to
+// `root_prop_0 ::= ((ref))` where `ref ::= basic_number | basic_string | ...`
+// -- read off the emitted grammar (#385's method), not inferred -- so the
+// constraint is gone with only a stderr warning. (b) On ALL THREE the
+// unnormalised spelling is invisible to the document-driven pointer reader, so
+// #388's `$ref`-sibling merge never fires and a `minLength: 5` beside such a ref
+// is silently unenforced. Both exited 0.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function blockers(r) {
+    return (r.ledger || []).filter(function (l) {
+      return l.op === "!" && !l.advisory;
+    });
+  }
+  function pnode(r) {
+    return (r.schema && r.schema.properties && r.schema.properties.p) || {};
+  }
+  function refDoc(ref, sibling) {
+    var p = { $ref: ref };
+    if (sibling) p.minLength = 5;
+    return { type: "object", properties: { p: p }, required: ["p"],
+             $defs: { P: { type: "string", "enum": ["low", "high"] } } };
+  }
+  var DECODERS = ["xgrammar", "outlines", "lmformatenforcer"];
+
+  // -- the repair itself -----------------------------------------------------
+  DECODERS.forEach(function (p) {
+    var r = conv(refDoc("/$defs/P"), p);
+    ok("#391 " + p + ": LiteLLM's `/$defs/` spelling is rewritten to `#/$defs/`",
+      pnode(r).$ref === "#/$defs/P");
+    ok("#391 " + p + ": the rewrite says why this spelling is not a style nit",
+      has(r.ledger, "root_prop_0 ::= ((ref))"));
+  });
+
+  // The repair the unnormalised spelling was DEFEATING: #388's sibling merge
+  // reads pointers with the same document-driven reader, which requires the `#`.
+  // Measured, a 2-char string passes `minLength: 5` on all three when unmerged.
+  DECODERS.forEach(function (p) {
+    var n = pnode(conv(refDoc("/$defs/P", true), p));
+    ok("#391 " + p + ": a constraining sibling beside a `/$defs/` ref now merges",
+      n.minLength === 5 && n.type === "string" && !n.$ref);
+  });
+
+  // -- the dangling half, and it is a severity correction --------------------
+  // The advisory used to justify itself with "nothing will error", and its own
+  // comment said the decoders "were not probed for this shape". Probing it: all
+  // three refuse to build a guide at all.
+  DECODERS.forEach(function (p) {
+    var r = conv({ type: "object", properties: { p: { $ref: "#/$defs/Missing" } },
+                   required: ["p"], $defs: { P: { type: "string" } } }, p);
+    ok("#391 " + p + ": a dangling `#/$defs/` ref is a BLOCKER, not an advisory",
+      blockers(r).length >= 1);
+    ok("#391 " + p + ": it does not claim \"nothing will error\"",
+      !has(r.ledger, "nothing will error"));
+    ok("#391 " + p + ": it names the measured refusal",
+      has(r.ledger, "cannot be built") && has(r.ledger, "Invalid reference path"));
+  });
+  DECODERS.forEach(function (p) {
+    var r = conv({ type: "object", properties: { p: { $ref: "/$defs/Missing" } },
+                   required: ["p"], $defs: { P: { type: "string" } } }, p);
+    ok("#391 " + p + ": an unresolvable `/$defs/` ref blocks",
+      blockers(r).length >= 1);
+    // The JSON-Schema-dialect wording is about a reference "arriving dangling"
+    // at a provider. A decoder has no wire: it either refuses to compile or
+    // compiles a match-anything guide. Same keyword, different reason (#390).
+    ok("#391 " + p + ": with the decoder reason, not the provider one",
+      has(r.ledger, "match-anything fallback") &&
+      !has(r.ledger, "No provider fetches external schema references"));
+  });
+
+  // -- over-block guards and scope pins: these hold BOTH ways -----------------
+  // Stated rather than counted as coverage, and load-bearing.
+  //
+  // THE #365 DISCRIMINATOR: an already-correct pointer must draw NO rewrite.
+  // Without this the rule could be rewriting every `$ref` it sees and every
+  // assertion above would still pass.
+  DECODERS.forEach(function (p) {
+    var r = conv(refDoc("#/$defs/P"), p);
+    ok("#391 " + p + ": an already-correct `#/$defs/` ref is NOT rewritten",
+      !has(r.ledger, "Rewrote") && pnode(r).$ref === "#/$defs/P");
+    ok("#391 " + p + ": and draws no blocker",
+      blockers(r).length === 0);
+  });
+  DECODERS.forEach(function (p) {
+    var r = conv({ type: "object", properties: { f: { type: "string" } },
+                   required: ["f"] }, p);
+    ok("#391 " + p + ": an ordinary ref-free schema is untouched",
+      blockers(r).length === 0 && !has(r.ledger, "Rewrote"));
+  });
+  // Anthropic must STAY an advisory: measured on @anthropic-ai/sdk 0.116.0, both
+  // helpers accept a dangling ref and forward it verbatim. Without this pin the
+  // "fix" could simply be "block everywhere", which is the over-strictness class
+  // this project has shipped repeatedly.
+  ["anthropic", "anthropic-json"].forEach(function (p) {
+    var r = conv({ type: "object", properties: { p: { $ref: "#/$defs/Missing" } },
+                   required: ["p"], $defs: { P: { type: "string" } } }, p);
+    ok("#391 " + p + ": a dangling ref stays an ADVISORY (the vendor forwards it)",
+      blockers(r).length === 0);
+  });
+  // openai keeps its own reason rather than acquiring the decoder one.
+  (function () {
+    var r = conv({ type: "object", properties: { p: { $ref: "#/$defs/Missing" } },
+                   required: ["p"], $defs: { P: { type: "string" } } }, "openai");
+    ok("#391 openai: still blocks, and still cites toStrictJsonSchema",
+      blockers(r).length >= 1 && has(r.ledger, "toStrictJsonSchema") &&
+      !has(r.ledger, "match-anything fallback"));
+  })();
+  // The five JSON-Schema-dialect targets already normalised this spelling; the
+  // decoder wiring must not have changed what they do with it.
+  ["openai", "anthropic"].forEach(function (p) {
+    var r = conv(refDoc("/$defs/P"), p);
+    ok("#391 " + p + ": unchanged — still rewrites with its own reason",
+      pnode(r).$ref === "#/$defs/P" && !has(r.ledger, "root_prop_0 ::= ((ref))"));
+  });
+  // gemini is the one target where the ref does NOT survive: the narrow
+  // `responseSchema` proto has no `$ref` field, so refs are inlined (#314/#319).
+  // Keying this on "the ref is still `#/$defs/P`" would have been asserting a
+  // shape I guessed rather than the property that matters — which is that the
+  // LiteLLM spelling is still recognised as LOCAL, so the definition is inlined
+  // rather than reported as pointing outside the document.
+  (function () {
+    var r = conv(refDoc("/$defs/P"), "gemini");
+    var n = pnode(r);
+    ok("#391 gemini: unchanged — the ref resolves and is inlined, not reported external",
+      n.type === "string" && Array.isArray(n["enum"]) && !n.$ref &&
+      !has(r.ledger, "points outside this document") &&
+      !has(r.ledger, "root_prop_0 ::= ((ref))"));
+  })();
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);
