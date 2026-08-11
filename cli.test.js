@@ -2359,6 +2359,29 @@ function fanout(depth) {
     run(["--to", "xgrammar", "--check"], SHAPELESS).status !== 3);
   ok("#402 cli openai leaves the closed empty object alone",
     run(["--to", "openai", "--check"], CLOSED_EMPTY).status === 0);
+
+  // #403 — an object-valued `enum` is unencodable on the narrow proto and fine
+  // on the JSON-Schema one, so the same file must get different verdicts. That
+  // disagreement is the proof the rule is target-scoped rather than blanket.
+  var OBJ_ENUM = JSON.stringify({
+    type: "object",
+    properties: { mode: { enum: [{ k: 1 }, { k: 2 }] } },
+    required: ["mode"], additionalProperties: false
+  });
+  var INT_ENUM = JSON.stringify({
+    type: "object",
+    properties: { apt: { type: "integer", enum: [101, 201] } },
+    required: ["apt"], additionalProperties: false
+  });
+  var objG = run(["--to", "gemini", "--check"], OBJ_ENUM);
+  ok("#403 cli gemini exits 3 on an object-valued enum", objG.status === 3);
+  ok("#403 cli the blocker reaches the binary and names the remodelling",
+    /objects or arrays/.test(objG.stderr + objG.stdout) &&
+    /\[object Object\]/.test(objG.stderr + objG.stdout));
+  ok("#403 cli gemini-json accepts the SAME file at exit 0",
+    run(["--to", "gemini-json", "--check"], OBJ_ENUM).status === 0);
+  ok("#403 cli the integer enum control still passes gemini",
+    run(["--to", "gemini", "--check"], INT_ENUM).status !== 3);
 })();
 
 console.log("\n" + pass + " passed, " + fail + " failed");

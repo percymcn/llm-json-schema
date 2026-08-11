@@ -10914,6 +10914,93 @@ function fanoutSchema(depth, cyclic) {
   });
 })();
 
+// ---------------------------------------------------------------------------
+// #403 — an `enum` of CONTAINERS is not encodable into `list[str]`.
+// Found by probing haystack-ai's `_remove_title_from_schema`, which collapses
+// an object enum to `[{}, {}]`; asked of our own engine, the narrow Gemini
+// path does the same thing by a different route — #316's stringification meets
+// an object member and `String({k:1})` is the literal "[object Object]", so two
+// distinct legal values become one and the proto ACCEPTS it. Guarded so a
+// reverted run REPORTS rather than aborting the file (#322).
+(function () {
+  function g(sch, p) {
+    var r;
+    try { r = E.convert(sch, p || "gemini"); } catch (e) { return { ok: false, ledger: [], schema: {} }; }
+    if (!r || !r.ok) return { ok: false, ledger: [], schema: {} };
+    return { ok: true, ledger: r.ledger || [], schema: r.schema || {} };
+  }
+  // The guard above is needed so a reverted run reports instead of aborting
+  // (#322) — but an empty ledger also satisfies every "does NOT acquire the
+  // blocker" pin below, so a broken module handle would make the scope pins
+  // pass VACUOUSLY. It did: the first run of this block used the wrong handle
+  // and only the positive assertions failed. This makes that impossible.
+  ok("#403 the conversion harness is live (guards the scope pins from vacuity)",
+    g({ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, "gemini").ok);
+  function prop(r, k) {
+    var ps = r.schema && r.schema.properties;
+    return (ps && ps[k]) || {};
+  }
+  function blockers(r) {
+    return r.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length;
+  }
+  function wrap(sub) {
+    return { type: "object", properties: { a: sub }, required: ["a"], additionalProperties: false };
+  }
+
+  ["gemini", "gemini-client"].forEach(function (t) {
+    var objEnum = g(wrap({ enum: [{ k: 1 }, { k: 2 }] }), t);
+    ok("#403 " + t + " blocks an `enum` of objects",
+      blockers(objEnum) >= 1);
+    // The whole point: the two members must not become one string.
+    ok("#403 " + t + " never emits `[object Object]` for an object enum",
+      JSON.stringify(prop(objEnum, "a").enum || []).indexOf("[object Object]") === -1);
+    // #318 — the shape stays visible so the reader can act on it.
+    ok("#403 " + t + " leaves the object enum VERBATIM rather than deleting it",
+      JSON.stringify(prop(objEnum, "a").enum) === JSON.stringify([{ k: 1 }, { k: 2 }]));
+    ok("#403 " + t + " blocks an `enum` of arrays too",
+      blockers(g(wrap({ enum: [[1, 2], [3, 4]] }), t)) >= 1);
+
+    // Keyed on the OUTCOME (#352): two scalars that stringify alike also shrink
+    // the allowed set, and no kind-based rule can see that.
+    var collide = g(wrap({ enum: ["1", 1] }), t);
+    ok("#403 " + t + " blocks a scalar enum that COLLAPSES on stringification",
+      blockers(collide) >= 1);
+    ok("#403 " + t + " says the allowed set was NOT preserved when it collapsed",
+      !has(collide.ledger, "allowed set is fully preserved"));
+    // A ledger is a sequence (#393): the rewrite is reported ABOVE its own
+    // consequence, or the blocker reads as a fact about the caller's input.
+    var iRewrite = collide.ledger.findIndex(function (l) { return l.op === "~"; });
+    var iLoss = collide.ledger.findIndex(function (l) { return l.op === "!" && !l.advisory; });
+    ok("#403 " + t + " reports the rewrite BEFORE the loss it caused",
+      iRewrite !== -1 && iLoss !== -1 && iRewrite < iLoss);
+
+    // Over-block guards. These are the vendor's own documented encoding
+    // (`{type:INTEGER, format:enum, enum:["101"]}`) and must be untouched —
+    // without them the "fix" could simply be "block every non-string enum".
+    var ints = g(wrap({ type: "integer", enum: [101, 202] }), t);
+    ok("#403 " + t + " still rewrites an INTEGER enum with no blocker",
+      blockers(ints) === 0 &&
+      JSON.stringify(prop(ints, "a").enum) === JSON.stringify(["101", "202"]));
+    ok("#403 " + t + " still keeps the fully-preserved claim for scalars",
+      has(ints.ledger, "allowed set is fully preserved"));
+    ok("#403 " + t + " leaves a BOOLEAN enum unblocked",
+      blockers(g(wrap({ type: "boolean", enum: [true, false] }), t)) === 0);
+    ok("#403 " + t + " leaves a null MEMBER unblocked (null is a scalar here)",
+      blockers(g(wrap({ enum: [1, null] }), t)) === 0);
+    ok("#403 " + t + " leaves an all-string enum untouched",
+      blockers(g(wrap({ type: "string", enum: ["x", "y"] }), t)) === 0);
+  });
+
+  // Scope pins (#365's discriminator): 10 of 12 targets carry an object enum
+  // verbatim, so without these the rule could be firing everywhere and every
+  // assertion above would still pass.
+  ["gemini-json", "openai", "anthropic", "anthropic-json", "xgrammar", "outlines"].forEach(function (t) {
+    var r = g(wrap({ enum: [{ k: 1 }, { k: 2 }] }), t);
+    ok("#403 " + t + " does NOT acquire the container-enum blocker",
+      blockers(r) === 0);
+  });
+})();
+
 function isPlainObjectTest(v) {
   return !!v && typeof v === "object" && !Array.isArray(v);
 }

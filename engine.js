@@ -6125,18 +6125,68 @@
       // constraint survives intact; only its encoding changes.
       // Narrow path only: `responseJsonSchema` accepts "enum (for strings and
       // numbers)" verbatim, so nothing needs rewriting there.
-      if (Array.isArray(node.enum) && node.enum.some(function (v) { return typeof v !== "string"; })) {
+      // ...but "only its encoding changes" is a claim about SCALAR members, and
+      // it is the part worth testing (#397). `String()` round-trips a number, a
+      // boolean and null; on a CONTAINER it does not. `String({k:1})` is the
+      // literal "[object Object]", so every object member of an enum collapses
+      // to the SAME string and two distinct legal values become one — and
+      // `Schema.enum` being `list[str]` means the vendor ACCEPTS that, so the
+      // request succeeds with the constraint destroyed. `String([1,2])` is
+      // "1,2", which is distinct but no longer an array. There is no encoding
+      // of a container into `list[str]` that keeps both the VALUE and its TYPE:
+      // the model would emit a string where the schema promised an object, so
+      // re-spelling it as one silently changes what the field means (#347).
+      // No repair is invented (#329) — the remodelling is named instead.
+      var enumContainers = Array.isArray(node.enum)
+        ? node.enum.filter(function (v) { return v !== null && typeof v === "object"; })
+        : [];
+      if (enumContainers.length) {
+        ledger.push(entry("!", path,
+          "This `enum` has " + enumContainers.length + " member(s) that are objects or arrays, " +
+          "and `Schema.enum` is declared `list[str]`. Stringifying a container is not an " +
+          "encoding: every object member becomes the literal `\"[object Object]\"`, so distinct " +
+          "values collapse into one, and an array member stops being an array. The proto " +
+          "accepts the result, so nothing would report the loss. There is no form that keeps " +
+          "both the value and its type here — either declare the shape with `properties` and " +
+          "constrain the fields individually, or, if you genuinely want a fixed set of JSON " +
+          "blobs, type the field `{\"type\":\"string\"}` with the serialized forms as the enum " +
+          "and parse it yourself. Scalar members (numbers, booleans, null) are fine and are " +
+          "rewritten normally — this is only about container members.",
+          DOCS.gemini));
+      } else if (Array.isArray(node.enum) && node.enum.some(function (v) { return typeof v !== "string"; })) {
         var before = JSON.stringify(node.enum);
         node.enum = node.enum.map(function (v) { return v === null ? "null" : String(v); });
         node.format = "enum";
+        // Keyed on the OUTCOME rather than on a kind list (#352): scalars round
+        // trip individually, but two DIFFERENT scalars can still stringify to
+        // the same text (`["1", 1]`), and then the allowed set has SHRUNK. The
+        // rewrite still stands (the enum is visible either way, #318) — what
+        // cannot stand is the sentence claiming the set is preserved, so that
+        // clause is conditional and the loss gets its own entry BELOW it: a
+        // ledger is a sequence, and this is a consequence of the edit above it
+        // rather than a separate fact about the input (#393).
+        var collapsed = node.enum.length - new Set(node.enum).size;
         ledger.push(entry("~", path,
           "Rewrote `enum` " + before + " to " + JSON.stringify(node.enum) + " and set " +
           "`format: \"enum\"`. `Schema.enum` is declared `list[str]`, so a non-string enum is " +
           "rejected — this is the live `enum: only allowed for STRING type` 400. The vendor " +
           "field doc gives this exact form (`{type:INTEGER, format:enum, enum:[\"101\"]}`), so " +
-          "`type` is left as-is and the allowed set is fully preserved; only its encoding " +
-          "changes. `z.literal(15)` and any numeric enum land here.",
+          "`type` is left as-is" +
+          (collapsed > 0
+            ? " — but see the blocker below: this particular rewrite did NOT preserve the " +
+              "allowed set."
+            : " and the allowed set is fully preserved; only its encoding changes.") +
+          " `z.literal(15)` and any numeric enum land here.",
           DOCS.gemini));
+        if (collapsed > 0) {
+          ledger.push(entry("!", path,
+            "That rewrite made " + collapsed + " member(s) duplicates of another member, so " +
+            "the allowed set is SMALLER than you wrote. It happens when two members differ " +
+            "only by type (`\"1\"` and `1` both become `\"1\"`). `Schema.enum` is `list[str]`, " +
+            "so no encoding separates them — drop the redundant member, or move to a " +
+            "`{\"type\":\"string\"}` enum, where the distinction was never expressible anyway.",
+            DOCS.gemini));
+        }
       }
 
       // `format` is CARRIED, never stripped.
