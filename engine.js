@@ -172,9 +172,39 @@
   }
 
   // A node is an "object schema" if it declares type:object or carries properties.
+  //
+  // KEPT ON THE SCALAR SPELLING ON PURPOSE, and this is a measurement rather
+  // than an oversight (#401). It reads `type === "object"` — one of the two
+  // legal spellings — so a union-typed node with no `properties` is NOT an
+  // object schema here. For the Anthropic targets that is CORRECT, because the
+  // vendor has the identical blindness: measured on @anthropic-ai/sdk@0.116.0,
+  // `transformJSONSchema` dispatches on `type === "object"` (#327), so a
+  // `{"type":["object","null"], patternProperties:{…}}` node comes back
+  // `{"type":["object","null"], description:"{patternProperties: …}"}` — kept
+  // OPEN, where the scalar spelling is rebuilt as
+  // `{"type":"object","properties":{},"additionalProperties":false}` and thereby
+  // EMPTIED. So #357's "this field is dead" advisory must stay silent on the
+  // union form: the field is not dead there. Widening this predicate globally
+  // would ship that false advisory. Pinned both ways by tests.
   function isObjectSchema(node) {
     if (!isPlainObject(node)) return false;
     if (node.type === "object") return true;
+    if (node.properties && isPlainObject(node.properties)) return true;
+    return false;
+  }
+
+  // The OpenAI variant, which DOES read both spellings. Strict mode's own
+  // transformer treats a union containing "object" exactly like a scalar
+  // `"object"` — measured on openai@7.4.0 across a 12-shape battery, matching
+  // this predicate on every row: `{type:"object"}`, `["object","null"]`,
+  // `["object","null","string"]`, a union carrying `properties`, and a
+  // `properties`-only node are all forced closed, while `"string"`,
+  // `["string","null"]`, `["array","null"]`, `"array"`, a bare `{}` and an
+  // `enum` node are all left open. So on this target the scalar-only reading is
+  // a false pass rather than a matching blindness.
+  function declaresObjectSchema(node) {
+    if (!isPlainObject(node)) return false;
+    if (declaresType(node, "object")) return true;
     if (node.properties && isPlainObject(node.properties)) return true;
     return false;
   }
@@ -3284,7 +3314,9 @@
       // An open map is already handled by its own arm below, so it is excluded
       // here rather than reported twice, and a node that is not an object
       // schema never reaches the close at all.
-      var mapKilled = mapEv.length > 0 && isObjectSchema(node) &&
+      // Both spellings (#401): this must agree with the close below, or a
+      // union-typed map would be closed while the diagnosis said nothing.
+      var mapKilled = mapEv.length > 0 && declaresObjectSchema(node) &&
         !isOpenMap(node) && !hasUsableProperties(node);
 
       // strip every keyword outside the supported set (unsupported => API error)
@@ -3312,7 +3344,18 @@
         ledger.push(entry("x", path, "Removed `" + k + "` — " + why, DOCS.openai));
       });
 
-      if (isObjectSchema(node) || isOpenMap(node)) {
+      // BOTH SPELLINGS (#401). Keyed on the scalar alone, this guard skipped
+      // every union-typed object with no `properties` — so the required-mismatch
+      // blocker below never fired and `additionalProperties: false` was never
+      // set, on documents openai@7.4.0 throws on. WE MANUFACTURE THAT SHAPE: the
+      // forced-required rewrite at the bottom of this same block calls
+      // `makeNullable` on each optional property, turning a child's
+      // `type: "object"` into `["object","null"]` — so the PARENT's repair
+      // rewrote the CHILD into a spelling the child's own rules could not see.
+      // Measured end to end: `--check` exited 1 ("commit my output"), our output
+      // was `{"type":["object","null"],"required":["k"]}`, the vendor THREW on
+      // it, and re-checking that output exited 0 "Already valid" (#330's break).
+      if (declaresObjectSchema(node) || isOpenMap(node)) {
         // additionalProperties: false on every object
         if (isOpenMap(node)) {
           // Do NOT rewrite: setting `false` here deletes the node's only content.
@@ -7397,7 +7440,16 @@
   // with a further keyword, `additionalProperties` alone restores the object
   // half only, `items` alone the array half only, and both restore it exactly.
   // Both predicates below can therefore fire on one node, by design.
-  function xgrammarDeclares(node, t) {
+  // #401 renamed this from `xgrammarDeclares`: the semantics are a property of
+  // JSON Schema, not of xgrammar — "does this node DECLARE type `t`, in either
+  // of the two legal spellings?" — so it is shared rather than copied (#396: two
+  // functions implementing one rule is the drift that produced #342 and #377).
+  // DECLARED, deliberately: `schemaTypes()` also INFERS a type from `enum`/
+  // `const`, and measured on openai@7.4.0 the vendor does NOT treat an inferred
+  // object as an object (`{enum:[{a:1}]}` and `{const:{a:1}}` are both left
+  // OPEN, while `{type:"object"}` and `{type:["object","null"]}` are forced
+  // closed) — so using the inferring reader here would over-close them.
+  function declaresType(node, t) {
     if (!isPlainObject(node)) return false;
     if (node.type === t) return true;
     return Array.isArray(node.type) && node.type.indexOf(t) !== -1;
@@ -7460,7 +7512,7 @@
   // schema's. `{"type":"object","required":["a"]}` permits exactly the one
   // document the schema forbids (`{}`) and rejects every document it permits.
   function xgrammarBareObject(node) {
-    if (!xgrammarDeclares(node, "object")) return false;
+    if (!declaresType(node, "object")) return false;
     if (xgrammarHasObjectShape(node)) return false;
     var keys = Object.keys(node);
     for (var i = 0; i < keys.length; i++) {
@@ -7496,7 +7548,7 @@
   // string, so the raw accept set {[]} is EXACTLY the one document the schema
   // forbids — DISJOINT, not merely narrowed.
   function xgrammarBareArray(node) {
-    if (!xgrammarDeclares(node, "array")) return false;
+    if (!declaresType(node, "array")) return false;
     for (var k in XGRAMMAR_ARRAY_SHAPE_KEYS) if (hasOwn(node, k)) return false;
     var keys = Object.keys(node);
     for (var i = 0; i < keys.length; i++) {

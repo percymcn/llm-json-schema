@@ -2255,5 +2255,68 @@ function fanout(depth) {
     mf.stdout.indexOf('"maxItems": 5') !== -1);
 })();
 
+// ---------------------------------------------------------------------------
+// #401 — the defect was an EXIT CODE, which is the only interface a CI gate has
+// (#330), so it is pinned here as well as in the engine. A union-typed object
+// with no `properties` used to print "Already valid for openai. No changes
+// needed." and exit 0 on a document openai@7.4.0 throws on.
+(function () {
+  var UNION_REQ = JSON.stringify({
+    type: "object",
+    properties: { f: { type: ["object", "null"], required: ["a"] } },
+    required: ["f"], additionalProperties: false
+  });
+  var SCALAR_REQ = JSON.stringify({
+    type: "object",
+    properties: { f: { type: "object", required: ["a"] } },
+    required: ["f"], additionalProperties: false
+  });
+  // The shape WE manufacture: `meta` is optional, so the forced-required
+  // rewrite unionizes its `type` before its own rules run.
+  var MANUFACTURED = JSON.stringify({
+    type: "object",
+    properties: { meta: { type: "object", required: ["k"] } },
+    required: [], additionalProperties: false
+  });
+  var OK_UNION = JSON.stringify({
+    type: "object",
+    properties: { f: { type: ["object", "null"], properties: { a: { type: "string" } }, required: ["a"] } },
+    required: ["f"], additionalProperties: false
+  });
+
+  var u = run(["--to", "openai", "--check"], UNION_REQ);
+  var s = run(["--to", "openai", "--check"], SCALAR_REQ);
+  ok("#401 cli a union-typed undeclared-required is a blocker, not a pass",
+    u.status === 3);
+  ok("#401 cli ...and the two spellings now agree about one schema",
+    u.status === s.status);
+  ok("#401 cli it no longer claims the schema is already valid",
+    u.stderr.indexOf("Already valid") === -1);
+
+  // Idempotence: our own output must not re-check as clean while the vendor
+  // rejects it. Before the fix this ran exit 1 -> commit -> exit 0 -> 400.
+  var m1 = run(["--to", "openai", "--check"], MANUFACTURED);
+  ok("#401 cli the manufacture chain is reported on the FIRST pass",
+    m1.status === 3);
+
+  // Over-block guards: these are vendor-ACCEPTED and must still pass the gate.
+  // A union carrying declared `properties` is a FIXABLE change, not a blocker:
+  // strict mode still requires `additionalProperties: false` on it, and we now
+  // add it. Asserting exit 0 here was wrong — it conflated "no blocker" with
+  // "no changes" — so this keys on the property that matters (never a blocker)
+  // and additionally pins that the fix is IDEMPOTENT, which is the half the
+  // old false pass broke: exit 1 -> commit -> re-check must reach 0.
+  var okU = run(["--to", "openai", "--check"], OK_UNION);
+  var fixed = run(["--to", "openai"], OK_UNION);
+  var recheck = run(["--to", "openai", "--check"], fixed.stdout);
+  ok("#401 cli a union carrying declared properties is fixable, not blocked",
+    okU.status === 1);
+  ok("#401 cli ...and committing that fix re-checks clean",
+    recheck.status === 0);
+  var other = run(["--to", "anthropic", "--check"], UNION_REQ);
+  ok("#401 cli anthropic still accepts the same file (targets disagree)",
+    other.status === 0);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

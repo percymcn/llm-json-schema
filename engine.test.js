@@ -10650,5 +10650,133 @@ function fanoutSchema(depth, cyclic) {
     m(conv({ type: "array", uniqueItems: true })).items !== undefined);
 })();
 
+// ---------------------------------------------------------------------------
+// #401 — `isObjectSchema()` dispatched on `type === "object"`, one of the two
+// legal spellings, so a union-typed object with NO `properties` skipped every
+// object rule in `toOpenAI`: the required-mismatch blocker never fired and
+// `additionalProperties: false` was never set. The `properties` fallback is what
+// masked it, which is why #329's union re-probe of OpenAI came back clean — all
+// of its shapes carried `properties`. WE MANUFACTURE THE SHAPE: the parent's
+// forced-required rewrite calls `makeNullable` on each optional property, so
+// `type: "object"` on a child becomes `["object","null"]` before the child's own
+// rules run. All verdicts below measured against openai@7.4.0
+// `toStrictJsonSchema()` (13-shape battery, 13/13 agreement, 0 over-blocks).
+(function () {
+  // Guarded: the reverted engine must REPORT rather than abort the file (#322).
+  function conv(node, provider) {
+    var doc = {
+      type: "object",
+      properties: { f: JSON.parse(JSON.stringify(node)) },
+      required: ["f"],
+      additionalProperties: false
+    };
+    try { return E.convert(doc, provider || "openai"); }
+    catch (e) { return { ok: false, error: String(e && e.message), ledger: [], schema: {} }; }
+  }
+  function blockers(r) {
+    if (!r || !r.ledger) return -1;
+    return r.ledger.filter(function (e) { return e.op === "!" && !e.advisory; }).length;
+  }
+  function fnode(r) {
+    if (!r || !r.schema || !r.schema.properties) return {};
+    return r.schema.properties.f || {};
+  }
+
+  // --- THE FINDING: the union spelling was a false pass at exit 0 -----------
+  ok("#401 union-typed object with an undeclared `required` name is blocked",
+    blockers(conv({ type: ["object", "null"], required: ["a"] })) === 1);
+  ok("#401 that blocker names the undeclared key",
+    has(conv({ type: ["object", "null"], required: ["a"] }).ledger,
+      "`required` lists `a`, which `properties` does not declare"));
+  // The discriminator that makes the two spellings AGREE about one schema.
+  ok("#401 the two spellings of one schema now get the same verdict",
+    blockers(conv({ type: ["object", "null"], required: ["a"] })) ===
+    blockers(conv({ type: "object", required: ["a"] })));
+
+  // --- strict mode closes every object, in either spelling ------------------
+  ok("#401 a union-typed bare object is closed",
+    fnode(conv({ type: ["object", "null"] })).additionalProperties === false);
+  ok("#401 a 3-way union containing object is closed",
+    fnode(conv({ type: ["object", "null", "string"] })).additionalProperties === false);
+  ok("#401 a union-typed map keyword is reported, not silently closed",
+    blockers(conv({ type: ["object", "null"], patternProperties: { "^S_": { type: "string" } } })) === 1);
+  ok("#401 a union-typed open map is still reported once",
+    blockers(conv({ type: ["object", "null"], additionalProperties: { type: "string" } })) === 1);
+
+  // --- WE MANUFACTURE IT: the parent's repair unionizes the child -----------
+  // The input's child is written with the SCALAR spelling and is optional, so
+  // the forced-required rewrite makes it a union before its own rules run.
+  (function () {
+    var doc = {
+      type: "object",
+      properties: { meta: { type: "object", required: ["k"] } },
+      required: [],
+      additionalProperties: false
+    };
+    var r;
+    try { r = E.convert(JSON.parse(JSON.stringify(doc)), "openai"); }
+    catch (e) { r = { ok: false, ledger: [], schema: {} }; }
+    ok("#401 a parent-unionized child still reports its own blocker",
+      (r.ledger || []).filter(function (e) { return e.op === "!" && !e.advisory; }).length === 1);
+    ok("#401 the unionized child is still closed by strict mode",
+      r.schema && r.schema.properties && r.schema.properties.meta &&
+      r.schema.properties.meta.additionalProperties === false);
+  })();
+
+  // --- OVER-BLOCK GUARDS: all vendor-ACCEPTED, must draw no blocker ---------
+  // Keyed on the DECLARED type: the vendor leaves an INFERRED object open
+  // (`{enum:[{a:1}]}` and `{const:{a:1}}` are ACCEPT-verbatim), so using the
+  // inferring reader `schemaTypes()` here would have over-closed them.
+  ok("#401 an enum of objects is NOT treated as an object schema",
+    fnode(conv({ enum: [{ a: 1 }] })).additionalProperties === undefined &&
+    blockers(conv({ enum: [{ a: 1 }] })) === 0);
+  ok("#401 a const object is NOT treated as an object schema",
+    fnode(conv({ const: { a: 1 } })).additionalProperties === undefined &&
+    blockers(conv({ const: { a: 1 } })) === 0);
+  ok("#401 a union of scalars is not an object",
+    fnode(conv({ type: ["string", "null"] })).additionalProperties === undefined &&
+    blockers(conv({ type: ["string", "null"] })) === 0);
+  ok("#401 a union-typed array is not an object",
+    fnode(conv({ type: ["array", "null"], items: { type: "string" } })).additionalProperties === undefined);
+  ok("#401 a union carrying declared properties is unchanged in verdict",
+    blockers(conv({ type: ["object", "null"], properties: { a: { type: "string" } }, required: ["a"] })) === 0);
+  ok("#401 an ordinary closed object is untouched",
+    blockers(conv({ type: "object", properties: { a: { type: "string" } }, required: ["a"], additionalProperties: false })) === 0);
+
+  // --- SCOPE PIN, and it is the discriminator (#365): the Anthropic targets
+  // must NOT acquire this. Measured on @anthropic-ai/sdk@0.116.0, the vendor
+  // has the identical scalar-only dispatch (#327), so it leaves a union-typed
+  // `patternProperties` node OPEN (`{"type":["object","null"],description:…}`)
+  // where it EMPTIES the scalar one. #357's "this field is dead" advisory is
+  // therefore correct on the scalar and FALSE on the union. Without this pair
+  // the fix could be a blanket widening and every assertion above would pass.
+  function deadFieldAdvisory(node, p) {
+    var r = conv(node, p);
+    return (r.ledger || []).some(function (e) {
+      return /only legal value is|can never be populated/i.test(String(e.msg));
+    });
+  }
+  ["anthropic-json", "anthropic-json-python", "anthropic-go"].forEach(function (t) {
+    ok("#401 " + t + " keeps the dead-field advisory on the SCALAR spelling",
+      deadFieldAdvisory({ type: "object", patternProperties: { "^S_": { type: "string" } } }, t) === true);
+    ok("#401 " + t + " stays SILENT on the union spelling (vendor leaves it open)",
+      deadFieldAdvisory({ type: ["object", "null"], patternProperties: { "^S_": { type: "string" } } }, t) === false);
+  });
+
+  // --- the array sibling already read both spellings; pin that it still does
+  ok("#401 array-without-items still blocks in both spellings",
+    blockers(conv({ type: "array" })) === 1 && blockers(conv({ type: ["array", "null"] })) === 1);
+  ok("#401 a union naming BOTH containers still blocks the array half",
+    blockers(conv({ type: ["object", "array"] })) >= 1);
+
+  // --- the renamed predicate must still serve its original xgrammar callers -
+  ok("#401 xgrammar bare-object repair still fires (#398/#400 regression)",
+    fnode(conv({ type: "object", required: ["a"] }, "xgrammar")).additionalProperties === true);
+  ok("#401 xgrammar union-object repair still fires (#400 regression)",
+    fnode(conv({ type: ["object", "null"], required: ["a"] }, "xgrammar")).additionalProperties === true);
+  ok("#401 xgrammar bare-array repair still fires (#399/#400 regression)",
+    fnode(conv({ type: ["array", "null"], uniqueItems: true }, "xgrammar")).items !== undefined);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1826 engine + 405 CLI + 83 ESM/library assertions = **2314** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1852 engine + 412 CLI + 83 ESM/library assertions = **2347** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -1219,12 +1219,52 @@ intact. OpenAI's own transformer gets `__proto__` right; we did not. The value
 is that the tool stopped deleting a property the destination accepts.
 
 
+## `type` has two spellings, and only one target reads both the same way
+
+JSON Schema specifies `type` as *"a string **or an array of strings**"*. A rule
+written `node.type === "object"` therefore does not ask "is this an object?" but
+"is this an object, **written the first way**?" — and whether that matters
+depends entirely on the destination, because some vendors have the identical
+blindness and some do not. Measured 2026-08-11 on a node declaring
+`type: ["object","null"]` with **no** `properties`:
+
+| destination | what it does with the union spelling | so our rules |
+|---|---|---|
+| **OpenAI strict** (`openai@7.4.0`) | treats it exactly like scalar `"object"` — forces `additionalProperties: false`, enforces `required ⊆ properties` | **must read both spellings** |
+| **Anthropic** `output_format` (JS `0.116.0`) | its own `transformJSONSchema` dispatches on `type === "object"`, so it leaves the node **open** (`{"type":["object","null"],"description":"{patternProperties: …}"}`) where it *empties* the scalar form | **must stay scalar-only** — the field is not dead here, so the "dead field" advisory would be false |
+| Anthropic Python / Go | `RAISE: unreachable` on any list-valued `type` | already rewritten to `anyOf` |
+| Gemini (narrow proto) | `types.Schema` rejects a list-valued `type` | already rewritten to `nullable` |
+| outlines / lm-format-enforcer / xgrammar | — | already handled |
+
+So every target that *cannot* carry a union rewrites it away first, and OpenAI is
+the one that both keeps it and reads it as an object. Two consequences there:
+
+- **`required` naming an undeclared property was a false pass.** `--check --to
+  openai` printed *"Already valid for openai. No changes needed."* and exited
+  **0** on a document `toStrictJsonSchema()` throws on, while the scalar spelling
+  of the same schema correctly exited 3.
+- **The tool manufactured that shape itself.** Strict mode has no optional
+  fields, so an optional property is made `required` and nullable — which turns a
+  child's `type: "object"` into `["object","null"]`. The **parent's** repair
+  rewrote the **child** into a spelling the child's own rules could not see. End
+  to end: `--check` exited 1 ("commit my output"), the output was
+  `{"type":["object","null"],"required":["k"]}`, the vendor **threw** on it, and
+  re-checking that output exited **0**.
+
+The predicate keys on the **declared** `type`, not an inferred one: the vendor
+leaves `{"enum":[{"a":1}]}` and `{"const":{"a":1}}` open, so reading the type
+through the inferring reader would have over-closed them. Verified 13/13 against
+`toStrictJsonSchema()` with 0 over-blocks, and across 849 corpus inputs × 13
+targets the only rows that moved were 8 on `openai` — 2 correctly newly blocked
+(vendor throws on both), 1 repaired, 3 that stopped needing the vendor to rewrite
+our output, and 12 of 13 targets untouched.
+
 ## How it's built
 - `engine.js` — dependency-free transform + lint logic (the product's value). Every rule cites its source doc URL. UMD, so the same bytes run in the browser.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2314 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2347 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
