@@ -10055,5 +10055,129 @@ function fanoutSchema(depth, cyclic) {
     }));
 })();
 
+// ---------------------------------------------------------------------------
+// #396  `allOf` is an INTERSECTION on a constrained decoder too.
+//
+// The merge has existed since #318/#349/#370/#371 and lived INLINE in toOpenAI,
+// so the three decoder targets added in #384/#385/#386 inherited none of it —
+// #388's law that a repair is a property of a CODE PATH. Measured 2026-08-11 on
+// xgrammar 0.2.5 / outlines-core 0.2.14 / lm-format-enforcer 0.11.3, accept sets
+// over [{}, {r}, {a}, {r,a}] for a node declaring `reasoning` with a
+// single-member `allOf` declaring `answer` (only {r,a} is legal):
+//     raw     xgrammar {a}   outlines {r}   lmfe {a}    <- DISJOINT, all three
+//     ours    {r,a}          {r,a}          {r,a}       <- correct, all three
+// Read off the emitted grammar rather than inferred (#385): xgrammar compiles
+// the raw form to a root BYTE-IDENTICAL to the member alone, i.e. this node's
+// own properties are discarded. That also CORRECTS #385's inherited claim that
+// "a SINGLE-member `allOf` is enforced" — the member REPLACES the node.
+// ---------------------------------------------------------------------------
+(function () {
+  // Guarded: the pre-fix engine must REPORT rather than crash the file (#322).
+  function conv(sch, p) {
+    var r;
+    try { r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {}; } catch (e) { r = {}; }
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function props(r) { return Object.keys((r.schema && r.schema.properties) || {}); }
+  function req(r) { return (r.schema && r.schema.required) || []; }
+  function blk(r) { return r.ledger.filter(function (e) { return e.op === "!"; }); }
+  var DEC = ["xgrammar", "outlines", "lmformatenforcer"];
+  var DIALECT = ["anthropic", "anthropic-json", "gemini-json", "openai-nonstrict"];
+
+  // The shape whose accept set is disjoint on all three engines.
+  var ONE = {
+    type: "object", properties: { reasoning: { type: "string" } }, required: ["reasoning"],
+    allOf: [{ type: "object", properties: { answer: { type: "string" } }, required: ["answer"] }]
+  };
+  DEC.forEach(function (p) {
+    var r = conv(ONE, p);
+    ok("#396 " + p + ": a constraining single-member `allOf` is MERGED, not passed through",
+      props(r).indexOf("reasoning") !== -1 && props(r).indexOf("answer") !== -1 &&
+      r.schema.allOf === undefined);
+    ok("#396 " + p + ": the merged `required` is the union of both sides",
+      req(r).indexOf("reasoning") !== -1 && req(r).indexOf("answer") !== -1);
+  });
+  // The two code paths now agree about one document. Before this cycle
+  // --to openai merged it and the decoders did not, which is the tell that
+  // one of them was wrong (#372: when one node is reached by two paths, diff).
+  ok("#396 the decoder targets now agree with --to openai about the same document",
+    DEC.every(function (p) {
+      return props(conv(ONE, p)).sort().join(",") === props(conv(ONE, "openai")).sort().join(",");
+    }));
+
+  // 2+ open members: the constraint is IGNORED unmerged (xgrammar warns
+  // "Support for allOf with multiple options is still ongoing"; outlines-core
+  // refuses to build a guide at all), so the merge is the only faithful form.
+  var TWO = {
+    type: "object", properties: { reasoning: { type: "string" } }, required: ["reasoning"],
+    allOf: [{ type: "object", properties: { answer: { type: "string" } }, required: ["answer"] },
+            { type: "object", properties: { cite: { type: "string" } }, required: ["cite"] }]
+  };
+  DEC.forEach(function (p) {
+    ok("#396 " + p + ": a two-member `allOf` of open objects is merged",
+      props(conv(TWO, p)).sort().join(",") === "answer,cite,reasoning");
+  });
+
+  // REACHABILITY, measured on zod 4.4.3 rather than argued: z.intersection(A,B)
+  // and A.and(B) emit exactly this — a 2-member `allOf` of CLOSED objects, each
+  // forbidding the other's required property. NO object can satisfy it (zod's
+  // own runtime parser accepts {reasoning,answer}, so its emitted schema
+  // contradicts its own parser). --to openai has blocked it since #370; the
+  // decoders exited 0.
+  var ZOD = { $schema: "https://json-schema.org/draft/2020-12/schema", allOf: [
+    { type: "object", properties: { reasoning: { type: "string" } }, required: ["reasoning"], additionalProperties: false },
+    { type: "object", properties: { answer: { type: "string" } }, required: ["answer"], additionalProperties: false }] };
+  DEC.forEach(function (p) {
+    ok("#396 " + p + ": zod's z.intersection output (unsatisfiable) is a BLOCKER",
+      blk(conv(ZOD, p)).length >= 1);
+  });
+  ok("#396 the unsatisfiable blocker names the decoder reason, not OpenAI's",
+    has(conv(ZOD, "xgrammar").ledger, "No decoder can express this either"));
+  ok("#396 --to openai keeps its own vendor clause for the same shape",
+    has(conv(ZOD, "openai").ledger, "OpenAI's transformer refuses exactly this"));
+
+  // --- over-block guards and scope pins: these hold BOTH ways, and are stated
+  // as such rather than counted as new coverage. Each one is load-bearing.
+
+  // THE #365 DISCRIMINATOR. The measured defect is the node's OWN declarations
+  // being discarded. A node that declares nothing loses nothing to that
+  // substitution, so the merge buys it NOTHING there — and firing anyway would
+  // rewrite the two shapes #388 and #393 pinned byte-identical. Without this
+  // pair the rule could be firing on every `allOf` and every assertion above
+  // would still pass.
+  var V1 = { title: "Inner", description: "d", allOf: [{ $ref: "#/$defs/T" }],
+             $defs: { T: { type: "object", properties: { k: { type: "string" } }, required: ["k"] } } };
+  DEC.forEach(function (p) {
+    var r = conv(V1, p);
+    ok("#396 " + p + ": pydantic v1's annotation-only wrapper draws NO merge (#388/#393 pin)",
+      !has(r.ledger, "Flattened a single-member"));
+  });
+  // #384's blocker must survive: a bare node whose only content is a
+  // single-member `allOf` of a NON-object is outside what was measured here.
+  ok("#396 outlines: a bare single-member `allOf` of a non-object still blocks (#384 pin)",
+    blk(conv({ type: "object", additionalProperties: false, required: ["v"],
+      properties: { v: { allOf: [{ type: "string" }] } } }, "outlines")).length >= 1);
+
+  // The JSON-Schema-dialect targets forward the document and let the
+  // destination read `allOf` itself, so merging there would be an edit that
+  // buys nothing. A later cycle must not "generalise" this rule onto them.
+  DIALECT.forEach(function (p) {
+    var r = conv(ONE, p);
+    ok("#396 " + p + " does NOT merge `allOf` (scope pin)",
+      r.schema.allOf !== undefined && props(r).join(",") === "reasoning");
+  });
+
+  // Regression on the EXTRACTION itself: --to openai must still merge, and its
+  // messages must still cite the vendor rather than the decoder measurement.
+  ok("#396 --to openai still merges a single-member `allOf` after the extraction",
+    props(conv(ONE, "openai")).sort().join(",") === "answer,reasoning");
+  ok("#396 --to openai's flatten note still cites its own transformer",
+    has(conv(ONE, "openai").ledger, "OpenAI's own transformer performs the same merge"));
+  ok("#396 a decoder's flatten note cites the measured grammar instead",
+    has(conv(ONE, "xgrammar").ledger, "BYTE-IDENTICAL to the member alone"));
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

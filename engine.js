@@ -2670,6 +2670,348 @@
     return false;
   }
 
+  // The justifying clause of every `allOf` message, per target. The MERGE is
+  // dialect-independent; WHY it is right is not. #395's corollary — when your
+  // own repair is correct for the surface you modelled, ask what it does to the
+  // other one — applied to a repair that was never ported at all.
+  //
+  // Decoder clauses are MEASURED, 2026-08-11, xgrammar 0.2.5 / outlines-core
+  // 0.2.14 / lm-format-enforcer 0.11.3, accept sets over
+  // [{}, {r}, {a}, {r,a}] for
+  //   {properties:{r},required:["r"],allOf:[{properties:{a},required:["a"]}]}
+  // whose only legal instance is {r,a}:
+  //   raw     xgrammar {a} · outlines {r} · lmfe {a}   <- DISJOINT from the schema
+  //   merged  {r,a} on all three                        <- correct on all three
+  // Read off the emitted grammar rather than inferred (#385): xgrammar compiles
+  // the raw single-member form to a root BYTE-IDENTICAL to the member alone.
+  var ALLOF_WHY = {
+    openai: {
+      resolved: "This is the standard \"extend a base schema\" shape; OpenAI's transformer merges it " +
+        "and we used to fail the gate on it, because a `$ref` member declares no `properties` " +
+        "of its own and the mergeability test could not look through it.",
+      refuseUnsat: "OpenAI's transformer refuses exactly this (\"Object allOf ... cannot be " +
+        "merged without changing Draft 7 validation\").",
+      refuseClash: "OpenAI's transformer refuses exactly this (\"Object allOf ... cannot " +
+        "be merged without changing Draft 7 validation\").",
+      flatten: "OpenAI's own transformer performs the same merge.",
+      merged: "This is what OpenAI's transformer does with the same input.",
+      dropped: "OpenAI's transformer discards the same names.",
+      unmergeable: function (n) {
+        return "`allOf` with " + n + " members that OpenAI cannot merge. Its transformer " +
+          "merges an `allOf` of OPEN object schemas and flattens a single-member one, but throws on " +
+          "anything else — closed objects (`additionalProperties: false`) \"cannot be merged without " +
+          "changing Draft 7 validation\", and non-object members are simply unsupported. Express the " +
+          "combined shape as one object schema. We will not drop the `allOf` for you: that would " +
+          "silently remove every constraint inside it.";
+      }
+    }
+  };
+  // Every constrained decoder mis-reads an unmerged `allOf`, and each in a
+  // different direction, so the merge is not a convenience here — it is the only
+  // form whose accept set is the schema's.
+  var DECODER_ALLOF_WHY = {
+    resolved: "Resolving first is what lets the merge below run at all, and on a constrained " +
+      "decoder an unmerged `allOf` is not merely unenforced — measured, its accept set is " +
+      "DISJOINT from this schema's.",
+    refuseUnsat: "No decoder can express this either: a schema no object satisfies has no " +
+      "grammar, and all three measured engines compile one anyway rather than refusing.",
+    refuseClash: "A constrained decoder makes the merged shape BINDING on the model rather " +
+      "than merely permissive, so picking either side would decide what the model may emit.",
+    flatten: "This is not cosmetic on a constrained decoder: measured on xgrammar 0.2.5, the " +
+      "UNMERGED single-member form compiles to a root rule BYTE-IDENTICAL to the member alone " +
+      "— this node's own properties are discarded, so the grammar accepts documents this schema " +
+      "forbids and forbids the ones it requires. lm-format-enforcer 0.11.3 does the same; " +
+      "outlines-core 0.2.14 instead ignores the member. Three engines, three wrong answers.",
+    merged: "Measured over the accept sets, the unmerged form is DISJOINT from this schema on " +
+      "xgrammar 0.2.5, outlines-core 0.2.14 and lm-format-enforcer 0.11.3 alike, while the " +
+      "merged form is correct on all three.",
+    dropped: "No grammar could have carried them either.",
+    unmergeable: function (n) {
+      return "`allOf` with " + n + " members that cannot be merged into one object schema, and a " +
+        "constrained decoder cannot honour it unmerged. Measured on xgrammar 0.2.5 a 2-member " +
+        "`allOf` is compiled with the constraint IGNORED (it warns \"Support for allOf with " +
+        "multiple options is still ongoing\"), and outlines-core 0.2.14 refuses to build a guide " +
+        "at all. Express the combined shape as one object schema. We will not drop the `allOf` " +
+        "for you: that would silently remove every constraint inside it.";
+    }
+  };
+
+  // `allOf` is an INTERSECTION. This merge was written for --to openai (#318,
+  // #349, #370, #371) and lived INLINE in toOpenAI, so the three decoder
+  // targets added later inherited none of it — #388's law that a repair is a
+  // property of a CODE PATH and the NEWEST paths carry the FEWEST. Extracted
+  // rather than copied: two functions implementing one rule is the drift that
+  // produced #342 and #377. The SEMANTICS are dialect-independent (it is what
+  // `allOf` MEANS); only the justifying clause differs, so that is what `W`
+  // carries (#315: a shared helper must not hardcode one provider's wording).
+  // Returns true when the node was blocked rather than merged.
+  function mergeAllOf(root, node, path, ledger, D, W, onlyWhenNodeConstrains) {
+    var allOfBlocked = false;
+    // SCOPED TO WHAT WAS MEASURED. The decoder defect is the node's OWN
+    // declarations being discarded (xgrammar and lm-format-enforcer replace the
+    // node with the member) or the members' being ignored (outlines, and 2+
+    // members on xgrammar). A node that declares nothing of its own and carries
+    // ONE member loses nothing to that substitution, so the merge buys it
+    // nothing (#365: ask what the rule buys the member it was written for) —
+    // and firing there would rewrite two shapes #388 and #393 deliberately
+    // pinned byte-identical, pydantic v1's `{title, description, allOf:[{$ref}]}`
+    // among them. It is the same predicate liftBareAllOfRef already uses.
+    if (onlyWhenNodeConstrains && Array.isArray(node.allOf) &&
+        !(isPlainObject(node.properties) || Array.isArray(node.required) || node.allOf.length > 1)) {
+      return false;
+    }
+    if (Array.isArray(node.allOf) && node.allOf.length) {
+      // A `$ref` MEMBER is a branch of the intersection, not an opaque token —
+      // and we treated it as opaque, so the mergeability test (which demands
+      // `type: "object"` and `properties` on every member) saw a member with
+      // neither and BLOCKED. Measured on openai@7.4.0: the standard OpenAPI
+      // "extend this base schema" idiom — `{properties:{a},required:["a"],
+      // allOf:[{$ref:Base}]}` and `{allOf:[{$ref:Base},{...}]}` — is ACCEPTED
+      // by the vendor with the merged property set and its accept set
+      // PRESERVED EXACTLY, and we failed the gate on it. That is the
+      // over-strictness class this project has now shipped ~10 times.
+      //
+      // Resolve first, then let the existing intersection merge decide. The
+      // guards are what keep every currently-passing shape byte-identical:
+      //   * only when the node itself constrains, or there are 2+ members —
+      //     so `{allOf:[{$ref}]}` and the Pydantic v1 `{description,
+      //     allOf:[{$ref}]}` still come out as a `$ref` beside annotations,
+      //     the form the vendor accepts and #349 pinned;
+      //   * only for OBJECT referents — a `$ref` to a scalar is a shape the
+      //     vendor throws on, and resolving it would route an unsatisfiable
+      //     node through a merge that reports success;
+      //   * fail closed on anything unresolvable, chained or recursive, so a
+      //     dangling pointer still reaches the blocker that owns it (#320).
+      var refMemberNeedsMerge =
+        isPlainObject(node.properties) || Array.isArray(node.required) || node.allOf.length > 1;
+      var refMembersResolved = 0;
+      if (refMemberNeedsMerge) {
+        node.allOf = node.allOf.map(function (m) {
+          if (!isPlainObject(m) || typeof m.$ref !== "string") return m;
+          var extra = Object.keys(m).filter(function (k) { return k !== "$ref"; });
+          if (!extra.every(function (k) { return inTable(OPENAI_ANNOTATION_KEYWORDS, k); })) return m;
+          var tgt = resolveLocalDef(root, m.$ref);
+          if (!tgt || typeof tgt.$ref === "string") return m;
+          if (!(tgt.type === "object" || isPlainObject(tgt.properties))) return m;
+          if (JSON.stringify(tgt).indexOf(m.$ref) !== -1) return m; // recursive
+          var res = clone(tgt);
+          extra.forEach(function (k) { if (!hasOwn(res, k)) setOwn(res, k, clone(m[k])); });
+          refMembersResolved++;
+          return res;
+        });
+      }
+      if (refMembersResolved) {
+        ledger.push(entry("~", path,
+          "Resolved " + refMembersResolved + " `$ref` member" + (refMembersResolved === 1 ? "" : "s") +
+          " of this `allOf` into the schema " + (refMembersResolved === 1 ? "it points" : "they point") +
+          " at, so the merge below can see what " + (refMembersResolved === 1 ? "it declares" : "they declare") +
+          ". " + W.resolved,
+          D));
+      }
+      var members = node.allOf;
+
+      // An `allOf` is an INTERSECTION, and a branch that declares
+      // `additionalProperties: false` FORBIDS every property it does not
+      // itself declare. So the merged property set is not the UNION of the
+      // branches — it is the union RESTRICTED to every closed branch's own
+      // declarations. openai@7.4.0 computes exactly that
+      // (transform.js:1496-1505, "A closed branch forbids every property it
+      // does not declare") and REFUSES the merge outright when a REQUIRED
+      // property falls outside the intersection, because no object can then
+      // satisfy the schema.
+      //
+      // We unioned, and never looked at any branch's `additionalProperties`
+      // at all — the N-member guard below checks the MEMBERS' and the
+      // single-member path short-circuits past it entirely (#349's shape: the
+      // N=1 special case skipping a condition the general path enforces).
+      // Measured on openai@7.4.0 over the 16-cell node×member grid at a
+      // NESTED position: 8 shapes whose raw accept set is EMPTY (ajv 2020-12,
+      // i.e. no instance can ever satisfy them) came out SATISFIABLE, at zero
+      // blockers, with the ledger claiming "OpenAI's own transformer performs
+      // the same merge" — which the same run measures as false, the vendor
+      // throws on every one. And one shape the vendor ACCEPTS and preserves
+      // EXACTLY (closed node + an optional member property) came out with a
+      // different accept set, because we admitted a property the schema
+      // forbade. Acceptance bought by changing what the schema means is not a
+      // repair (#347).
+      var allOfBranches = [node].concat(members);
+      var closedSets = [];
+      allOfBranches.forEach(function (b) {
+        if (isPlainObject(b) && b.additionalProperties === false) {
+          closedSets.push(Object.keys(isPlainObject(b.properties) ? b.properties : {}));
+        }
+      });
+      // `null` means no branch is closed -> nothing is forbidden -> the plain
+      // union is correct and this whole rule is a no-op, which is what keeps
+      // every currently-passing shape byte-identical.
+      var allowedProps = null;
+      if (closedSets.length) {
+        allowedProps = closedSets[0].slice();
+        closedSets.slice(1).forEach(function (st) {
+          allowedProps = allowedProps.filter(function (k) { return st.indexOf(k) !== -1; });
+        });
+      }
+      var isAllowed = function (k) {
+        return allowedProps === null || allowedProps.indexOf(k) !== -1;
+      };
+      var allOfRequired = [];
+      allOfBranches.forEach(function (b) {
+        (Array.isArray(b && b.required) ? b.required : []).forEach(function (k) {
+          if (allOfRequired.indexOf(k) === -1) allOfRequired.push(k);
+        });
+      });
+      var excludedRequired = allOfRequired.filter(function (k) { return !isAllowed(k); });
+
+      var mergeable =
+        members.length === 1 ||
+        members.every(function (m) {
+          return isPlainObject(m) && m.type === "object" &&
+            isPlainObject(m.properties) && m.additionalProperties !== false;
+        });
+      if (excludedRequired.length) {
+        // No repair exists, so name the remodelling rather than invent one
+        // (#329). Merging anyway is what we used to do and it manufactures a
+        // schema the author never wrote: every one of these is unsatisfiable
+        // as written, and the union silently makes it satisfiable.
+        allOfBlocked = true;
+        ledger.push(entry("!", path,
+          "This `allOf` cannot be satisfied by any object. A branch here declares " +
+          "`additionalProperties: false`, which forbids every property that branch does not itself " +
+          "declare — so the properties allowed by ALL branches together are [" +
+          (allowedProps.length ? "`" + allowedProps.join("`, `") + "`" : "none") + "], while `" +
+          excludedRequired.join("`, `") + "` " + (excludedRequired.length > 1 ? "are" : "is") +
+          " required. " + W.refuseUnsat + " We will not merge it for you: taking the " +
+          "union of the branches would silently ADMIT " + (excludedRequired.length > 1 ? "properties" : "a property") +
+          " the schema forbids, turning a schema no object can satisfy into one that looks fine. " +
+          "Either drop `additionalProperties: false` from the closed branch, or declare `" +
+          excludedRequired.join("`, `") + "` there too.",
+          D));
+      } else if (!mergeable) {
+        allOfBlocked = true;
+        ledger.push(entry("!", path,
+          W.unmergeable(members.length),
+          D));
+      } else if (members.length === 1) {
+        // A single-member `allOf` is NOT a special case. Measured on
+        // openai@7.4.0: the vendor applies the SAME merge it applies to N
+        // members — `{properties:{kind},required:["kind"],allOf:[{properties:
+        // {a},required:["a"]}]}` comes back carrying BOTH `kind` and `a` with
+        // a union `required`. The old code copied a member key only
+        // `if (!(k in node))`, i.e. PARENT WINS, so a parent that already had
+        // `properties` silently DISCARDED the member's `properties` and
+        // `required` — and the ledger line said "Nothing is lost."
+        // That reading is right for ANNOTATIONS (title/description belong to
+        // the wrapper) and is a deletion for anything that carries
+        // constraints. The N-member branch below has always merged correctly;
+        // the special case was the broken one.
+        var only = isPlainObject(members[0]) ? members[0] : null;
+        var onlyProps = only && isPlainObject(only.properties) ? only.properties : null;
+        // The vendor throws when the same property name is declared on both
+        // sides with DIFFERENT subschemas ("cannot be merged without changing
+        // Draft 7 validation"), and accepts when they are identical — so the
+        // test is conflict, not duplication. canonical() so key order does
+        // not manufacture a conflict.
+        var clash = null;
+        if (onlyProps && isPlainObject(node.properties)) {
+          Object.keys(onlyProps).forEach(function (k) {
+            if (clash === null && hasOwn(node.properties, k) &&
+                canonical(node.properties[k]) !== canonical(onlyProps[k])) clash = k;
+          });
+        }
+        if (clash !== null) {
+          allOfBlocked = true;
+          ledger.push(entry("!", path,
+            "This node and its single-member `allOf` both declare a property `" + clash + "`, with " +
+            "different schemas. " + W.refuseClash + " So do we: picking either side would " +
+            "silently change what the schema accepts. Declare `" + clash + "` once, with the shape " +
+            "you actually mean.",
+            D));
+        } else {
+          if (onlyProps) {
+            // Merge, do not overwrite. Union of `properties` and of `required`.
+            if (!node.properties) node.properties = {};
+            Object.keys(onlyProps).forEach(function (k) {
+              if (!hasOwn(node.properties, k)) setOwn(node.properties, k, clone(onlyProps[k]));
+            });
+            var oneReq = Array.isArray(only.required) ? only.required : [];
+            var baseReq = Array.isArray(node.required) ? node.required : [];
+            oneReq.forEach(function (k) { if (baseReq.indexOf(k) === -1) baseReq.push(k); });
+            if (baseReq.length) node.required = baseReq;
+            if (node.type === undefined) node.type = "object";
+          }
+          if (only) {
+            // Everything else (annotations, `$ref`, `type`, …) keeps the
+            // wrapper-wins rule, which is what makes the standard Pydantic v1
+            // shape — `{title, description, allOf:[{$ref}]}` — come out as a
+            // `$ref` beside metadata, the form the vendor accepts.
+            Object.keys(only).forEach(function (k) {
+              if (k === "properties" || k === "required") return;
+              if (!hasOwn(node, k)) setOwn(node, k, clone(only[k]));
+            });
+          }
+          delete node.allOf;
+          ledger.push(entry("~", path,
+            "Flattened a single-member `allOf` into this node, merging its `properties` and " +
+            "`required` with this node's rather than letting either side win . " + W.flatten + " (A `$ref` wrapped in `allOf` beside a " +
+            "`description` is the standard Pydantic v1 output for a referenced model with a field " +
+            "description; that shape has nothing to merge and is unchanged.)",
+            D));
+        }
+      } else {
+        var mergedProps = {}, mergedReq = [];
+        members.forEach(function (m) {
+          Object.keys(m.properties).forEach(function (k) {
+            if (!hasOwn(mergedProps, k)) setOwn(mergedProps, k, clone(m.properties[k]));
+          });
+          (Array.isArray(m.required) ? m.required : []).forEach(function (k) {
+            if (mergedReq.indexOf(k) === -1) mergedReq.push(k);
+          });
+        });
+        Object.keys(mergedProps).forEach(function (k) {
+          if (!node.properties) node.properties = {};
+          if (!hasOwn(node.properties, k)) setOwn(node.properties, k, mergedProps[k]);
+        });
+        var nodeReq = Array.isArray(node.required) ? node.required : [];
+        mergedReq.forEach(function (k) { if (nodeReq.indexOf(k) === -1) nodeReq.push(k); });
+        node.required = nodeReq;
+        if (node.type === undefined) node.type = "object";
+        delete node.allOf;
+        ledger.push(entry("~", path,
+          "Merged an `allOf` of " + members.length + " open object schemas into one object — the " +
+          "union of their properties and of their `required` lists. " + W.merged,
+          D));
+      }
+
+      // The merge above is a union; a closed branch makes the intersection
+      // SMALLER than that union. Drop what no object could have carried
+      // anyway. This is lossless BY CONSTRUCTION — every name removed here is
+      // one some branch already forbade, so no instance that was legal before
+      // becomes illegal — and it is what the vendor does with the same input.
+      // It is reported rather than done silently, because a property vanishing
+      // from the output is exactly the kind of edit a reader must be able to
+      // see (#318).
+      if (!allOfBlocked && allowedProps !== null && isPlainObject(node.properties)) {
+        var dropped = Object.keys(node.properties).filter(function (k) { return !isAllowed(k); });
+        if (dropped.length) {
+          dropped.forEach(function (k) { delete node.properties[k]; });
+          if (Array.isArray(node.required)) {
+            node.required = node.required.filter(function (k) { return isAllowed(k); });
+          }
+          ledger.push(entry("~", path,
+            "Dropped `" + dropped.join("`, `") + "` while merging this `allOf`: a branch declares " +
+            "`additionalProperties: false` without declaring " + (dropped.length > 1 ? "them" : "it") +
+            ", so no object could ever have carried " + (dropped.length > 1 ? "them" : "it") +
+            " and keeping " + (dropped.length > 1 ? "them" : "it") + " would WIDEN what this schema " +
+            "accepts. " + W.dropped + " If you meant " +
+            (dropped.length > 1 ? "these" : "this") + " to be usable, declare " +
+            (dropped.length > 1 ? "them" : "it") + " on the closed branch too.",
+            D));
+        }
+      }
+    }
+    return allOfBlocked;
+  }
+
   function toOpenAI(schema) {
     // `convert()` guards this too, but these four converters are EXPORTED, so a
     // library caller reaches `clone` -- the first recursive thing in the file --
@@ -2759,267 +3101,7 @@
       // exactly what Pydantic emits for a $ref'd model with a field
       // description — came out as `{"description":"..."}`: the entire shape
       // gone, reported as a successful fix. Silent widening, again.
-      var allOfBlocked = false;
-      if (Array.isArray(node.allOf) && node.allOf.length) {
-        // A `$ref` MEMBER is a branch of the intersection, not an opaque token —
-        // and we treated it as opaque, so the mergeability test (which demands
-        // `type: "object"` and `properties` on every member) saw a member with
-        // neither and BLOCKED. Measured on openai@7.4.0: the standard OpenAPI
-        // "extend this base schema" idiom — `{properties:{a},required:["a"],
-        // allOf:[{$ref:Base}]}` and `{allOf:[{$ref:Base},{...}]}` — is ACCEPTED
-        // by the vendor with the merged property set and its accept set
-        // PRESERVED EXACTLY, and we failed the gate on it. That is the
-        // over-strictness class this project has now shipped ~10 times.
-        //
-        // Resolve first, then let the existing intersection merge decide. The
-        // guards are what keep every currently-passing shape byte-identical:
-        //   * only when the node itself constrains, or there are 2+ members —
-        //     so `{allOf:[{$ref}]}` and the Pydantic v1 `{description,
-        //     allOf:[{$ref}]}` still come out as a `$ref` beside annotations,
-        //     the form the vendor accepts and #349 pinned;
-        //   * only for OBJECT referents — a `$ref` to a scalar is a shape the
-        //     vendor throws on, and resolving it would route an unsatisfiable
-        //     node through a merge that reports success;
-        //   * fail closed on anything unresolvable, chained or recursive, so a
-        //     dangling pointer still reaches the blocker that owns it (#320).
-        var refMemberNeedsMerge =
-          isPlainObject(node.properties) || Array.isArray(node.required) || node.allOf.length > 1;
-        var refMembersResolved = 0;
-        if (refMemberNeedsMerge) {
-          node.allOf = node.allOf.map(function (m) {
-            if (!isPlainObject(m) || typeof m.$ref !== "string") return m;
-            var extra = Object.keys(m).filter(function (k) { return k !== "$ref"; });
-            if (!extra.every(function (k) { return inTable(OPENAI_ANNOTATION_KEYWORDS, k); })) return m;
-            var tgt = resolveLocalDef(s, m.$ref);
-            if (!tgt || typeof tgt.$ref === "string") return m;
-            if (!(tgt.type === "object" || isPlainObject(tgt.properties))) return m;
-            if (JSON.stringify(tgt).indexOf(m.$ref) !== -1) return m; // recursive
-            var res = clone(tgt);
-            extra.forEach(function (k) { if (!hasOwn(res, k)) setOwn(res, k, clone(m[k])); });
-            refMembersResolved++;
-            return res;
-          });
-        }
-        if (refMembersResolved) {
-          ledger.push(entry("~", path,
-            "Resolved " + refMembersResolved + " `$ref` member" + (refMembersResolved === 1 ? "" : "s") +
-            " of this `allOf` into the schema " + (refMembersResolved === 1 ? "it points" : "they point") +
-            " at, so the merge below can see what " + (refMembersResolved === 1 ? "it declares" : "they declare") +
-            ". This is the standard \"extend a base schema\" shape; OpenAI's transformer merges it " +
-            "and we used to fail the gate on it, because a `$ref` member declares no `properties` " +
-            "of its own and the mergeability test could not look through it.",
-            DOCS.openai));
-        }
-        var members = node.allOf;
-
-        // An `allOf` is an INTERSECTION, and a branch that declares
-        // `additionalProperties: false` FORBIDS every property it does not
-        // itself declare. So the merged property set is not the UNION of the
-        // branches — it is the union RESTRICTED to every closed branch's own
-        // declarations. openai@7.4.0 computes exactly that
-        // (transform.js:1496-1505, "A closed branch forbids every property it
-        // does not declare") and REFUSES the merge outright when a REQUIRED
-        // property falls outside the intersection, because no object can then
-        // satisfy the schema.
-        //
-        // We unioned, and never looked at any branch's `additionalProperties`
-        // at all — the N-member guard below checks the MEMBERS' and the
-        // single-member path short-circuits past it entirely (#349's shape: the
-        // N=1 special case skipping a condition the general path enforces).
-        // Measured on openai@7.4.0 over the 16-cell node×member grid at a
-        // NESTED position: 8 shapes whose raw accept set is EMPTY (ajv 2020-12,
-        // i.e. no instance can ever satisfy them) came out SATISFIABLE, at zero
-        // blockers, with the ledger claiming "OpenAI's own transformer performs
-        // the same merge" — which the same run measures as false, the vendor
-        // throws on every one. And one shape the vendor ACCEPTS and preserves
-        // EXACTLY (closed node + an optional member property) came out with a
-        // different accept set, because we admitted a property the schema
-        // forbade. Acceptance bought by changing what the schema means is not a
-        // repair (#347).
-        var allOfBranches = [node].concat(members);
-        var closedSets = [];
-        allOfBranches.forEach(function (b) {
-          if (isPlainObject(b) && b.additionalProperties === false) {
-            closedSets.push(Object.keys(isPlainObject(b.properties) ? b.properties : {}));
-          }
-        });
-        // `null` means no branch is closed -> nothing is forbidden -> the plain
-        // union is correct and this whole rule is a no-op, which is what keeps
-        // every currently-passing shape byte-identical.
-        var allowedProps = null;
-        if (closedSets.length) {
-          allowedProps = closedSets[0].slice();
-          closedSets.slice(1).forEach(function (st) {
-            allowedProps = allowedProps.filter(function (k) { return st.indexOf(k) !== -1; });
-          });
-        }
-        var isAllowed = function (k) {
-          return allowedProps === null || allowedProps.indexOf(k) !== -1;
-        };
-        var allOfRequired = [];
-        allOfBranches.forEach(function (b) {
-          (Array.isArray(b && b.required) ? b.required : []).forEach(function (k) {
-            if (allOfRequired.indexOf(k) === -1) allOfRequired.push(k);
-          });
-        });
-        var excludedRequired = allOfRequired.filter(function (k) { return !isAllowed(k); });
-
-        var mergeable =
-          members.length === 1 ||
-          members.every(function (m) {
-            return isPlainObject(m) && m.type === "object" &&
-              isPlainObject(m.properties) && m.additionalProperties !== false;
-          });
-        if (excludedRequired.length) {
-          // No repair exists, so name the remodelling rather than invent one
-          // (#329). Merging anyway is what we used to do and it manufactures a
-          // schema the author never wrote: every one of these is unsatisfiable
-          // as written, and the union silently makes it satisfiable.
-          allOfBlocked = true;
-          ledger.push(entry("!", path,
-            "This `allOf` cannot be satisfied by any object. A branch here declares " +
-            "`additionalProperties: false`, which forbids every property that branch does not itself " +
-            "declare — so the properties allowed by ALL branches together are [" +
-            (allowedProps.length ? "`" + allowedProps.join("`, `") + "`" : "none") + "], while `" +
-            excludedRequired.join("`, `") + "` " + (excludedRequired.length > 1 ? "are" : "is") +
-            " required. OpenAI's transformer refuses exactly this (\"Object allOf ... cannot be " +
-            "merged without changing Draft 7 validation\"). We will not merge it for you: taking the " +
-            "union of the branches would silently ADMIT " + (excludedRequired.length > 1 ? "properties" : "a property") +
-            " the schema forbids, turning a schema no object can satisfy into one that looks fine. " +
-            "Either drop `additionalProperties: false` from the closed branch, or declare `" +
-            excludedRequired.join("`, `") + "` there too.",
-            DOCS.openai));
-        } else if (!mergeable) {
-          allOfBlocked = true;
-          ledger.push(entry("!", path,
-            "`allOf` with " + members.length + " members that OpenAI cannot merge. Its transformer " +
-            "merges an `allOf` of OPEN object schemas and flattens a single-member one, but throws on " +
-            "anything else — closed objects (`additionalProperties: false`) \"cannot be merged without " +
-            "changing Draft 7 validation\", and non-object members are simply unsupported. Express the " +
-            "combined shape as one object schema. We will not drop the `allOf` for you: that would " +
-            "silently remove every constraint inside it.",
-            DOCS.openai));
-        } else if (members.length === 1) {
-          // A single-member `allOf` is NOT a special case. Measured on
-          // openai@7.4.0: the vendor applies the SAME merge it applies to N
-          // members — `{properties:{kind},required:["kind"],allOf:[{properties:
-          // {a},required:["a"]}]}` comes back carrying BOTH `kind` and `a` with
-          // a union `required`. The old code copied a member key only
-          // `if (!(k in node))`, i.e. PARENT WINS, so a parent that already had
-          // `properties` silently DISCARDED the member's `properties` and
-          // `required` — and the ledger line said "Nothing is lost."
-          // That reading is right for ANNOTATIONS (title/description belong to
-          // the wrapper) and is a deletion for anything that carries
-          // constraints. The N-member branch below has always merged correctly;
-          // the special case was the broken one.
-          var only = isPlainObject(members[0]) ? members[0] : null;
-          var onlyProps = only && isPlainObject(only.properties) ? only.properties : null;
-          // The vendor throws when the same property name is declared on both
-          // sides with DIFFERENT subschemas ("cannot be merged without changing
-          // Draft 7 validation"), and accepts when they are identical — so the
-          // test is conflict, not duplication. canonical() so key order does
-          // not manufacture a conflict.
-          var clash = null;
-          if (onlyProps && isPlainObject(node.properties)) {
-            Object.keys(onlyProps).forEach(function (k) {
-              if (clash === null && hasOwn(node.properties, k) &&
-                  canonical(node.properties[k]) !== canonical(onlyProps[k])) clash = k;
-            });
-          }
-          if (clash !== null) {
-            allOfBlocked = true;
-            ledger.push(entry("!", path,
-              "This node and its single-member `allOf` both declare a property `" + clash + "`, with " +
-              "different schemas. OpenAI's transformer refuses exactly this (\"Object allOf ... cannot " +
-              "be merged without changing Draft 7 validation\") and so do we: picking either side would " +
-              "silently change what the schema accepts. Declare `" + clash + "` once, with the shape " +
-              "you actually mean.",
-              DOCS.openai));
-          } else {
-            if (onlyProps) {
-              // Merge, do not overwrite. Union of `properties` and of `required`.
-              if (!node.properties) node.properties = {};
-              Object.keys(onlyProps).forEach(function (k) {
-                if (!hasOwn(node.properties, k)) setOwn(node.properties, k, clone(onlyProps[k]));
-              });
-              var oneReq = Array.isArray(only.required) ? only.required : [];
-              var baseReq = Array.isArray(node.required) ? node.required : [];
-              oneReq.forEach(function (k) { if (baseReq.indexOf(k) === -1) baseReq.push(k); });
-              if (baseReq.length) node.required = baseReq;
-              if (node.type === undefined) node.type = "object";
-            }
-            if (only) {
-              // Everything else (annotations, `$ref`, `type`, …) keeps the
-              // wrapper-wins rule, which is what makes the standard Pydantic v1
-              // shape — `{title, description, allOf:[{$ref}]}` — come out as a
-              // `$ref` beside metadata, the form the vendor accepts.
-              Object.keys(only).forEach(function (k) {
-                if (k === "properties" || k === "required") return;
-                if (!hasOwn(node, k)) setOwn(node, k, clone(only[k]));
-              });
-            }
-            delete node.allOf;
-            ledger.push(entry("~", path,
-              "Flattened a single-member `allOf` into this node, merging its `properties` and " +
-              "`required` with this node's rather than letting either side win — OpenAI's own " +
-              "transformer performs the same merge. (A `$ref` wrapped in `allOf` beside a " +
-              "`description` is the standard Pydantic v1 output for a referenced model with a field " +
-              "description; that shape has nothing to merge and is unchanged.)",
-              DOCS.openai));
-          }
-        } else {
-          var mergedProps = {}, mergedReq = [];
-          members.forEach(function (m) {
-            Object.keys(m.properties).forEach(function (k) {
-              if (!hasOwn(mergedProps, k)) setOwn(mergedProps, k, clone(m.properties[k]));
-            });
-            (Array.isArray(m.required) ? m.required : []).forEach(function (k) {
-              if (mergedReq.indexOf(k) === -1) mergedReq.push(k);
-            });
-          });
-          Object.keys(mergedProps).forEach(function (k) {
-            if (!node.properties) node.properties = {};
-            if (!hasOwn(node.properties, k)) setOwn(node.properties, k, mergedProps[k]);
-          });
-          var nodeReq = Array.isArray(node.required) ? node.required : [];
-          mergedReq.forEach(function (k) { if (nodeReq.indexOf(k) === -1) nodeReq.push(k); });
-          node.required = nodeReq;
-          if (node.type === undefined) node.type = "object";
-          delete node.allOf;
-          ledger.push(entry("~", path,
-            "Merged an `allOf` of " + members.length + " open object schemas into one object — the " +
-            "union of their properties and of their `required` lists. This is what OpenAI's " +
-            "transformer does with the same input.",
-            DOCS.openai));
-        }
-
-        // The merge above is a union; a closed branch makes the intersection
-        // SMALLER than that union. Drop what no object could have carried
-        // anyway. This is lossless BY CONSTRUCTION — every name removed here is
-        // one some branch already forbade, so no instance that was legal before
-        // becomes illegal — and it is what the vendor does with the same input.
-        // It is reported rather than done silently, because a property vanishing
-        // from the output is exactly the kind of edit a reader must be able to
-        // see (#318).
-        if (!allOfBlocked && allowedProps !== null && isPlainObject(node.properties)) {
-          var dropped = Object.keys(node.properties).filter(function (k) { return !isAllowed(k); });
-          if (dropped.length) {
-            dropped.forEach(function (k) { delete node.properties[k]; });
-            if (Array.isArray(node.required)) {
-              node.required = node.required.filter(function (k) { return isAllowed(k); });
-            }
-            ledger.push(entry("~", path,
-              "Dropped `" + dropped.join("`, `") + "` while merging this `allOf`: a branch declares " +
-              "`additionalProperties: false` without declaring " + (dropped.length > 1 ? "them" : "it") +
-              ", so no object could ever have carried " + (dropped.length > 1 ? "them" : "it") +
-              " and keeping " + (dropped.length > 1 ? "them" : "it") + " would WIDEN what this schema " +
-              "accepts. OpenAI's transformer discards the same names. If you meant " +
-              (dropped.length > 1 ? "these" : "this") + " to be usable, declare " +
-              (dropped.length > 1 ? "them" : "it") + " on the closed branch too.",
-              DOCS.openai));
-          }
-        }
-      }
+      var allOfBlocked = mergeAllOf(s, node, path, ledger, DOCS.openai, ALLOF_WHY.openai);
 
       // `anyOf` is the union OpenAI supports; `oneOf` is not representable.
       // Rewriting is only lossless when the branches are provably disjoint —
@@ -6972,6 +7054,11 @@
     noteDecoderBooleans("outlines", s, ledger, url);
 
     walk(s, "root", function (node, path) {
+      // The merge FIRST, so every rule below reads the node the schema MEANS
+      // rather than the one the caller spelled: it invents `properties`/`required`
+      // on this node and deletes `allOf`, and a rule that runs before a rewrite
+      // cannot see what the rewrite creates (#363).
+      mergeAllOf(s, node, path, ledger, url, DECODER_ALLOF_WHY, true);
       noteDecoderUnsatisfiable("outlines", node, path, ledger, url);
 
       // 1. The fatal case, and the only one that is both silent AND repairable.
@@ -7159,6 +7246,11 @@
     noteDecoderBooleans("xgrammar", s, ledger, url);
 
     walk(s, "root", function (node, path) {
+      // The merge FIRST, so every rule below reads the node the schema MEANS
+      // rather than the one the caller spelled: it invents `properties`/`required`
+      // on this node and deletes `allOf`, and a rule that runs before a rewrite
+      // cannot see what the rewrite creates (#363).
+      mergeAllOf(s, node, path, ledger, url, DECODER_ALLOF_WHY, true);
       noteDecoderUnsatisfiable("xgrammar", node, path, ledger, url);
 
       // 1. The alternation bug, confirmed in a SECOND engine. outlines accepts
@@ -7412,6 +7504,11 @@
       // only one not already covered by the `Unsupported type None` blocker
       // below — every other form is TYPELESS, so reporting both would be two
       // findings for one node with one cause.
+      // The merge FIRST, so every rule below reads the node the schema MEANS
+      // rather than the one the caller spelled: it invents `properties`/`required`
+      // on this node and deletes `allOf`, and a rule that runs before a rewrite
+      // cannot see what the rewrite creates (#363).
+      mergeAllOf(s, node, path, ledger, url, DECODER_ALLOF_WHY, true);
       noteDecoderUnsatisfiable("lmformatenforcer", node, path, ledger, url);
 
       // 1. THE HEADLINE, and it is an INVERSION rather than a loss of
