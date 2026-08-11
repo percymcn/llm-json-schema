@@ -33,7 +33,8 @@
     "openai-nonstrict": "https://platform.openai.com/docs/guides/function-calling",
     "openai-realtime": "https://platform.openai.com/docs/guides/realtime-conversations",
     outlines: "https://github.com/dottxt-ai/outlines-core",
-    xgrammar: "https://github.com/mlc-ai/xgrammar"
+    xgrammar: "https://github.com/mlc-ai/xgrammar",
+    lmformatenforcer: "https://github.com/noamgat/lm-format-enforcer"
   };
 
   // ---- small helpers -------------------------------------------------------
@@ -6481,6 +6482,184 @@
     return { schema: s, ledger: ledger };
   }
 
+  // ---- lm-format-enforcer: the THIRD consumer target ------------------------
+  //
+  // #385 measured two constrained decoders and found their tables nearly
+  // DISJOINT, which is why a third one is worth measuring rather than assuming.
+  // It is also architecturally different from both: outlines compiles the
+  // schema to a REGEX, xgrammar to a PUSHDOWN GRAMMAR, and this one is a
+  // CHARACTER-LEVEL PARSER that walks the schema as it consumes bytes.
+  //
+  // That difference is load-bearing, because it FALSIFIES the class-level claim
+  // #385 made. Both of the other engines interpolate a user `pattern` between
+  // the two JSON quote characters without wrapping it, so a top-level `|` binds
+  // across them and `cat|dog` becomes uncompilable-in-practice. MEASURED HERE:
+  // `cat|dog`, `^GET|POST$` and `(?:cat|dog)` all accept both alternatives AND
+  // still reject a violation. The shared bug is a property of engines that
+  // SPLICE a pattern into a grammar, not of constrained decoding. Likewise
+  // xgrammar's `propertyNames`-destroys-`additionalProperties` finding does NOT
+  // reproduce here (measured on the same three shapes).
+  //
+  // MEASURED 2026-08-11 against lm-format-enforcer 0.11.3 via `JsonSchemaParser`
+  // fed one character at a time (`get_allowed_characters` / `add_character` /
+  // `can_end`) — exact, local, no API key, no model, no tokenizer. Every row
+  // asserts BOTH halves: a valid instance that must be ACCEPTED and a violating
+  // one that must be REJECTED (#384's correction — a one-sided row goes green
+  // for the wrong reason).
+  //
+  // Reachability: a vLLM `guided_decoding_backend` option, and the engine behind
+  // several HF/LangChain integrations.
+
+  // Silently ignored: kept, never stripped. This engine IGNORES rather than
+  // erroring, so removing them would destroy a constraint that still holds
+  // everywhere else the document is used and buy nothing here (#314).
+  var LMFE_IGNORED = {
+    minimum: 1, maximum: 1, exclusiveMinimum: 1, exclusiveMaximum: 1,
+    multipleOf: 1, uniqueItems: 1, prefixItems: 1, contains: 1,
+    minProperties: 1, maxProperties: 1, propertyNames: 1,
+    patternProperties: 1, dependentRequired: 1, allOf: 1, not: 1
+  };
+
+  // Positive control, and the reason this table is measured rather than
+  // reasoned: `pattern`, `minLength`/`maxLength` and `minItems`/`maxItems` are
+  // ENFORCED here. outlines ignores every numeric bound; xgrammar enforces them
+  // all; this engine enforces the string and array bounds and ignores the
+  // numeric ones. Three implementations, three answers.
+  var LMFE_ENFORCED = [
+    "type", "enum", "const", "minLength", "maxLength", "pattern",
+    "minItems", "maxItems", "items", "required", "properties",
+    "additionalProperties", "anyOf"
+  ];
+
+  // A schema object with at least one key but nothing that determines its kind
+  // makes `JsonSchemaParser()` RAISE `Unsupported type None`, so no parser is
+  // built and no request is made. Measured to fire at the ROOT and on `allOf`
+  // MEMBERS; a nested `properties` value with the same shape compiles, so the
+  // rule is scoped to those two positions rather than applied everywhere (which
+  // would be the over-strictness bug this project has shipped repeatedly).
+  // `oneOf` is handled by forcing EVERY member into an object parser without
+  // dispatching per member (`jsonschemaparser.py:205`, which returns before the
+  // `$ref` branch at :213 is reached). For INLINE OBJECT members that guess is
+  // right and the union works — measured, and it is the shape their own issue
+  // #138 was filed about. It is wrong for a `$ref` member (merged with no
+  // `properties` → any object) and for a scalar member (forced to demand `{`).
+  // So the rule is scoped to the members that are actually broken: firing on a
+  // working inline-object union would be an edit that buys nothing (#365).
+  function lmfeOneOfBroken(branches) {
+    if (!Array.isArray(branches) || !branches.length) return false;
+    return branches.some(function (m) {
+      if (!isPlainObject(m)) return true;
+      if (hasOwn(m, "$ref")) return true;                       // never resolved on this path
+      if (m.type === "object" || isPlainObject(m.properties)) return false;
+      return true;                                              // scalar / untyped member
+    });
+  }
+
+  function lmfeUnbuildable(node) {
+    if (!isPlainObject(node)) return false;
+    if (Object.keys(node).length === 0) return false;      // bare {} is legal: any JSON
+    if (hasOwn(node, "type") || hasOwn(node, "enum") || hasOwn(node, "const")) return false;
+    if (hasOwn(node, "anyOf") || hasOwn(node, "oneOf") || hasOwn(node, "allOf")) return false;
+    if (hasOwn(node, "$ref")) return false;
+    return true;
+  }
+
+  function toLmFormatEnforcer(schema) {
+    var tooDeepOut = tooDeepEntry(schema, DOCS.lmformatenforcer);
+    if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
+    var s = clone(schema);
+    var ledger = [];
+    var url = DOCS.lmformatenforcer;
+
+    walk(s, "root", function (node, path) {
+      // 1. THE HEADLINE, and it is an INVERSION rather than a loss of
+      //    enforcement: `oneOf` compiles with NO error and the parser then
+      //    demands an OBJECT. For a scalar union the accept set becomes
+      //    DISJOINT from the schema's — measured, `{"oneOf":[integer,string]}`
+      //    REJECTS 5 and "s" (every value it permits) and ACCEPTS {} and
+      //    {"j":1} (values it forbids). For an OBJECT union it is widened to
+      //    "any object": every field constraint and the discriminator itself
+      //    stop applying.
+      //
+      //    Reachability is the recommended spelling: pydantic 2.13.4 emits
+      //    `oneOf` for `Field(discriminator=...)`, verbatim.
+      //
+      //    `anyOf` is ENFORCED correctly here, so the repair is the rewrite
+      //    #318 already owns — and it is only sound when the branches are
+      //    PROVABLY EXCLUSIVE, because `oneOf` means exactly-one and `anyOf`
+      //    means at-least-one.
+      if (Array.isArray(node.oneOf) && node.oneOf.length && !hasOwn(node, "anyOf") &&
+          lmfeOneOfBroken(node.oneOf)) {
+        if (oneOfProvablyExclusive(node.oneOf, s)) {
+          setOwn(node, "anyOf", node.oneOf);
+          delete node.oneOf;
+          ledger.push(entry("~", path,
+            "Rewrote `oneOf` to `anyOf`. lm-format-enforcer forces every `oneOf` member into an " +
+            "object parser without dispatching per member, and returns before its own `$ref` " +
+            "branch runs — so a `$ref` member becomes an unconstrained object and a scalar " +
+            "member is rejected outright. `anyOf` resolves the same `$ref`s correctly (that is " +
+            "the control), and these branches are provably exclusive, so the rewrite preserves " +
+            "the meaning. Measured on pydantic's own `Field(discriminator=...)` output: before, " +
+            "`{}` and a cat-tagged object carrying a dog's field are both accepted; after, both " +
+            "are rejected and the two legal shapes still generate. A union whose members are " +
+            "INLINE objects already works and is left alone.",
+            url));
+        } else {
+          ledger.push(entry("!", path,
+            "`oneOf` here has a `$ref` or non-object member, and lm-format-enforcer forces every " +
+            "member into an object parser without resolving it — a union of scalars rejects " +
+            "every value your schema permits and accepts objects it forbids; `$ref` members lose " +
+            "every field constraint. The repair is to spell it " +
+            "`anyOf`, which this engine enforces, but that is only meaning-preserving when the " +
+            "branches are mutually exclusive and these are not provably so (`oneOf` is " +
+            "exactly-one, `anyOf` is at-least-one). Add a required discriminator property with a " +
+            "distinct literal per branch, or make the branches disjoint by type.",
+            url));
+        }
+      }
+
+      // 2. A subschema with no `type`/`enum`/`const`/combinator/`$ref` makes the
+      //    parser constructor RAISE, so nothing is generated at all. Loud, and
+      //    therefore far safer than rule 1 — but worth blocking because the
+      //    message (`Unsupported type None`) names neither the keyword nor the
+      //    path. Scoped to the two positions where it was measured to fire.
+      var unbuildable = [];
+      if (path === "root" && lmfeUnbuildable(node)) unbuildable.push("this schema");
+      if (Array.isArray(node.allOf)) {
+        node.allOf.forEach(function (m, i) {
+          if (lmfeUnbuildable(m)) unbuildable.push("`allOf[" + i + "]`");
+        });
+      }
+      if (unbuildable.length) {
+        ledger.push(entry("!", path,
+          "lm-format-enforcer cannot build a parser for " + unbuildable.join(" and ") + ": a " +
+          "schema object with keys but no `type`, `enum`, `const`, `$ref` or combinator raises " +
+          "`Unsupported type None`, so the request is never made and the error names neither the " +
+          "keyword nor the path. Give the node an explicit `type`. (A bare `{}` is fine — it " +
+          "means any JSON — and the same shape nested under `properties` compiles, so this is " +
+          "specific to the root and to `allOf` members.)",
+          url));
+      }
+
+      // 3. The silent set.
+      Object.keys(LMFE_IGNORED).forEach(function (k) {
+        if (!hasOwn(node, k)) return;
+        ledger.push(entry("=", path,
+          "`" + k + "` is kept here but lm-format-enforcer does NOT enforce it: the parser " +
+          "accepts values that violate it, and nothing errors. Validate this constraint yourself " +
+          "after generation. (Measured asymmetry worth knowing: `pattern`, `minLength`/" +
+          "`maxLength` and `minItems`/`maxItems` ARE enforced here, every numeric bound is not, " +
+          "and xgrammar is the other way round on the numeric ones — you cannot carry one " +
+          "decoder's table over to another.)",
+          url, true));
+      });
+    });
+
+    noteEmptiedDocument(schema, s, ledger, url,
+      "lm-format-enforcer takes standard JSON Schema, so nothing is stripped on this target.");
+    return { schema: s, ledger: ledger };
+  }
+
   var CONVERTERS = {
     openai: toOpenAI,
     // Anthropic is two request fields, two dialects, two targets — same shape
@@ -6532,7 +6711,8 @@
     // The second consumer, and a different answer: xgrammar enforces every
     // numeric bound that outlines silently drops, and ignores `allOf`/`not`
     // that outlines refuses outright. One decoder's table does not transfer.
-    xgrammar: toXgrammar
+    xgrammar: toXgrammar,
+    lmformatenforcer: toLmFormatEnforcer
   };
 
   // ---- public API ----------------------------------------------------------
@@ -6763,6 +6943,7 @@
     toGemini: toGemini,
     toOutlines: toOutlines,
     toXgrammar: toXgrammar,
+    toLmFormatEnforcer: toLmFormatEnforcer,
     DOCS: DOCS,
 
     // Exported so the measured enforcement table is re-diffable against
@@ -6774,6 +6955,8 @@
     OUTLINES_REJECTED_KEYS: Object.keys(OUTLINES_REJECTED),
     OUTLINES_ENFORCED_KEYS: OUTLINES_ENFORCED.slice(),
     XGRAMMAR_DROPPED_KEYS: Object.keys(XGRAMMAR_DROPPED),
+    LMFE_IGNORED_KEYS: Object.keys(LMFE_IGNORED),
+    LMFE_ENFORCED_KEYS: LMFE_ENFORCED.slice(),
     XGRAMMAR_ENFORCED_KEYS: XGRAMMAR_ENFORCED.slice(),
     // The narrow `responseSchema` subset, exported so it can be diffed against
     // the vendor artifact it is derived from. It is now confirmed by three

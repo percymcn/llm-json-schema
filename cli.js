@@ -20,7 +20,7 @@ var E = require("./engine.js");
 
 var PROVIDERS = ["openai", "openai-nonstrict", "anthropic", "anthropic-json",
   "anthropic-json-python", "anthropic-go", "gemini", "gemini-json",
-  "gemini-client", "openai-realtime", "outlines", "xgrammar"];
+  "gemini-client", "openai-realtime", "outlines", "xgrammar", "lmformatenforcer"];
 
 var USAGE = [
   "llm-schema — make a JSON Schema valid for OpenAI / Anthropic / Gemini",
@@ -44,6 +44,7 @@ var USAGE = [
   "                     (google-adk etc.) — proto limits, JSON Schema spellings",
   "  outlines           outlines / outlines-core constrained decoding, incl. self-hosted",
   "  xgrammar           xgrammar constrained decoding — vLLM and SGLang's DEFAULT backend",
+  "  lmformatenforcer   lm-format-enforcer constrained decoding — a vLLM backend option",
   "                     (schema -> regex: asks what is ENFORCED, not what is accepted)",
   "",
   "If you never set `strict`, you are on openai-nonstrict — it is optional and off by",

@@ -8608,5 +8608,147 @@ function fanoutSchema(depth, cyclic) {
     !has(conv(bounded, "xgrammar").ledger, "does NOT enforce"));
 })();
 
+// --- Cycle #386: lm-format-enforcer, the THIRD constrained decoder -----------
+// Measured 2026-08-11 against lm-format-enforcer 0.11.3 via JsonSchemaParser fed
+// one character at a time. Every row asserts BOTH halves (valid accepted AND
+// violating rejected), per #384's correction.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function ops(r, op) {
+    return r.ledger.filter(function (l) { return l.op === op; }).length;
+  }
+  var T = "lmformatenforcer";
+
+  // VERBATIM pydantic 2.13.4 output for Field(discriminator="kind") (#311).
+  var PYD = {
+    "$defs": {
+      "Cat": { "properties": { "kind": { "const": "cat", "title": "Kind", "type": "string" },
+                               "meow": { "title": "Meow", "type": "integer" } },
+               "required": ["kind", "meow"], "title": "Cat", "type": "object" },
+      "Dog": { "properties": { "kind": { "const": "dog", "title": "Kind", "type": "string" },
+                               "bark": { "title": "Bark", "type": "integer" } },
+               "required": ["kind", "bark"], "title": "Dog", "type": "object" }
+    },
+    "properties": { "pet": {
+      "discriminator": { "mapping": { "cat": "#/$defs/Cat", "dog": "#/$defs/Dog" },
+                         "propertyName": "kind" },
+      "oneOf": [{ "$ref": "#/$defs/Cat" }, { "$ref": "#/$defs/Dog" }], "title": "Pet" } },
+    "required": ["pet"], "title": "Pet", "type": "object"
+  };
+
+  var r = conv(PYD, T);
+  ok("lmfe: pydantic discriminated union has its `oneOf` rewritten to `anyOf`",
+    JSON.stringify(r.schema).indexOf('"oneOf"') === -1 &&
+    JSON.stringify(r.schema).indexOf('"anyOf"') !== -1);
+  ok("lmfe: the rewrite is reported, and names the mechanism rather than the keyword",
+    has(r.ledger, "Rewrote `oneOf` to `anyOf`") &&
+    has(r.ledger, "without dispatching per member"));
+
+  // SCOPING, measured: a union of INLINE OBJECT members is handled correctly by
+  // this engine (it is the shape their own issue #138 was filed about and it
+  // still works), so firing there would be an edit that buys nothing (#365).
+  var inlineUnion = { oneOf: [
+    { type: "object", properties: { kind: { const: "cat" }, meow: { type: "integer" } },
+      required: ["kind", "meow"] },
+    { type: "object", properties: { kind: { const: "dog" }, bark: { type: "integer" } },
+      required: ["kind", "dog"] } ] };
+  ok("lmfe: an INLINE-object union is left alone (it already works there)",
+    JSON.stringify(conv(inlineUnion, T).schema).indexOf('"oneOf"') !== -1);
+  ok("lmfe: ...while the SAME union written with `$ref` members IS repaired",
+    JSON.stringify(conv({ $defs: { C: inlineUnion.oneOf[0], D: inlineUnion.oneOf[1] },
+      oneOf: [{ $ref: "#/$defs/C" }, { $ref: "#/$defs/D" }] }, T).schema)
+      .indexOf('"anyOf"') !== -1);
+  ok("lmfe: the discriminator itself survives the rewrite",
+    JSON.stringify(r.schema).indexOf("propertyName") !== -1);
+
+  // A union whose branches are NOT provably exclusive has no lossless repair:
+  // `anyOf` is at-least-one, so rewriting would widen it (#318's rule).
+  var overlap = conv({ oneOf: [{ type: "integer" }, { type: "integer", minimum: 5 }] }, T);
+  ok("lmfe: a non-exclusive `oneOf` is a blocker, not a silent widening",
+    ops(overlap, "!") >= 1 && has(overlap.ledger, "exactly-one"));
+  ok("lmfe: the non-exclusive blocker leaves `oneOf` visible to the reader (#318)",
+    JSON.stringify(overlap.schema).indexOf('"oneOf"') !== -1);
+
+  // A scalar union IS provably exclusive (disjoint types) and is repaired.
+  var scalar = conv({ oneOf: [{ type: "integer" }, { type: "string" }] }, T);
+  ok("lmfe: a disjoint scalar union is repaired rather than blocked",
+    ops(scalar, "~") >= 1 && ops(scalar, "!") === 0);
+
+  // The parser constructor RAISES on a keyed schema with no kind. Measured to
+  // fire at the root and on allOf members ONLY.
+  ok("lmfe: an untyped root is a blocker (JsonSchemaParser raises)",
+    ops(conv({ minimum: 10 }, T), "!") >= 1);
+  ok("lmfe: an untyped `allOf` member is a blocker",
+    has(conv({ allOf: [{ type: "integer" }, { minimum: 10 }] }, T).ledger, "allOf[1]"));
+
+  // OVER-BLOCK GUARDS. These hold both ways and are stated as guards, not
+  // counted as new coverage.
+  ok("lmfe: a bare {} is NOT blocked (it means any JSON, and compiles)",
+    ops(conv({}, T), "!") === 0);
+  ok("lmfe: the same untyped shape NESTED under `properties` is NOT blocked",
+    ops(conv({ type: "object", properties: { a: { minimum: 3 } }, required: ["a"] }, T), "!") === 0);
+  ok("lmfe: an ordinary typed object draws no blocker",
+    ops(conv({ type: "object", properties: { a: { type: "integer" } }, required: ["a"] }, T), "!") === 0);
+
+  // THE FALSIFICATION OF #385'S CLASS CLAIM, made executable. Both other
+  // decoders splice a pattern between the JSON quote characters, so a top-level
+  // alternation binds across them; this engine parses the pattern separately and
+  // handles it correctly. Measured: `cat|dog` accepts "cat" AND "dog" AND still
+  // rejects "ZZZ9".
+  var alt = { type: "string", pattern: "cat|dog" };
+  ok("lmfe: a top-level alternation in `pattern` is NOT rewritten here",
+    !has(conv(alt, T).ledger, "non-capturing group"));
+  ok("lmfe: ...while BOTH other decoders still rewrite it (the discriminator)",
+    has(conv(alt, "outlines").ledger, "non-capturing group") &&
+    has(conv(alt, "xgrammar").ledger, "non-capturing group"));
+
+  // xgrammar's headline does not reproduce here either.
+  var mapNode = { type: "object", propertyNames: {}, additionalProperties: { type: "integer" } };
+  ok("lmfe: `propertyNames` does not destroy the sibling value schema here",
+    JSON.stringify(conv(mapNode, T).schema).indexOf('"additionalProperties":{"type":"integer"}') !== -1);
+
+  // The silent set, with a POSITIVE CONTROL: without it the advisory could be
+  // firing on every keyword and every other assertion would still pass.
+  ok("lmfe: `minimum` is flagged unenforced",
+    has(conv({ type: "integer", minimum: 10 }, T).ledger, "does NOT enforce it"));
+  ok("lmfe: `minLength` is NOT flagged — it is genuinely enforced here",
+    !has(conv({ type: "string", minLength: 3 }, T).ledger, "does NOT enforce it"));
+  ok("lmfe: ...and xgrammar is the other way round on the numeric bound",
+    !has(conv({ type: "integer", minimum: 10 }, "xgrammar").ledger, "does NOT enforce it"));
+
+  // #365's discriminator: the three consumer targets must produce genuinely
+  // DIFFERENT diagnoses for one document, or this target is an alias.
+  var three = { type: "object", required: ["v", "s"], properties: {
+    v: { oneOf: [{ type: "integer" }, { type: "string" }] },
+    s: { type: "string", pattern: "cat|dog" } } };
+  var a = JSON.stringify(conv(three, "outlines").schema);
+  var b = JSON.stringify(conv(three, "xgrammar").schema);
+  var c = JSON.stringify(conv(three, T).schema);
+  ok("lmfe: the three decoder targets emit genuinely different documents",
+    c !== a && c !== b);
+
+  // SCOPE PINS: no other target may acquire this rewrite.
+  ["openai", "anthropic", "gemini-json", "outlines", "xgrammar"].forEach(function (p) {
+    ok("lmfe: `--to " + p + "` never emits the lm-format-enforcer `oneOf` note",
+      !has(conv(PYD, p).ledger, "lm-format-enforcer compiles `oneOf`"));
+  });
+
+  // Advisories must never fail the gate (#317's property).
+  ok("lmfe: the unenforced-keyword note is advisory",
+    conv({ type: "integer", minimum: 10 }, T).ledger.filter(function (l) {
+      return l.op === "=" && l.advisory; }).length >= 1);
+
+  ok("lmfe: the measured tables are exported for re-diffing (#361)",
+    Array.isArray(E.LMFE_IGNORED_KEYS) && E.LMFE_IGNORED_KEYS.length >= 10 &&
+    Array.isArray(E.LMFE_ENFORCED_KEYS) && E.LMFE_ENFORCED_KEYS.indexOf("pattern") !== -1 &&
+    E.LMFE_IGNORED_KEYS.indexOf("minimum") !== -1);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -1818,5 +1818,52 @@ function fanout(depth) {
      run(["--help"], "").stdout.indexOf("xgrammar") !== -1);
 })();
 
+// --- Cycle #386: lm-format-enforcer target reachable from the CLI -----------
+(function () {
+  var PYD = JSON.stringify({
+    "$defs": {
+      "Cat": { "properties": { "kind": { "const": "cat", "type": "string" },
+                               "meow": { "type": "integer" } },
+               "required": ["kind", "meow"], "type": "object" },
+      "Dog": { "properties": { "kind": { "const": "dog", "type": "string" },
+                               "bark": { "type": "integer" } },
+               "required": ["kind", "bark"], "type": "object" }
+    },
+    "properties": { "pet": { "oneOf": [{ "$ref": "#/$defs/Cat" }, { "$ref": "#/$defs/Dog" }] } },
+    "required": ["pet"], "type": "object"
+  });
+
+  var r = run(["--to", "lmformatenforcer"], PYD);
+  ok("cli: `--to lmformatenforcer` is a valid target", r.status === 0 || r.status === 1);
+  ok("cli: it rewrites the union to `anyOf`",
+    r.stdout.indexOf('"anyOf"') !== -1 && r.stdout.indexOf('"oneOf"') === -1);
+  ok("cli: it explains what goes wrong without the rewrite",
+    r.stderr.indexOf("without dispatching per member") !== -1);
+
+  // The three decoder targets must genuinely disagree about the same file.
+  var x = run(["--to", "xgrammar"], PYD);
+  ok("cli: xgrammar leaves the same union alone",
+    x.stdout.indexOf('"oneOf"') !== -1);
+
+  // A non-exclusive union is a blocker: exit 3, not a silent widening.
+  var blocked = run(["--check", "--to", "lmformatenforcer"],
+    JSON.stringify({ oneOf: [{ type: "integer" }, { type: "integer", minimum: 5 }] }));
+  ok("cli: a non-exclusive `oneOf` exits 3 (blocker)", blocked.status === 3);
+
+  // An advisory alone must never fail the gate (#317).
+  var adv = run(["--check", "--to", "lmformatenforcer"],
+    JSON.stringify({ type: "integer", minimum: 10 }));
+  ok("cli: an unenforced-keyword advisory alone exits 0", adv.status === 0);
+
+  // Idempotence: rechecking our own output is clean.
+  var out = run(["--to", "lmformatenforcer"], PYD).stdout;
+  ok("cli: converted output rechecks clean",
+    run(["--check", "--to", "lmformatenforcer"], out).status === 0);
+
+  ok("cli: the target is listed in --help beside its condition",
+    run(["--help"], "").stdout.indexOf("lmformatenforcer") !== -1);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

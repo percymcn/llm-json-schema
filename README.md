@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1378 engine + 295 CLI + 77 ESM/library assertions = **1750** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1405 engine + 303 CLI + 83 ESM/library assertions = **1791** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -926,7 +926,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1709 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1791 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1810,3 +1810,29 @@ The tuple and set rows are worth separating out, because they are *not* open
 mappings: no open-mapping preflight, however deep, can see them. They are a
 different reason the same schema is strict-invalid, and they fail loudly at the
 provider rather than silently in the document.
+
+### Three constrained decoders, three different tables
+
+`--to outlines`, `--to xgrammar` and `--to lmformatenforcer` ask a different question from every other target. The rest ask *will the destination accept this document?*; a constrained decoder asks *will the constraint actually be enforced?* — and the answers do not transfer between them.
+
+| keyword | outlines-core | xgrammar | lm-format-enforcer |
+|---|---|---|---|
+| numeric bounds (`minimum`, `multipleOf`, …) | ignored | **enforced** | ignored |
+| `minLength` / `maxLength` | ignored | **enforced** | **enforced** |
+| `minItems` / `maxItems` | **enforced** | **enforced** | **enforced** |
+| `minProperties` / `maxProperties` | ignored | **enforced** | ignored |
+| `uniqueItems`, `contains`, `dependentRequired` | ignored | ignored | ignored |
+| `allOf`, `not` | **refused** (raises) | ignored | ignored |
+| `pattern` with a top-level `\|` | **broken** | **broken** | **correct** |
+| `oneOf` with `$ref` or scalar members | — | — | **broken** |
+| `propertyNames` beside `additionalProperties` | — | **destroys the value schema** | fine |
+
+Measured 2026-08-10/11 against `outlines-core` 0.2.14, `xgrammar` 0.2.4 and `lm-format-enforcer` 0.11.3, with every row asserting both halves: a valid instance that must be accepted **and** a violating one that must be rejected.
+
+Two things that generalise from the table:
+
+- **A table measured against one implementation is a fact about that implementation.** "Constrained decoding ignores numeric bounds" is true of outlines and false of xgrammar, which is the backend most people are actually running.
+- **A shared failure is not automatically a universal one.** outlines and xgrammar both splice a user `pattern` between the two JSON quote characters without wrapping it, so a top-level `|` binds across them and `cat|dog` matches neither `cat` nor `dog`. That is a property of engines that *splice a pattern into a grammar* — lm-format-enforcer parses it separately and handles the same pattern correctly.
+
+Unenforced keywords are **kept, never stripped**: these engines ignore rather than error, so removing a keyword would destroy a constraint that still holds everywhere else the document is used and buy nothing here.
+

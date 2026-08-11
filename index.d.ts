@@ -17,7 +17,8 @@ export type Provider =
   | "gemini-client"
   | "openai-realtime"
   | "outlines"
-  | "xgrammar";
+  | "xgrammar"
+  | "lmformatenforcer";
 
 /** A JSON Schema object. Deliberately loose — we transform arbitrary schemas. */
 export type JSONSchema = Record<string, any>;
@@ -125,6 +126,13 @@ export function toOutlines(schema: JSONSchema): TransformResult;
  * `allOf`/`not` that outlines refuses outright.
  */
 export function toXgrammar(schema: JSONSchema): TransformResult;
+
+/**
+ * lm-format-enforcer (character-level parser). Rewrites a provably-exclusive
+ * `oneOf` to `anyOf` — it compiles `oneOf` with no error and then demands an
+ * object, so a scalar union rejects every value the schema permits.
+ */
+export function toLmFormatEnforcer(schema: JSONSchema): TransformResult;
 
 /** Infer a JSON Schema from a sample JSON value. */
 export function inferSchema(value: unknown): JSONSchema;
@@ -300,6 +308,12 @@ export const OUTLINES_ENFORCED_KEYS: string[];
  */
 export const XGRAMMAR_DROPPED_KEYS: string[];
 
+/** Keywords lm-format-enforcer 0.11.3 silently ignores (measured). */
+export const LMFE_IGNORED_KEYS: string[];
+
+/** Keywords lm-format-enforcer 0.11.3 genuinely enforces (measured). */
+export const LMFE_ENFORCED_KEYS: string[];
+
 /** Positive control: keywords xgrammar genuinely does enforce. */
 export const XGRAMMAR_ENFORCED_KEYS: string[];
 
@@ -328,7 +342,10 @@ declare const api: {
   OUTLINES_REJECTED_KEYS: typeof OUTLINES_REJECTED_KEYS;
   OUTLINES_ENFORCED_KEYS: typeof OUTLINES_ENFORCED_KEYS;
   toXgrammar: typeof toXgrammar;
+  toLmFormatEnforcer: typeof toLmFormatEnforcer;
   XGRAMMAR_DROPPED_KEYS: typeof XGRAMMAR_DROPPED_KEYS;
+  LMFE_IGNORED_KEYS: typeof LMFE_IGNORED_KEYS;
+  LMFE_ENFORCED_KEYS: typeof LMFE_ENFORCED_KEYS;
   XGRAMMAR_ENFORCED_KEYS: typeof XGRAMMAR_ENFORCED_KEYS;
 };
 
