@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1746 engine + 387 CLI + 83 ESM/library assertions = **2216** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1775 engine + 397 CLI + 83 ESM/library assertions = **2255** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -817,6 +817,50 @@ workflow *"convert for OpenAI, then serve with vLLM"* hands these engines a
 pointer they cannot read. Measured end to end, our repaired output goes from
 **0 to 11 of 11 compiling** across the three engines.
 
+## A bare `{"type":"object"}` is destroyed by xgrammar (#398)
+
+A keyword table can only say *this keyword is ignored*. Measured against
+xgrammar 0.2.5, that is a claim about the keyword **and the node it sits on**.
+
+On a node that declares `type: "object"` and **nothing else that describes its
+shape** — no `properties`, no `additionalProperties`, no `$ref`, no combinator —
+the presence of almost any further keyword compiles to:
+
+```
+root ::= (("{" "}") | ("{" [ \n\t]* "}"))
+```
+
+The empty object becomes the only legal document. Not a narrowing of whatever
+the keyword expresses — the node goes from *any object* to *nothing but `{}`*,
+with no error. A bogus `frobnicate` does it too, which is what makes this about
+the **absence of a shape** rather than any particular keyword; `minProperties`
+refuses to compile outright.
+
+`{"type":"object","required":["a"]}` is the sharpest case, because the raw
+accept set is **disjoint** from the schema's — it permits exactly the one
+document the schema forbids and rejects every document it requires:
+
+| | `{}` | `{"a":1}` | `{"a":"x"}` | `{"b":2}` | `{"a":1,"b":2}` | `{"x":"y"}` |
+|---|---|---|---|---|---|---|
+| JSON Schema says | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ |
+| raw, on xgrammar | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| after `--to xgrammar` | ✗ | ✓ | ✓ | ✗ | ✓ | ✗ |
+
+The repair gives the node a shape: `additionalProperties: true`, plus a declared
+`properties[name] = {}` for each name already in `required`. **Both edits are
+no-ops in JSON Schema** — `additionalProperties: true` is the default and `{}`
+matches anything — and that was verified rather than argued: on three healthy
+nodes the accept set is byte-identical with and without them. Nine shapes go
+from broken to *exactly* the schema's accept set; zero regress.
+
+This is **xgrammar-specific, and that is a measurement**. On outlines-core the
+same keywords on the same node are harmlessly ignored, and lm-format-enforcer
+enforces `required` on a bare object **correctly**. The repair is actively
+destructive on both — on outlines the repaired form accepts nothing, and on
+lm-format-enforcer the boolean `additionalProperties` crashes the parser
+mid-parse — so `--to outlines` and `--to lmformatenforcer` leave the document
+alone. Same file, three decoder targets, one exit code that differs.
+
 ## One decoder's table does not transfer — `--to xgrammar`
 
 `--to outlines` above establishes the enforcement question. `--to xgrammar`
@@ -1139,7 +1183,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2216 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2255 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)

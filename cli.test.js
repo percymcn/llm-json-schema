@@ -2160,5 +2160,55 @@ function fanout(depth) {
     (l.stdout + l.stderr).indexOf("outlines.models.gemini") === -1);
 })();
 
+// #398. The bare-object collapse, end to end at the CLI boundary.
+(function () {
+  var BARE_REQ = JSON.stringify({ type: "object", required: ["a"] });
+  var BARE_UNIQ = JSON.stringify({ type: "object", uniqueItems: true });
+  var HEALTHY = JSON.stringify({ type: "object", properties: { a: { type: "string" } }, required: ["a"] });
+
+  // The false pass this closes: `--check` exited 0 on a document whose xgrammar
+  // accept set is DISJOINT from the schema's.
+  var c = run(["--to", "xgrammar", "--check"], BARE_REQ);
+  ok("#398 cli a bare object with `required` now fails --check on xgrammar",
+    c.status === 1);
+  ok("#398 cli ...and the diagnosis reaches the binary",
+    (c.stdout + c.stderr).indexOf("EMPTY OBJECT becomes the only legal document") !== -1);
+
+  // The repair is a fix, not a blocker: rerunning without --check must produce
+  // a document that then passes.
+  var fixed = run(["--to", "xgrammar"], BARE_REQ);
+  ok("#398 cli the converted document declares the required property",
+    fixed.status === 0 && fixed.stdout.indexOf('"a": {}') !== -1);
+  ok("#398 cli ...and states additionalProperties explicitly",
+    fixed.stdout.indexOf('"additionalProperties": true') !== -1);
+  var recheck = run(["--to", "xgrammar", "--check"], fixed.stdout);
+  ok("#398 cli the converted document rechecks clean (idempotent)", recheck.status === 0);
+
+  // A healthy node must not be touched -- the over-edit guard at the boundary.
+  var h = run(["--to", "xgrammar", "--check"], HEALTHY);
+  ok("#398 cli an ordinary object with declared properties still exits 0", h.status === 0);
+
+  // THE DISCRIMINATOR: the same file, three decoder targets, and only xgrammar
+  // disagrees. On outlines the keyword is harmlessly ignored and on
+  // lm-format-enforcer `required` is enforced CORRECTLY on a bare object -- both
+  // measured -- so a rule that fired on all three would be a false CI failure
+  // for two of them, and the repair itself is destructive there.
+  var o = run(["--to", "outlines", "--check"], BARE_REQ);
+  var l = run(["--to", "lmformatenforcer", "--check"], BARE_REQ);
+  ok("#398 cli outlines and lmformatenforcer accept the same file unchanged",
+    o.status === 0 && l.status === 0);
+  ok("#398 cli ...so the three decoder targets genuinely disagree about one file",
+    c.status === 1 && o.status === 0 && l.status === 0);
+
+  // A bare object with a non-`required` keyword is repaired without inventing
+  // any property name.
+  var u = run(["--to", "xgrammar"], BARE_UNIQ);
+  ok("#398 cli a bare object with `uniqueItems` gains a shape but no properties",
+    u.status === 0 && u.stdout.indexOf('"additionalProperties": true') !== -1 &&
+    u.stdout.indexOf('"properties"') === -1);
+  ok("#398 cli ...and the keyword itself SURVIVES conversion (#314 ignore->keep)",
+    u.stdout.indexOf('"uniqueItems": true') !== -1);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

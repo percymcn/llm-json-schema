@@ -10310,5 +10310,117 @@ function fanoutSchema(depth, cyclic) {
     has(conv(ONE, "xgrammar").ledger, "BYTE-IDENTICAL to the member alone"));
 })();
 
+// ---------------------------------------------------------------------------
+// #398. A bare `{"type":"object"}` on xgrammar: the fate is a property of the
+// NODE, not of the keyword.
+//
+// MEASURED against xgrammar 0.2.5 with an independent JSON Schema validator
+// (`jsonschema` Draft202012Validator) as the truth oracle, over nine instances:
+//
+//   case                    TRUTH       RAW-xgrammar  OURS
+//   bare + required         011010100   100000000     011010100   FIXED (exact)
+//   bare + uniqueItems      111111111   100000000     111111111   FIXED (exact)
+//   bare + minProperties    011111111   REFUSED       011111111   FIXED (exact)
+//   bare + $defs/$id/x-*    111111111   100000000     111111111   FIXED (exact)
+//   nested bare + required  000000001   000000010     000000001   FIXED (exact)
+//   CONTROL bare alone      111111111   111111111     111111111   unchanged
+//   CONTROL open map        101001000   101001000     101001000   unchanged
+//   CONTROL declared props  001000000   001000000     001000000   unchanged
+//   CONTROL annotations     111111111   111111111     111111111   unchanged
+//
+//   9 FIXED / 0 REGRESSED / 4 controls unchanged.
+//
+// The `required` row is the sharpest: the RAW accept set is DISJOINT from the
+// schema's — it permits exactly the document the schema forbids and rejects
+// every document it requires.
+(function () {
+  function xconv(s) {
+    try { var r = E.convert(s, "xgrammar"); return (r && r.ok) ? r : { schema: {}, ledger: [] }; }
+    catch (e) { return { schema: {}, ledger: [] }; }
+  }
+  function keyAt(r, path) { var n = at(r.schema, path); return isObj(n) ? Object.keys(n) : []; }
+  function isObj(v) { return v && typeof v === "object" && !Array.isArray(v); }
+  function nodeAt(r, path) { var n = at(r.schema, path); return isObj(n) ? n : {}; }
+
+  // --- the repair fires, and is EXACT for `required` ---
+  var req = xconv({ type: "object", required: ["a"] });
+  ok("#398 xgrammar: a bare object with `required` gains declared properties",
+    isObj(req.schema.properties) && Object.keys(req.schema.properties).join(",") === "a");
+  ok("#398 xgrammar: ...and an explicit additionalProperties:true",
+    req.schema.additionalProperties === true);
+  ok("#398 xgrammar: the declared property is the match-anything schema",
+    isObj(req.schema.properties) && JSON.stringify(req.schema.properties.a) === "{}");
+  ok("#398 xgrammar: `required` itself is preserved, not rewritten",
+    JSON.stringify(req.schema.required) === '["a"]');
+  ok("#398 xgrammar: the ledger says the empty object was the only legal document",
+    has(req.ledger, "EMPTY OBJECT becomes the only legal document"));
+  ok("#398 xgrammar: ...and names the disjoint accept set for the `required` case",
+    has(req.ledger, "DISJOINT from the schema's"));
+
+  // Two required names -> two declared properties.
+  var req2 = xconv({ type: "object", required: ["a", "b"] });
+  ok("#398 xgrammar: every required name is declared",
+    isObj(req2.schema.properties) && Object.keys(req2.schema.properties).sort().join(",") === "a,b");
+
+  // --- a bare object with a NON-required keyword gets the shape only ---
+  var uq = xconv({ type: "object", uniqueItems: true });
+  ok("#398 xgrammar: a bare object with `uniqueItems` is given a shape",
+    uq.schema.additionalProperties === true && uq.schema.uniqueItems === true);
+  ok("#398 xgrammar: ...and no properties are invented when there is no `required`",
+    !Object.prototype.hasOwnProperty.call(uq.schema, "properties"));
+
+  // The keyword `XGRAMMAR_ENFORCED` lists as enforced but which REFUSES to
+  // compile on a bare object -- the third direction the flat table was wrong in.
+  ok("#398 xgrammar: `minProperties` on a bare object is repaired too",
+    xconv({ type: "object", minProperties: 1 }).schema.additionalProperties === true);
+
+  // The `frobnicate` control: this is about the ABSENCE OF A SHAPE, not about a
+  // keyword list. Without this the rule could be a four-keyword special case.
+  ok("#398 xgrammar: an UNKNOWN keyword collapses a bare object too, so it is repaired",
+    xconv({ type: "object", frobnicate: 1 }).schema.additionalProperties === true);
+
+  // --- OVER-EDIT GUARDS. Each is a shape the engine leaves byte-identical. ---
+  [["bare object alone", { type: "object" }],
+   ["annotations only", { type: "object", title: "T", description: "d" }],
+   ["open map", { type: "object", additionalProperties: { type: "string" } }],
+   ["declared properties", { type: "object", properties: { a: { type: "string" } }, required: ["a"] }],
+   ["closed object", { type: "object", properties: {}, additionalProperties: false }],
+   ["enum node", { type: "object", enum: [{ a: 1 }] }],
+   ["combinator node", { type: "object", anyOf: [{ type: "object", properties: { a: { type: "string" } } }] }],
+   ["a non-object type", { type: "string", minLength: 2 }]
+  ].forEach(function (pair) {
+    var before = JSON.stringify(pair[1]);
+    ok("#398 xgrammar: " + pair[0] + " is left byte-identical (over-edit guard)",
+      JSON.stringify(xconv(pair[1]).schema) === before);
+  });
+
+  // Nested position: the repair must reach a bare object under `properties`.
+  var nest = xconv({ type: "object", properties: { m: { type: "object", required: ["k"] } }, required: ["m"] });
+  ok("#398 xgrammar: the repair reaches a NESTED bare object",
+    keyAt(nest, "properties.m.properties").join(",") === "k" &&
+    nodeAt(nest, "properties.m").additionalProperties === true);
+
+  // Idempotence: our own output must be a fixed point.
+  ok("#398 xgrammar: the repair is idempotent",
+    JSON.stringify(xconv(req.schema).schema) === JSON.stringify(req.schema));
+
+  // --- SCOPE PINS. This is xgrammar-only, and that is a MEASUREMENT.
+  // On outlines-core a bare object with these keywords is harmlessly IGNORED
+  // (accept set identical to the bare node); lm-format-enforcer ENFORCES
+  // `required` on a bare object CORRECTLY (011010, the exact truth). And the
+  // repair itself is DESTRUCTIVE on both: on outlines the repaired form accepts
+  // NOTHING (000000), and on lmfe the boolean `additionalProperties` crashes the
+  // parser mid-parse. Without these pins a later cycle would "generalise" the
+  // rule onto the siblings and silently break two targets.
+  ["outlines", "lmformatenforcer", "openai", "anthropic", "anthropic-json",
+   "gemini", "gemini-json", "openai-nonstrict"].forEach(function (p) {
+    var r;
+    try { r = E.convert({ type: "object", required: ["a"] }, p); } catch (e) { r = null; }
+    var s = (r && r.ok && r.schema) ? r.schema : {};
+    ok("#398 " + p + " does NOT invent properties for a bare object (scope pin)",
+      !Object.prototype.hasOwnProperty.call(s, "properties"));
+  });
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

@@ -7284,6 +7284,15 @@
   // an unrelated reason (#384's own `minProperties` error). Snapshot: this
   // suite is dependency-free and cannot run C++, so a version bump owes a
   // re-measure.
+  // #398 CORRECTION, recorded rather than silently amended: "silently ignored"
+  // is true of the node shapes measured above and FALSE on a third. On a node
+  // declaring `type:"object"` with no `properties` and no `additionalProperties`,
+  // every one of these DESTROYS the node — xgrammar compiles it to
+  // `root ::= "{" "}"`, so the empty object becomes the only legal document.
+  // The fate is a property of the NODE, not of the keyword (#397's lesson,
+  // which is why this table was re-measured at all). `xgrammarBareObject`
+  // repairs that shape; this set remains correct for every node that HAS a
+  // shape, which is what the two controls below pin.
   var XGRAMMAR_DROPPED = {
     uniqueItems: 1, contains: 1, dependentRequired: 1, not: 1
   };
@@ -7292,6 +7301,12 @@
   // these are enforced HERE and silently ignored by outlines. "It is a
   // constrained decoder, so bounds do not work" is exactly the inference the
   // data refuses.
+  // #398: these are enforced ON A NODE THAT HAS A SHAPE, which is the only
+  // place they were measured. On a bare `{"type":"object"}` six of them
+  // (`minProperties`, `maxProperties`, `minItems`, `minimum`, `format`,
+  // `prefixItems`) destroy the node instead, and `minProperties` refuses to
+  // compile at all — so "enforced" is a claim about the keyword AND the node,
+  // exactly as `XGRAMMAR_DROPPED` above turned out to be.
   var XGRAMMAR_ENFORCED = [
     "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     "minLength", "maxLength", "minItems", "maxItems", "minProperties",
@@ -7343,6 +7358,63 @@
     return n % 2 !== 0;
   }
 
+  // Keys that give xgrammar an object shape to build a grammar from. If a node
+  // declaring `type:"object"` has NONE of these, the node is "bare", and the
+  // presence of ANY further keyword destroys it (see xgrammarBareObject).
+  var XGRAMMAR_SHAPE_KEYS = {
+    properties: 1, additionalProperties: 1, $ref: 1, allOf: 1, anyOf: 1,
+    oneOf: 1, enum: 1, const: 1, patternProperties: 1, propertyNames: 1
+  };
+  // Keys that are inert on a bare object: measured to leave the emitted grammar
+  // byte-identical to the bare node's. `type` is the node's own declaration.
+  var XGRAMMAR_INERT_ON_BARE = {
+    type: 1, title: 1, description: 1, $comment: 1, $schema: 1,
+    default: 1, examples: 1, readOnly: 1, writeOnly: 1, deprecated: 1
+  };
+
+  // #398. `XGRAMMAR_DROPPED` said four keywords are "silently ignored". That is
+  // true of the node shapes #385 measured and FALSE on a third: the fate is a
+  // property of the NODE, not of the keyword (#397's lesson, applied to the
+  // sibling table per #390).
+  //
+  // MEASURED against xgrammar 0.2.5. On a node declaring `type:"object"` with
+  // NEITHER `properties` NOR `additionalProperties` (nor any other shape key),
+  // the presence of almost any further keyword compiles the node to
+  //     root ::= (("{" "}") | ("{" [ \n\t]* "}"))
+  // i.e. THE EMPTY OBJECT IS THE ONLY LEGAL DOCUMENT. It is not a narrowing of
+  // the constraint the keyword expresses — the node goes from "any object" to
+  // "nothing but {}", with no error.
+  //
+  //   {"type":"object"}                         any object          (correct)
+  //   {"type":"object", uniqueItems:true}       ONLY {}             DESTROYED
+  //   {"type":"object", required:["a"]}         ONLY {}             INVERTED
+  //   {"type":"object", $defs:{...}}            ONLY {}             DESTROYED
+  //   {"type":"object", minProperties:1}        RuntimeError        REFUSED
+  //   {"type":"object", frobnicate:1}           ONLY {}             (CONTROL)
+  //   {"type":"object", title:"t"}              any object          (CONTROL)
+  //   {..., additionalProperties:{...}, uniqueItems:true}  ignored  (CONTROL)
+  //   {..., properties:{a}, uniqueItems:true}              ignored  (CONTROL)
+  //
+  // The two controls at the bottom are what make this about the NODE: the same
+  // keyword on a node that has a shape is byte-identically ignored. The
+  // `frobnicate` control is what makes it about the ABSENCE of a shape rather
+  // than about any particular keyword — six keywords `XGRAMMAR_ENFORCED` lists
+  // as enforced (`minProperties`, `maxProperties`, `minItems`, `minimum`,
+  // `format`, `prefixItems`) destroy a bare object too.
+  //
+  // `required` is the sharpest row: the raw accept set is DISJOINT from the
+  // schema's. `{"type":"object","required":["a"]}` permits exactly the one
+  // document the schema forbids (`{}`) and rejects every document it permits.
+  function xgrammarBareObject(node) {
+    if (!isPlainObject(node) || node.type !== "object") return false;
+    for (var k in XGRAMMAR_SHAPE_KEYS) if (hasOwn(node, k)) return false;
+    var keys = Object.keys(node);
+    for (var i = 0; i < keys.length; i++) {
+      if (!XGRAMMAR_INERT_ON_BARE[keys[i]]) return true;
+    }
+    return false;
+  }
+
   function toXgrammar(schema) {
     var tooDeepOut = tooDeepEntry(schema, DOCS.xgrammar);
     if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
@@ -7372,6 +7444,71 @@
       // cannot see what the rewrite creates (#363).
       mergeAllOf(s, node, path, ledger, url, DECODER_ALLOF_WHY, true);
       noteDecoderUnsatisfiable("xgrammar", node, path, ledger, url);
+
+      // #398. Give a bare object a shape, so xgrammar stops collapsing it to
+      // the empty object. Both edits are semantic NO-OPS in JSON Schema and
+      // both were verified as such against the engine rather than argued:
+      //
+      //   `additionalProperties: true` IS the JSON Schema default, so stating
+      //   it explicitly cannot change what the document means. Measured on
+      //   three healthy nodes (bare object, declared properties, open map) the
+      //   accept set is byte-identical with and without it — so this rule
+      //   cannot over-edit, which matters because being stricter than the
+      //   destination is the bug this project has shipped ~11 times.
+      //
+      //   Declaring `properties[name] = {}` for a name already in `required`
+      //   adds no constraint either: `{}` is the match-anything schema, and the
+      //   name was already required. It is what makes the repair EXACT rather
+      //   than merely non-destructive — measured over six instances against
+      //   `{"type":"object","required":["a"]}`:
+      //     JSON Schema truth ............................ 011010
+      //     raw .......................................... 100000  (disjoint!)
+      //     + additionalProperties:true .................. 111111  (unenforced)
+      //     + properties:{a:{}} .......................... 011000  (over-closed)
+      //     + properties:{a:{}} + additionalProperties ... 011010  (exact)
+      //
+      // SCOPED TO xgrammar, and that is a measurement rather than caution: on
+      // outlines-core a bare object with these keywords is harmlessly IGNORED
+      // (any object, same as bare), and lm-format-enforcer ENFORCES `required`
+      // on a bare object CORRECTLY (011010, the exact truth). Worse, this very
+      // repair is DESTRUCTIVE on both siblings — on outlines the repaired form
+      // accepts NOTHING (000000), and on lmfe the boolean `additionalProperties`
+      // crashes the parser mid-parse (#333/#390's boolean-subschema defect). Two
+      // destinations, opposite canonical spellings for one document (#368/#389).
+      if (xgrammarBareObject(node)) {
+        var addedProps = [];
+        var req = hasOwn(node, "required") ? node.required : undefined;
+        if (Array.isArray(req)) {
+          var props = {};
+          for (var ri = 0; ri < req.length; ri++) {
+            if (typeof req[ri] === "string" && !hasOwn(props, req[ri])) {
+              setOwn(props, req[ri], {});
+              addedProps.push(req[ri]);
+            }
+          }
+          if (addedProps.length) setOwn(node, "properties", props);
+        }
+        setOwn(node, "additionalProperties", true);
+        ledger.push(entry("+", path,
+          "Gave this object a shape xgrammar can build from" +
+          (addedProps.length
+            ? " (declared `" + addedProps.join("`, `") + "` and set `additionalProperties: true`)"
+            : " (set `additionalProperties: true`)") +
+          ". The node declared `type: \"object\"` and nothing else that describes its shape, and " +
+          "xgrammar compiles such a node to `root ::= \"{\" \"}\"` the moment any further keyword " +
+          "is present — the EMPTY OBJECT becomes the only legal document, with no error. " +
+          (addedProps.length
+            ? "For `required` the raw accept set is DISJOINT from the schema's: it permits exactly " +
+              "the one document the schema forbids (`{}`) and rejects every document it requires. " +
+              "Measured, this repair reproduces the schema's accept set EXACTLY."
+            : "Measured, this repair restores the node from `{}`-only to the objects the schema " +
+              "permits, and the keyword is then simply ignored rather than destructive.") +
+          " Both edits are no-ops in JSON Schema — `additionalProperties: true` is the default, " +
+          "and a declared `{}` matches anything — verified by measuring that healthy nodes' " +
+          "accept sets are unchanged. This is xgrammar-specific: outlines-core ignores these " +
+          "harmlessly and lm-format-enforcer enforces `required` here correctly.",
+          url));
+      }
 
       // 1. The alternation bug, confirmed in a SECOND engine. outlines accepts
       //    only malformed JSON; xgrammar accepts NOTHING — the field becomes
