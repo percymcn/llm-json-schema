@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1405 engine + 303 CLI + 83 ESM/library assertions = **1791** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1438 engine + 313 CLI + 83 ESM/library assertions = **1834** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -926,7 +926,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1791 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1834 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
@@ -1835,4 +1835,26 @@ Two things that generalise from the table:
 - **A shared failure is not automatically a universal one.** outlines and xgrammar both splice a user `pattern` between the two JSON quote characters without wrapping it, so a top-level `|` binds across them and `cat|dog` matches neither `cat` nor `dog`. That is a property of engines that *splice a pattern into a grammar* — lm-format-enforcer parses it separately and handles the same pattern correctly.
 
 Unenforced keywords are **kept, never stripped**: these engines ignore rather than error, so removing a keyword would destroy a constraint that still holds everywhere else the document is used and buy nothing here.
+
+### A union `type` is a second spelling of a union — and two of the three get it wrong
+
+`{"type": ["object", "null"], "properties": {…}}` and `{"anyOf": [{"type":"object", "properties":{…}}, {"type":"null"}]}` mean the same thing. Only the second is handled correctly by all three decoders:
+
+| | outlines-core | xgrammar | lm-format-enforcer |
+|---|---|---|---|
+| `["object","null"]` + `properties`: the **null** member | **dropped** | kept | kept |
+| `["object","null"]` + `properties`: the value type | enforced | enforced | **dropped** |
+| `["string","null"]` + `minLength` | enforced | enforced | **dropped** |
+| `["array","null"]` + `items` | enforced | enforced | **dropped** |
+| the same meaning spelled `anyOf` | correct | correct | correct |
+
+The two failures point in **opposite directions**. outlines *narrows*: it drops every non-`object` member, so a field the schema marks optional can never be generated as `null`, and it compiles with no error. lm-format-enforcer *widens*: it discards every validation sibling, so the same node with one extra member in `type` will accept a wrong-typed property, an object missing its `required` key, and an arbitrary unrelated object — while the type membership itself still holds, so it degrades quietly to "any object, or null".
+
+So `--to outlines` and `--to lmformatenforcer` rewrite the union to `anyOf`, distributing the siblings across the branches. The rewrite is lossless — `properties`/`required` are vacuously satisfied by a non-object instance, so distributing them is exactly what the union already meant — and it is scoped by measurement, not by symmetry: outlines only mis-handles a union containing `object` whose node declares a `properties` **key** (an empty `properties: {}` triggers it; `required` alone does not), while lm-format-enforcer mis-handles any validation sibling at all. A **bare** union with no siblings is correct on both and is left exactly as written.
+
+`--to xgrammar` is deliberately **not** rewritten: it handles the union spelling correctly and still enforces the value type. That is the discriminator — without it the rule could be firing blanket and every other assertion would still pass.
+
+Why this matters more than an exotic-shape note: **this tool manufactures the broken shape.** `--to openai` turns an ordinary optional object property into `{"type":["object","null"], "properties":…, "required":…}`, because strict mode has no optional fields. Convert for OpenAI, serve the result with vLLM/outlines or lm-format-enforcer, and the constraint you just paid for is either inverted or gone. (Pydantic itself emits `anyOf` and is not a producer here; the other reachable sources are hand-authored, OpenAPI 3.1 and MCP tool schemas.)
+
+Known and deliberately not covered: when a **combinator** sits beside a `type`, all three decoders honour only the combinator — the `type` and its siblings stop applying, so `{"type":["string","integer"], "anyOf":[{"type":"boolean"}]}` accepts `true`. A *scalar* `type` behaves identically, so this is a different defect with a different population rather than part of the union story, and flagging only the array-valued half would be incoherent. Those nodes are left exactly as written.
 

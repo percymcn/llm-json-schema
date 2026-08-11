@@ -1865,5 +1865,48 @@ function fanout(depth) {
 })();
 
 
+// ---- #387: the union `type` spelling, end to end through the CLI ----------
+(function () {
+  var UNION = JSON.stringify({ type: "object", additionalProperties: false,
+    required: ["a"], properties: { a: { type: ["object", "null"],
+      properties: { n: { type: "integer" } }, required: ["n"] } } });
+
+  var o = run(["--check", "--to", "outlines"], UNION);
+  var x = run(["--check", "--to", "xgrammar"], UNION);
+  var l = run(["--check", "--to", "lmformatenforcer"], UNION);
+  ok("cli #387: `--to outlines` flags the union `type`", o.status === 1);
+  ok("cli #387: `--to lmformatenforcer` flags it too", l.status === 1);
+  // THE DISCRIMINATOR: the third decoder handles the spelling correctly, so it
+  // must stay silent. Without this the rule could be firing blanket.
+  ok("cli #387: `--to xgrammar` stays SILENT on the same file", x.status === 0);
+
+  var oOut = run(["--to", "outlines"], UNION).stdout;
+  var xOut = run(["--to", "xgrammar"], UNION).stdout;
+  ok("cli #387: the two targets emit genuinely different documents",
+    oOut !== xOut);
+  ok("cli #387: the repaired output carries a null branch",
+    oOut.indexOf('"null"') !== -1 && oOut.indexOf('"anyOf"') !== -1);
+  ok("cli #387: the repaired output keeps the value type",
+    oOut.indexOf('"integer"') !== -1);
+  ok("cli #387: converted output rechecks clean (idempotent)",
+    run(["--check", "--to", "outlines"], oOut).status === 0);
+
+  // The explanation must reach the user, and must say the third decoder needs
+  // no such rewrite — otherwise a reader generalises it to "decoders".
+  var msg = run(["--check", "--to", "outlines"], UNION).stderr +
+            run(["--check", "--to", "outlines"], UNION).stdout;
+  ok("cli #387: the diagnosis names the dropped member",
+    msg.indexOf("DROPS every non-") !== -1);
+  ok("cli #387: the diagnosis says xgrammar needs no rewrite",
+    msg.indexOf("xgrammar") !== -1);
+
+  // A bare union is correct on both engines and must not be touched.
+  var BARE = JSON.stringify({ type: "object", additionalProperties: false,
+    required: ["a"], properties: { a: { type: ["string", "null"] } } });
+  ok("cli #387: a BARE union exits 0 on outlines", 
+    run(["--check", "--to", "outlines"], BARE).status === 0);
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

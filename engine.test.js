@@ -8750,5 +8750,156 @@ function fanoutSchema(depth, cyclic) {
 })();
 
 
+// ---- #387: a union `type` is a SECOND SPELLING of a union -----------------
+//
+// Measured 2026-08-10 against all three decoders, `anyOf` as the control in
+// every run. outlines DROPS the non-object members (a narrowing: an optional
+// field can never be null); lm-format-enforcer DISCARDS every validation
+// sibling (a widening: the object stops being constrained); xgrammar is
+// CORRECT and is therefore deliberately not rewritten.
+(function () {
+  function conv(sch, p) {
+    var r = E.convert(JSON.parse(JSON.stringify(sch)), p) || {};
+    if (!r.schema) r.schema = {};
+    if (!r.ledger) r.ledger = [];
+    return r;
+  }
+  function propOf(r, k) {
+    return (r.schema && r.schema.properties && r.schema.properties[k]) || {};
+  }
+  function wrap(node) {
+    return { type: "object", properties: { a: node }, required: ["a"],
+             additionalProperties: false };
+  }
+  function branchTypes(n) {
+    return Array.isArray(n.anyOf)
+      ? n.anyOf.map(function (b) { return b && b.type; }).join(",")
+      : null;
+  }
+
+  var OBJ_UNION = wrap({ type: ["object", "null"],
+                         properties: { n: { type: "integer" } }, required: ["n"] });
+  var STR_UNION = wrap({ type: ["string", "null"], minLength: 3 });
+  var ARR_UNION = wrap({ type: ["array", "null"], items: { type: "integer" } });
+  var BARE_OBJ  = wrap({ type: ["object", "null"] });
+  var BARE_STR  = wrap({ type: ["string", "null"] });
+
+  // --- outlines: the measured defect, and ONLY it --------------------------
+  var oa = propOf(conv(OBJ_UNION, "outlines"), "a");
+  ok("#387 outlines: `[object,null]` + properties is rewritten to `anyOf`",
+    branchTypes(oa) === "object,null");
+  ok("#387 outlines: the dropped null member comes back as a branch",
+    Array.isArray(oa.anyOf) && oa.anyOf.some(function (b) { return b.type === "null"; }));
+  ok("#387 outlines: the object branch keeps `properties` AND `required`",
+    Array.isArray(oa.anyOf) && oa.anyOf[0] && oa.anyOf[0].properties &&
+    oa.anyOf[0].properties.n && oa.anyOf[0].properties.n.type === "integer" &&
+    JSON.stringify(oa.anyOf[0].required) === '["n"]');
+  ok("#387 outlines: the null branch carries no distributed keywords",
+    Array.isArray(oa.anyOf) && oa.anyOf[1] &&
+    Object.keys(oa.anyOf[1]).join(",") === "type");
+
+  // OVER-BLOCK GUARDS, each one a shape outlines was MEASURED to handle
+  // correctly. Without these the rule could be firing on any union at all.
+  ok("#387 outlines: a BARE `[object,null]` is left alone",
+    JSON.stringify(propOf(conv(BARE_OBJ, "outlines"), "a").type) === '["object","null"]');
+  ok("#387 outlines: `[string,null]` + minLength is left alone (measured correct there)",
+    JSON.stringify(propOf(conv(STR_UNION, "outlines"), "a").type) === '["string","null"]');
+  ok("#387 outlines: `[array,null]` + items is left alone (measured correct there)",
+    JSON.stringify(propOf(conv(ARR_UNION, "outlines"), "a").type) === '["array","null"]');
+  ok("#387 outlines: `required` alone does not trigger it (the `properties` KEY does)",
+    JSON.stringify(propOf(conv(wrap({ type: ["object", "null"], required: ["n"] }),
+      "outlines"), "a").type) === '["object","null"]');
+  // Key presence, not size (#346): an EMPTY `properties` drops the member too.
+  ok("#387 outlines: an EMPTY `properties: {}` still triggers it",
+    branchTypes(propOf(conv(wrap({ type: ["object", "null"], properties: {} }),
+      "outlines"), "a")) === "object,null");
+
+  // --- lm-format-enforcer: a WIDER trigger, and that difference is the point
+  ok("#387 lmfe: `[object,null]` + properties is rewritten",
+    branchTypes(propOf(conv(OBJ_UNION, "lmformatenforcer"), "a")) === "object,null");
+  ok("#387 lmfe: `[string,null]` + minLength is rewritten — WIDER than outlines",
+    branchTypes(propOf(conv(STR_UNION, "lmformatenforcer"), "a")) === "string,null");
+  ok("#387 lmfe: `[array,null]` + items is rewritten",
+    branchTypes(propOf(conv(ARR_UNION, "lmformatenforcer"), "a")) === "array,null");
+  ok("#387 lmfe: the string branch keeps its minLength",
+    (propOf(conv(STR_UNION, "lmformatenforcer"), "a").anyOf || [{}])[0].minLength === 3);
+  ok("#387 lmfe: a BARE union is left alone (measured correct there)",
+    JSON.stringify(propOf(conv(BARE_STR, "lmformatenforcer"), "a").type) === '["string","null"]');
+
+  // --- THE DISCRIMINATOR (#365): xgrammar handles the union spelling
+  //     correctly, so it must NOT be rewritten. Without this the rule could be
+  //     firing blanket and every assertion above would still pass.
+  ["outlines", "lmformatenforcer"].forEach(function (p) {
+    ok("#387 xgrammar vs " + p + ": only " + p + " rewrites the union",
+      branchTypes(propOf(conv(OBJ_UNION, p), "a")) === "object,null");
+  });
+  ok("#387 xgrammar: the union `type` is left EXACTLY as written",
+    JSON.stringify(propOf(conv(OBJ_UNION, "xgrammar"), "a").type) === '["object","null"]');
+  ok("#387 xgrammar: `[string,null]` + minLength is left alone too",
+    JSON.stringify(propOf(conv(STR_UNION, "xgrammar"), "a").type) === '["string","null"]');
+
+  // One file, three decoders, three genuinely different documents.
+  var dOut = JSON.stringify(conv(STR_UNION, "outlines").schema);
+  var dXg  = JSON.stringify(conv(STR_UNION, "xgrammar").schema);
+  var dLm  = JSON.stringify(conv(STR_UNION, "lmformatenforcer").schema);
+  ok("#387 one file, three decoders, and the three outputs are NOT aliases",
+    dOut === dXg && dLm !== dOut);
+
+  // --- annotations stay OUTSIDE the anyOf (measured fine on both engines) ---
+  var ann = propOf(conv(wrap({ type: ["object", "null"], description: "a note",
+    properties: { n: { type: "integer" } } }), "outlines"), "a");
+  ok("#387 the node keeps its annotation beside `anyOf`",
+    ann.description === "a note" && Array.isArray(ann.anyOf));
+  ok("#387 the annotation is NOT distributed into the branches",
+    Array.isArray(ann.anyOf) && ann.anyOf.every(function (b) {
+      return b.description === undefined; }));
+
+  // --- branches must not share a sub-schema reference ----------------------
+  var multi = propOf(conv(wrap({ type: ["string", "array"], minLength: 3,
+    items: { type: "integer" } }), "lmformatenforcer"), "a");
+  ok("#387 a multi-member union distributes to every non-null branch",
+    Array.isArray(multi.anyOf) && multi.anyOf.length === 2 &&
+    multi.anyOf[0].minLength === 3 && multi.anyOf[1].minLength === 3);
+  ok("#387 the branches do not share a sub-schema reference (cloned)",
+    Array.isArray(multi.anyOf) && multi.anyOf[0].items !== multi.anyOf[1].items);
+
+  // --- a combinator beside the union is left ALONE, on purpose -------------
+  //     Measured: all three decoders ignore the `type` AND its siblings when a
+  //     combinator is present — and a SCALAR `type` behaves identically, so
+  //     this is a different defect with a different population. Blocking only
+  //     the array-valued half would be incoherent. Pinned so a later cycle
+  //     changes it deliberately rather than by accident.
+  var comb = conv(wrap({ type: ["string", "null"], minLength: 3,
+    anyOf: [{ type: "string" }] }), "lmformatenforcer");
+  ok("#387 a union `type` beside a combinator is NOT rewritten",
+    JSON.stringify(propOf(comb, "a").type) === '["string","null"]');
+  ok("#387 ...and draws no blocker (the scalar case is identical and silent)",
+    comb.ledger.filter(function (l) { return l.op === "!" && !l.advisory; }).length === 0);
+
+  // --- REACHABILITY PIN: our OWN `--to openai` manufactures the broken shape
+  var optObj = { type: "object", additionalProperties: false,
+    properties: { a: { type: "object", properties: { n: { type: "integer" } },
+      required: ["n"] }, b: { type: "string" } }, required: ["b"] };
+  ok("#387 REACHABILITY: `--to openai` emits `[\"object\",\"null\"]` + properties",
+    JSON.stringify(propOf(conv(optObj, "openai"), "a").type) === '["object","null"]' &&
+    propOf(conv(optObj, "openai"), "a").properties !== undefined);
+
+  // --- SCOPE PINS: no other target may acquire this rewrite ----------------
+  ["openai", "anthropic", "anthropic-json", "gemini-json", "openai-nonstrict"]
+    .forEach(function (p) {
+      ok("#387 `--to " + p + "` does not acquire the decoder union rewrite",
+        !has(conv(OBJ_UNION, p).ledger, "is a fact about these two decoders"));
+    });
+
+  // --- idempotent: converting our own output changes nothing ---------------
+  ["outlines", "lmformatenforcer"].forEach(function (p) {
+    var once = conv(OBJ_UNION, p).schema;
+    var twice = conv(once, p).schema;
+    ok("#387 " + p + ": the rewrite is idempotent",
+      JSON.stringify(once) === JSON.stringify(twice));
+  });
+})();
+
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

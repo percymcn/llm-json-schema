@@ -6193,6 +6193,123 @@
     return lead !== trail;
   }
 
+  // ---- a union `type` is a SECOND SPELLING of a union ----------------------
+  //
+  // Measured 2026-08-10 against all three decoders, with the `anyOf` spelling of
+  // the SAME meaning as the control in every run. Two of the three are wrong,
+  // and they are wrong in OPPOSITE directions:
+  //
+  //   outlines-core 0.2.14  `{"type":["object","null"], "properties":{…}}`
+  //                         DROPS every non-object member — `null` becomes
+  //                         ungeneratable, so a field the schema marks optional
+  //                         can never be emitted as null. A NARROWING.
+  //                         Trigger scoped by measurement: the `properties` KEY
+  //                         (an empty `properties:{}` drops it too), NOT the
+  //                         siblings in general — `required` alone, `description`
+  //                         alone, `[array,null]`+`items` and `[string,null]`+
+  //                         `minLength` all keep the member. Member order does
+  //                         not matter; a 3-member union loses BOTH others.
+  //
+  //   lm-format-enforcer    a union `type` DISCARDS EVERY VALIDATION SIBLING.
+  //   0.11.3                Same node, one extra member, and `{"n":"WRONG"}`,
+  //                         `{}` (violating `required`) and an arbitrary
+  //                         `{"COMPLETELY":"unrelated"}` all become legal. Type
+  //                         membership itself still holds, so the node degrades
+  //                         to "any object, or null". A WIDENING, and silent.
+  //
+  //   xgrammar              CORRECT on every row, and still enforces the value
+  //                         type — which is why it is deliberately NOT rewritten.
+  //                         Without that the rule could be firing blanket and
+  //                         every other assertion here would still pass (#365).
+  //
+  // The rewrite is LOSSLESS: `properties`/`required` are vacuously satisfied by
+  // a non-object instance, so distributing the siblings across the branches is
+  // exactly what the union already meant. Verified through both engines — every
+  // repaired row accepts what the schema permits and rejects what it forbids.
+  //
+  // REACHABILITY IS OUR OWN OUTPUT, measured rather than argued: `--to openai`
+  // turns an ordinary optional object property into
+  // `{"type":["object","null"], "properties":…, "required":…}`, because strict
+  // mode has no optional fields (#311's forced-required rewrite). So a caller
+  // converts for OpenAI — the documented workflow — and then serves the result
+  // with vLLM/outlines or lm-format-enforcer, where the constraint they just
+  // paid for is either inverted or gone. pydantic itself emits `anyOf` and is
+  // NOT a producer here; the other reachable population is hand-authored /
+  // OpenAPI 3.1 / MCP tool schemas.
+  function decoderUnionSiblings(node) {
+    return Object.keys(node).filter(function (k) {
+      return k !== "type" && !inTable(ANNOTATION_KW, k) &&
+        k !== "$defs" && k !== "definitions";
+    });
+  }
+
+  function rewriteDecoderUnionType(node, path, ledger, url, engine) {
+    var raw = node.type;
+    if (!Array.isArray(raw) || raw.length < 2) return;
+    // A combinator beside the `type` is left ALONE, and deliberately without a
+    // ledger entry, because the defect there is a DIFFERENT one with a
+    // different population. Measured on all three decoders: when a combinator
+    // is present the `type` and every validation sibling STOP APPLYING —
+    // `{"type":["string","integer"], "anyOf":[{"type":"boolean"}]}` accepts
+    // `true` (which the schema forbids) and rejects `"s"`, and
+    // `{"type":["string","null"], "minLength":3, "anyOf":[{"type":"string"}]}`
+    // accepts `"x"`. Crucially a SCALAR `type` behaves IDENTICALLY, so this is
+    // not about the union spelling at all — flagging only the array-valued half
+    // while leaving the identical scalar case silent would be incoherent.
+    // Recorded for its own cycle rather than half-covered here.
+    if (node.anyOf !== undefined || node.oneOf !== undefined || node.allOf !== undefined) return;
+
+    var members = [];
+    raw.forEach(function (t) { if (members.indexOf(t) === -1) members.push(t); });
+    var siblings = decoderUnionSiblings(node);
+    // OVER-BLOCK GUARD, MEASURED: a BARE union (no validation siblings) is
+    // handled correctly by both engines — `["string","null"]` and
+    // `["object","null"]` each accept both members and reject a foreign type —
+    // so rewriting it would change the document and buy nothing.
+    if (!siblings.length) return;
+
+    if (engine === "outlines") {
+      // Scoped to the measured defect. outlines is already correct for every
+      // other shape, so firing there would be a no-op for its own justification.
+      if (members.indexOf("object") === -1 || !hasOwn(node, "properties")) return;
+    }
+
+    var branches = members.map(function (t) {
+      var b = {};
+      setOwn(b, "type", t);
+      // Distributed onto the non-null branches only. Both forms were measured
+      // correct, and leaving the null branch clean keeps the output readable.
+      // Each value is CLONED so two branches can never share a sub-schema
+      // reference — the walk descends into these next, and a shared reference
+      // would be visited (and mutated) twice.
+      if (t !== "null") siblings.forEach(function (k) { setOwn(b, k, clone(node[k])); });
+      return b;
+    });
+
+    siblings.forEach(function (k) { delete node[k]; });
+    delete node.type;
+    setOwn(node, "anyOf", branches);
+
+    ledger.push(entry("~", path,
+      "Rewrote the array-valued `type` (`" + JSON.stringify(raw) + "`) to `anyOf`, distributing " +
+      siblings.map(function (k) { return "`" + k + "`"; }).join(", ") + " across the branches. " +
+      (engine === "outlines"
+        ? "outlines DROPS every non-`object` member of a union whose node declares `properties` — " +
+          "measured, `{\"a\": null}` is rejected while the object member works, so a field the " +
+          "schema marks optional can never be generated as null. It compiles with no error. (The " +
+          "trigger is the `properties` key itself: `required` alone, or `[\"array\",\"null\"]` with " +
+          "`items`, keep the member.)"
+        : "lm-format-enforcer DISCARDS EVERY VALIDATION SIBLING of a union-typed node — measured, " +
+          "the same node with one extra member in `type` accepts a wrong-typed property, an " +
+          "object missing its `required` key, and an arbitrary unrelated object. The type " +
+          "membership still holds, so the node silently degrades to \"any object, or null\".") +
+      " `anyOf` is enforced correctly here, and the rewrite is lossless: those keywords are " +
+      "vacuously satisfied by a non-object instance, so distributing them is what the union " +
+      "already meant. Note `--to xgrammar` needs NO such rewrite — it handles the union spelling " +
+      "correctly — so this is a fact about these two decoders, not about constrained decoding.",
+      url));
+  }
+
   function toOutlines(schema) {
     var tooDeepOut = tooDeepEntry(schema, DOCS.outlines);
     if (tooDeepOut) return { schema: schema, ledger: [tooDeepOut] };
@@ -6264,6 +6381,11 @@
           "neighbours.)",
           url, true));
       });
+
+      // LAST in the callback on purpose: every rule above reads the node the
+      // CALLER wrote, and the walk descends AFTER this returns, so the branches
+      // this creates are still visited (once, via the `anyOf` arm).
+      rewriteDecoderUnionType(node, path, ledger, url, "outlines");
     });
 
     noteEmptiedDocument(schema, s, ledger, url,
@@ -6653,6 +6775,12 @@
           "decoder's table over to another.)",
           url, true));
       });
+
+      // LAST in the callback, same reasoning as `--to outlines`. Note this
+      // fires on a WIDER set than the outlines rule does: there the defect
+      // needs an `object` member and a `properties` key, here ANY validation
+      // sibling is discarded.
+      rewriteDecoderUnionType(node, path, ledger, url, "lmfe");
     });
 
     noteEmptiedDocument(schema, s, ledger, url,
