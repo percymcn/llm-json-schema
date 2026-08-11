@@ -704,6 +704,13 @@ The control is the whole argument: the same constraint written *without* the
 keyword. Nothing throws — the request succeeds and the field is simply no longer
 constrained, which is the failure mode a constrained decoder exists to prevent.
 
+This is **not** presented as a decoder bug. Draft-07 *ignores* `$ref` siblings
+and 2020-12 *applies* them, so the three engines are defensible under the older
+dialect — and that is exactly why the merge is worth doing: `zod-to-json-schema`
+stamps `draft-07` while pydantic emits 2020-12, so the meaning of your schema
+would otherwise depend on which generator produced it. The merged form means the
+same thing under both.
+
 So on `--to outlines`, `--to xgrammar` and `--to lmformatenforcer` the sibling is
 merged into the node, which is what the schema already meant. This is the same
 merge the JSON-Schema-dialect targets have used since the `$ref`-intersection
