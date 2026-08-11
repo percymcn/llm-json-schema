@@ -10526,5 +10526,129 @@ function fanoutSchema(depth, cyclic) {
   });
 })();
 
+
+// --- #400: a union-valued `type` is the SECOND legal spelling of a container ---
+// #398 (bare object) and #399 (bare array) both dispatched with
+// `node.type === "object"`, strict equality against ONE of JSON Schema's two
+// legal spellings of `type` ("a string OR an array of strings"). The collapse
+// they each fixed is reached untouched through the other spelling, and our own
+// `--to openai` output manufactures it (an optional container property becomes
+// `type: ["object","null"]`). Measured on xgrammar 0.2.5.
+(function () {
+  function conv(node, p) {
+    return E.convert({
+      type: "object", properties: { m: JSON.parse(JSON.stringify(node)) },
+      required: ["m"], additionalProperties: false
+    }, p || "xgrammar");
+  }
+  function led(r) { return (r && Array.isArray(r.ledger)) ? r.ledger : []; }
+  function m(r) {
+    var s = r && r.schema;
+    return (s && s.properties && s.properties.m) || {};
+  }
+  function same(node, p) {
+    var before = JSON.stringify(node);
+    return JSON.stringify(m(conv(node, p))) === before;
+  }
+
+  // --- the defect: union spelling collapses and was passing at exit 0 ---
+  var oreq = m(conv({ type: ["object", "null"], required: ["a"] }));
+  ok("#400 union `type` object + required is repaired (was a false pass)",
+    oreq.additionalProperties === true &&
+    oreq.properties && Object.prototype.hasOwnProperty.call(oreq.properties, "a"));
+  ok("#400 union object repair keeps the union `type` intact",
+    JSON.stringify(oreq.type) === JSON.stringify(["object", "null"]));
+
+  var ouni = m(conv({ type: ["object", "null"], uniqueItems: true }));
+  ok("#400 union `type` object + a stray keyword is repaired",
+    ouni.additionalProperties === true);
+
+  var auni = m(conv({ type: ["array", "null"], uniqueItems: true }));
+  ok("#400 union `type` array + uniqueItems gets `items: {}`",
+    auni.items && typeof auni.items === "object" && Object.keys(auni.items).length === 0);
+
+  var amin = m(conv({ type: ["array", "null"], minItems: 1 }));
+  ok("#400 union `type` array + minItems gets `items: {}` (xgrammar RuntimeError otherwise)",
+    amin.items && Object.keys(amin.items).length === 0);
+
+  // --- BOTH containers named: measured to need BOTH repairs, not either ---
+  // {"type":["object","array"]} + a keyword collapses BOTH halves; measured,
+  // `additionalProperties` alone restores only the object half and `items`
+  // alone only the array half. Not guessable — this row is why the two
+  // predicates are allowed to fire on one node.
+  var both = m(conv({ type: ["object", "array"], uniqueItems: true }));
+  ok("#400 a union naming BOTH containers gets BOTH repairs",
+    both.additionalProperties === true &&
+    both.items && Object.keys(both.items).length === 0);
+
+  // --- the message must be true of the reader's file (#393) ---
+  ok("#400 the ledger names the spelling the caller actually wrote",
+    led(conv({ type: ["object", "null"], required: ["a"] }))
+      .some(function (l) { return l.msg.indexOf('["object","null"]') !== -1; }));
+  ok("#400 the scalar spelling still says `type: \"object\"`",
+    led(conv({ type: "object", required: ["a"] }))
+      .some(function (l) { return l.msg.indexOf('type: "object"') !== -1; }));
+
+  // --- `unevaluatedProperties` is a shape key BY VALUE, not by key (#345) ---
+  ok("#400 unevaluatedProperties:true is a shape — node left byte-identical",
+    same({ type: "object", unevaluatedProperties: true, uniqueItems: true }));
+  ok("#400 unevaluatedProperties:{} is a shape — node left byte-identical",
+    same({ type: "object", unevaluatedProperties: {}, uniqueItems: true }));
+  ok("#400 unevaluatedProperties:FALSE is NOT a shape — still repaired",
+    m(conv({ type: "object", unevaluatedProperties: false, uniqueItems: true }))
+      .additionalProperties === true);
+
+  // --- over-edit guards: these must all be byte-identical both before and after ---
+  ok("#400 a bare union object ALONE is left byte-identical",
+    same({ type: ["object", "null"] }));
+  ok("#400 a bare union array ALONE is left byte-identical",
+    same({ type: ["array", "null"] }));
+  ok("#400 an annotations-only union object is left byte-identical",
+    same({ type: ["object", "null"], title: "t", description: "d" }));
+  ok("#400 a SHAPED union object (declared properties) is left byte-identical",
+    same({ type: ["object", "null"], properties: { a: { type: "string" } }, uniqueItems: true }));
+  ok("#400 a SHAPED union array (declared items) is left byte-identical",
+    same({ type: ["array", "null"], items: { type: "string" }, uniqueItems: true }));
+  ok("#400 a union of SCALARS is not a container and is left byte-identical",
+    same({ type: ["string", "null"], minLength: 3 }));
+  ok("#400 a union object carrying $ref is shaped and left byte-identical",
+    same({ type: ["object", "null"], $ref: "#/$defs/T", uniqueItems: true }));
+
+  // --- scope pins: the collapse is xgrammar-ONLY, measured on the siblings ---
+  // outlines-core and lm-format-enforcer treat the union spelling IDENTICALLY
+  // to the bare node (harmlessly ignored), and #398 measured that this very
+  // repair DESTROYS both of them. Without these pins a later cycle could
+  // "generalise" the rule and silently break two targets.
+  // NOTE the pin is "did NOT acquire the xgrammar REPAIR", not byte-identity:
+  // #387's `rewriteDecoderUnionType` legitimately rewrites a union `type` to
+  // `anyOf` on outlines and lmfe (and deliberately not on xgrammar, which
+  // handles unions correctly). A byte-identity assertion here would forbid
+  // that correct rule — so this keys on the repair's own artifacts, which also
+  // pins that #387's rewrite still runs.
+  function noXgrammarRepair(node, p) {
+    var out = m(conv(node, p));
+    var seen = JSON.stringify(out);
+    return seen.indexOf('"items":{}') === -1 &&
+           seen.indexOf('"additionalProperties":true') === -1;
+  }
+  ok("#400 outlines does NOT acquire the union repair",
+    noXgrammarRepair({ type: ["object", "null"], required: ["a"] }, "outlines"));
+  ok("#400 lmformatenforcer does NOT acquire the union repair",
+    noXgrammarRepair({ type: ["array", "null"], uniqueItems: true }, "lmformatenforcer"));
+  ok("#400 lmformatenforcer still applies #387's union->anyOf rewrite",
+    JSON.stringify(m(conv({ type: ["array", "null"], uniqueItems: true }, "lmformatenforcer")))
+      .indexOf('"anyOf"') !== -1);
+  ok("#400 gemini-json does NOT acquire the union repair",
+    noXgrammarRepair({ type: ["array", "null"], uniqueItems: true }, "gemini-json"));
+  ok("#400 openai does NOT acquire the union repair",
+    noXgrammarRepair({ type: ["array", "null"], uniqueItems: true }, "openai"));
+
+  // --- the scalar spelling must keep working (regression on #398/#399) ---
+  ok("#400 scalar bare object still repaired (#398 regression)",
+    m(conv({ type: "object", required: ["a"] })).additionalProperties === true);
+  ok("#400 scalar bare array still repaired (#399 regression)",
+    m(conv({ type: "array", uniqueItems: true })).items !== undefined);
+})();
+
 console.log("\n" + pass + " passed, " + fail + " failed");
 process.exit(fail ? 1 : 0);

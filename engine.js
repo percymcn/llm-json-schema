@@ -7365,6 +7365,49 @@
     properties: 1, additionalProperties: 1, $ref: 1, allOf: 1, anyOf: 1,
     oneOf: 1, enum: 1, const: 1, patternProperties: 1, propertyNames: 1
   };
+  // #400. `unevaluatedProperties` belongs in the table above and cannot be
+  // written there, because it is a shape key BY VALUE rather than by key —
+  // #345's key-vs-value distinction, found inside our own table by re-running
+  // #399's "re-measure the shape keys" step against a second spelling of
+  // `type`. Measured on xgrammar 0.2.5 with a `frobnicate` control beside it:
+  //   {"type":"object", unevaluatedProperties:true,  frobnicate:1}  -> 111 (shape)
+  //   {"type":"object", unevaluatedProperties:{},    frobnicate:1}  -> 111 (shape)
+  //   {"type":"object", unevaluatedProperties:false, frobnicate:1}  -> 100 (collapses)
+  //   {"type":"object",                              frobnicate:1}  -> 100 (baseline)
+  // So `false` is not a shape and everything else is. Getting this wrong is a
+  // harmless over-edit rather than a correctness bug (the repaired node's
+  // accept set is unchanged), but it is still an edit to a document that
+  // needed none, which is the class this project keeps flagging.
+  function xgrammarHasObjectShape(node) {
+    for (var k in XGRAMMAR_SHAPE_KEYS) if (hasOwn(node, k)) return true;
+    return hasOwn(node, "unevaluatedProperties") && node.unevaluatedProperties !== false;
+  }
+  // #400. `type` has TWO legal spellings — "a string OR an array of strings" —
+  // and #398/#399 both dispatched with `node.type === "object"`, i.e. strict
+  // equality against one of them. That is #327's defect class, and here it
+  // means the collapse those two cycles fixed is reached untouched through the
+  // second spelling. Measured, the union form collapses IDENTICALLY:
+  //   {"type":["object","null"]}                   accepts {} {a:x} null  (correct)
+  //   {"type":["object","null"], required:["a"]}   accepts {} null        DISJOINT
+  //   {"type":["object","null"], frobnicate:1}     accepts {} null        (CONTROL)
+  //   {"type":["object","null"], title:"t"}        accepts {} {a:x} null  (CONTROL)
+  //   {"type":["object","null"], properties:{...}} no collapse            (CONTROL)
+  // A union naming BOTH containers collapses both halves and needs both
+  // repairs — measured, and not guessable: for {"type":["object","array"]}
+  // with a further keyword, `additionalProperties` alone restores the object
+  // half only, `items` alone the array half only, and both restore it exactly.
+  // Both predicates below can therefore fire on one node, by design.
+  function xgrammarDeclares(node, t) {
+    if (!isPlainObject(node)) return false;
+    if (node.type === t) return true;
+    return Array.isArray(node.type) && node.type.indexOf(t) !== -1;
+  }
+  // Which spelling the caller wrote, for the ledger text: a message that says
+  // `type: "object"` about a document containing `type: ["object","null"]` is
+  // false of the reader's file (#393).
+  function xgrammarTypeSpelling(node) {
+    return Array.isArray(node.type) ? JSON.stringify(node.type) : JSON.stringify(node.type);
+  }
   // Keys that are inert on a bare object: measured to leave the emitted grammar
   // byte-identical to the bare node's. `type` is the node's own declaration.
   // RE-MEASURED for the array case in #399: the same ten are inert there too,
@@ -7417,8 +7460,8 @@
   // schema's. `{"type":"object","required":["a"]}` permits exactly the one
   // document the schema forbids (`{}`) and rejects every document it permits.
   function xgrammarBareObject(node) {
-    if (!isPlainObject(node) || node.type !== "object") return false;
-    for (var k in XGRAMMAR_SHAPE_KEYS) if (hasOwn(node, k)) return false;
+    if (!xgrammarDeclares(node, "object")) return false;
+    if (xgrammarHasObjectShape(node)) return false;
     var keys = Object.keys(node);
     for (var i = 0; i < keys.length; i++) {
       if (!XGRAMMAR_INERT_ON_BARE[keys[i]]) return true;
@@ -7453,7 +7496,7 @@
   // string, so the raw accept set {[]} is EXACTLY the one document the schema
   // forbids — DISJOINT, not merely narrowed.
   function xgrammarBareArray(node) {
-    if (!isPlainObject(node) || node.type !== "array") return false;
+    if (!xgrammarDeclares(node, "array")) return false;
     for (var k in XGRAMMAR_ARRAY_SHAPE_KEYS) if (hasOwn(node, k)) return false;
     var keys = Object.keys(node);
     for (var i = 0; i < keys.length; i++) {
@@ -7541,7 +7584,8 @@
           (addedProps.length
             ? " (declared `" + addedProps.join("`, `") + "` and set `additionalProperties: true`)"
             : " (set `additionalProperties: true`)") +
-          ". The node declared `type: \"object\"` and nothing else that describes its shape, and " +
+          ". The node declared `type: " + xgrammarTypeSpelling(node) + "` and nothing else that " +
+          "describes its shape, and " +
           "xgrammar compiles such a node to `root ::= \"{\" \"}\"` the moment any further keyword " +
           "is present — the EMPTY OBJECT becomes the only legal document, with no error. " +
           (addedProps.length
@@ -7579,7 +7623,8 @@
         setOwn(node, "items", {});
         ledger.push(entry("+", path,
           "Gave this array a shape xgrammar can build from (set `items: {}`). The node declared " +
-          "`type: \"array\"` and nothing else that describes its elements, and xgrammar compiles " +
+          "`type: " + xgrammarTypeSpelling(node) + "` and nothing else that describes its " +
+          "elements, and xgrammar compiles " +
           "such a node to `root ::= \"[\" \"]\"` the moment any further keyword is present — the " +
           "EMPTY ARRAY becomes the only legal document, with no error. This is not a narrowing of " +
           "the constraint the keyword expresses: for `contains` the raw accept set is DISJOINT " +

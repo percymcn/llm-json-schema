@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1801 engine + 405 CLI + 83 ESM/library assertions = **2289** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1826 engine + 405 CLI + 83 ESM/library assertions = **2314** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -88,6 +88,47 @@ the substitution, so merging there would buy it nothing and would rewrite
 pydantic v1's `{title, description, allOf:[{$ref}]}` — a shape pinned
 byte-identical on purpose. The four JSON-Schema-dialect targets forward the
 document and read `allOf` themselves, so they do not merge either.
+
+
+### `type` has two spellings, and both reach the same collapse (xgrammar)
+
+JSON Schema defines `type` as *"a string **or an array of strings**"*. Two earlier
+rules repaired a container that declares a type but no shape — an object with no
+`properties`/`additionalProperties`, an array with no `items`/`prefixItems` —
+because xgrammar 0.2.5 compiles such a node to *the empty container only* the
+moment any further keyword is present. Both dispatched with `node.type === "object"`,
+i.e. strict equality against **one** of the two spellings, so the identical collapse
+was reachable untouched through the other. Measured, with controls:
+
+| node | accepts | |
+|---|---|---|
+| `{"type":["object","null"]}` | `{}`, `{"a":"x"}`, `null` | correct |
+| `{"type":["object","null"],"required":["a"]}` | `{}`, `null` | **disjoint** — permits the one document the schema forbids, rejects every one it requires |
+| `{"type":["object","null"],"frobnicate":1}` | `{}`, `null` | control: it is the *absence of a shape*, not any keyword |
+| `{"type":["object","null"],"title":"t"}` | `{}`, `{"a":"x"}`, `null` | control: annotations stay inert |
+| `{"type":["object","null"],"properties":{…}}` | — | control: a shaped node is fine |
+| `{"type":["array","null"],"uniqueItems":true}` | `[]`, `null` | destroyed |
+| `{"type":["array","null"],"minItems":1}` | — | `RuntimeError` |
+
+A union naming **both** containers collapses both halves and needs both repairs:
+for `{"type":["object","array"], …}`, `additionalProperties` alone restores only
+the object half and `items` alone only the array half. That is measured, not
+inferred, and it is why the two rules are allowed to fire on one node.
+
+The repairs are unchanged and remain semantic no-ops (`additionalProperties: true`
+is the JSON Schema default; an absent `items` already leaves elements
+unconstrained). From a consumer install, the `required` case goes from `101`
+(disjoint) to `011` — the schema's exact accept set.
+
+**Scoped to xgrammar, measured:** outlines-core and lm-format-enforcer treat the
+union spelling identically to the bare node (harmlessly ignored), and this repair
+is destructive on both. `--to lmformatenforcer` still applies its own
+union-to-`anyOf` rewrite, which is a different and correct rule.
+
+One keyword also moved: **`unevaluatedProperties` is a shape key by *value*, not
+by key** — `true` and `{}` prevent the collapse, `false` does not — so it could
+not simply be added to the flat table. It was missing entirely, which meant two
+otherwise-healthy schemas were being edited when they needed nothing.
 
 ## Quick start
 
@@ -1183,7 +1224,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2289 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 2314 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
