@@ -8399,6 +8399,18 @@ function fanoutSchema(depth, cyclic) {
   ok("#384 outlines: ENFORCED bounds draw no advisory (the asymmetry control)",
     advisories(enforced).length === 0 && blockers(enforced).length === 0);
 
+  // 4b. THE CORRECTION. `minProperties` looked enforced against a FREE-FORM
+  //     object, whose regex rejects `{}` for an unrelated reason — green for the
+  //     wrong reason (#362). Measured properly it accepts a ONE-property object.
+  //     Pinned with the discriminating instance so it cannot be "restored".
+  var minProps = conv({
+    type: "object",
+    properties: { m: { type: "object", minProperties: 2 } },
+    required: ["m"], additionalProperties: false
+  });
+  ok("#384 outlines: minProperties is DROPPED, not enforced (corrects my own fixture)",
+    advisories(minProps).length === 1 && has(minProps.ledger, "minProperties"));
+
   // 5. REFUSED OUTRIGHT — loud, so safer than the silent set.
   ["allOf", "not", "patternProperties"].forEach(function (k) {
     var sch = { type: "object", properties: { v: {} }, required: ["v"], additionalProperties: false };
@@ -8421,8 +8433,8 @@ function fanoutSchema(depth, cyclic) {
   var DROPPED = E.OUTLINES_DROPPED_KEYS || [];
   var REJECTED = E.OUTLINES_REJECTED_KEYS || [];
   var ENFORCED = E.OUTLINES_ENFORCED_KEYS || [];
-  ok("#384 outlines: dropped table is the 10 measured keywords",
-    DROPPED.length === 10 &&
+  ok("#384 outlines: dropped table is the 11 measured keywords",
+    DROPPED.length === 11 && DROPPED.indexOf("minProperties") !== -1 &&
     DROPPED.indexOf("minimum") !== -1 &&
     DROPPED.indexOf("multipleOf") !== -1 &&
     DROPPED.indexOf("dependentRequired") !== -1);

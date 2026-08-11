@@ -6130,8 +6130,8 @@
   // version bump is a manual step.
   var OUTLINES_DROPPED = {
     minimum: 1, maximum: 1, exclusiveMinimum: 1, exclusiveMaximum: 1,
-    multipleOf: 1, uniqueItems: 1, contains: 1, maxProperties: 1,
-    propertyNames: 1, dependentRequired: 1
+    multipleOf: 1, uniqueItems: 1, contains: 1, minProperties: 1,
+    maxProperties: 1, propertyNames: 1, dependentRequired: 1
   };
 
   // Keywords `build_regex_from_schema` REFUSES outright (ValueError). Loud, and
@@ -6139,13 +6139,18 @@
   // built, so nothing ships believing it is constrained.
   var OUTLINES_REJECTED = { allOf: 1, not: 1, patternProperties: 1 };
 
-  // Kept as a positive control. The asymmetries are why this table is measured
+  // Kept as a positive control. The asymmetry is why this table is measured
   // rather than reasoned: `minItems`/`maxItems` ARE enforced while
-  // `minimum`/`maximum` are not, and `minProperties` IS enforced while
-  // `maxProperties` is not. "Length bounds work, so value bounds work" is
+  // `minimum`/`maximum` are not — "length bounds work, so value bounds work" is
   // exactly the inference the data refuses.
+  //
+  // `minProperties` was in THIS list until a cross-check against outlines-core
+  // issue #261 contradicted it. Re-measured: my fixture was a FREE-FORM object,
+  // whose regex rejects `{}` for an unrelated reason (it requires at least one
+  // pair), so the row was green for the wrong reason. `minProperties: 2` does
+  // accept a ONE-property object. It is dropped, and #261 was right.
   var OUTLINES_ENFORCED = [
-    "minLength", "maxLength", "minItems", "maxItems", "minProperties",
+    "minLength", "maxLength", "minItems", "maxItems",
     "const", "enum", "format", "prefixItems", "oneOf"
   ];
 
@@ -6252,8 +6257,9 @@
           "`" + k + "` is kept here but outlines-core does NOT enforce it: the compiled regex is " +
           "byte-identical to the one it emits with the keyword absent, so the model is free to " +
           "violate it and nothing errors. Validate this constraint yourself after generation. " +
-          "(Measured asymmetry worth knowing: `minItems`/`maxItems` and `minProperties` ARE " +
-          "enforced, so you cannot infer this keyword's fate from its neighbours.)",
+          "(Measured asymmetry worth knowing: `minItems`/`maxItems` ARE enforced while " +
+          "`minimum`/`maximum` are not, so you cannot infer this keyword's fate from its " +
+          "neighbours.)",
           url, true));
       });
     });

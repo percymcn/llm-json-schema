@@ -10,7 +10,7 @@ Available three ways, all running the same dependency-free engine:
 | **Library** | `import { toOpenAI } from "llm-json-schema"` — ESM, CJS, and TypeScript types |
 | **Web (no install)** | https://percymcn.github.io/llm-json-schema/ |
 
-> Status: **v0.1**. Unit-tested: 1350 engine + 287 CLI + 71 ESM/library assertions = **1708** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
+> Status: **v0.1**. Unit-tested: 1351 engine + 287 CLI + 71 ESM/library assertions = **1709** (`npm test`). Provider rules are verified against each vendor's own SDK, not its docs — the docs list the *supported* subset, the SDK encodes the *accepted* one, and they differ.
 >
 > Not yet on the npm registry — install straight from GitHub as shown below. The `llm-json-schema` name is unclaimed and the package is publish-ready (`npm pack` verified); the registry release is pending.
 
@@ -700,16 +700,22 @@ asking whether a **violating** instance still matches it:
 
 | | Keywords |
 |---|---|
-| **Silently not enforced** | `minimum` `maximum` `exclusiveMinimum` `exclusiveMaximum` `multipleOf` `uniqueItems` `contains` `maxProperties` `propertyNames` `dependentRequired` |
+| **Silently not enforced** | `minimum` `maximum` `exclusiveMinimum` `exclusiveMaximum` `multipleOf` `uniqueItems` `contains` `minProperties` `maxProperties` `propertyNames` `dependentRequired` |
 | **Refused outright** (loud — no guide is built) | `allOf` `not` `patternProperties` |
-| **Genuinely enforced** | `minLength` `maxLength` `minItems` `maxItems` `minProperties` `const` `enum` `format` `prefixItems` `oneOf` |
+| **Genuinely enforced** | `minLength` `maxLength` `minItems` `maxItems` `const` `enum` `format` `prefixItems` `oneOf` |
 
-The asymmetries are why this table is measured rather than reasoned:
-`minItems`/`maxItems` **are** enforced while `minimum`/`maximum` are not, and
-`minProperties` **is** enforced while `maxProperties` is not. "Length bounds
-work, so value bounds work" is exactly the inference the data refuses. For a
-`minimum`, the emitted regex is byte-identical to the one emitted with the
-keyword absent.
+The asymmetry is why this table is measured rather than reasoned:
+`minItems`/`maxItems` **are** enforced while `minimum`/`maximum` are not.
+"Length bounds work, so value bounds work" is exactly the inference the data
+refuses — for a `minimum`, the emitted regex is byte-identical to the one
+emitted with the keyword absent.
+
+Measuring is not enough on its own, either: `minProperties` sat in the
+*enforced* column here until a cross-check against outlines-core
+[#261](https://github.com/dottxt-ai/outlines-core/issues/261) contradicted it.
+The fixture was a free-form object, whose regex rejects `{}` for an unrelated
+reason — the row was green for the wrong reason. It accepts a one-property
+object, so it is dropped, and #261 was right.
 
 ### A `pattern` with a top-level `|` compiles to a guide that emits only malformed JSON
 
@@ -858,7 +864,7 @@ is that the tool stopped deleting a property the destination accepts.
 - `engine.mjs` — ESM entry point. Node cannot statically detect named exports through the UMD wrapper, so these are re-exported explicitly; without it, `import { convert }` throws in any `"type": "module"` project.
 - `index.d.ts` — TypeScript definitions (`Provider` is a union, so a wrong provider name is a compile error).
 - `cli.js` — the `llm-schema` binary; a thin wrapper so CI and the browser enforce identical rules.
-- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1708 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
+- `engine.test.js` / `cli.test.js` / `esm.test.mjs` — 1709 assertions total. Run: `npm test`. The fixtures are the actual schemas from real reported failures and verbatim `zod-to-json-schema` / `z.toJSONSchema()` output, so a regression means the tool stopped fixing a bug people genuinely hit. Every provider is asserted **idempotent** — a `--check` gate that flagged its own output would be unusable in CI. When you pass an *example* rather than a schema, the suite also asserts the **round trip**: the inferred schema must accept the very document it was inferred from, across 27 shapes and every JSON-Schema-dialect target. A conversion may narrow below your example only if it says so in the ledger — strict mode does exactly that, because it has no optional fields. (`--to gemini` is excluded from that check on purpose: its output is a Gemini `Schema` proto message, not JSON Schema.)
 - `index.html` + `app.js` — static UI, GitHub Pages host. SEO scaffold: title/meta/canonical, JSON-LD `SoftwareApplication`, `sitemap.xml`, `robots.txt`, `.nojekyll`.
 
 ## Sources (verified 2026-07-30; OpenAI keyword set re-verified 2026-08-08)
